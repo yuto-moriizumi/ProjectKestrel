@@ -5,6 +5,7 @@ Bugs
 * Add "Parent folder" button to analyze folders directory so you can walk up the folder tree if needed. 
 * Fix GPU non-supported in Github documentation.
 * RAW+JPG co-movement problem in Culling Assistant.
+* Frequent failures when running on images with many subjects; find a way to lower Mask-RCNN region proposal threshold to improve performance.
 
 
 Features under consideration
@@ -13,8 +14,11 @@ Features under consideration
     - This may be either a python notebook or a script, unsure.
 * Add a "Quick Export" system or copy thumbnail system.
 * Potentially skip species analysis?
+* Multi-subject mode is not handled super consistently. Consider reworking pipeline to store crop exports of all detected subjects for improved analysis.
+* Implement "Analyze JPGs instead of RAWs" with clear warning that analysis on RAWs is strongly preferred since JPG compression artifacts can dramatically alter quality scores.
 * Investigate GPU support from recent pull request #14
 
+===================================================================================================================
 
 # Version Yellow Warbler Changelog
 * Massive improvement to Kestrel group detection methodology particularly for birds in flight
@@ -28,6 +32,7 @@ Features under consideration
 * Fixed UI for settings page and expanded number of potential editors to several new options with a dedicated "Custom application" page.
 * Fix UI - Live Analysis Page
 * Added "Accept All" and "Reject All" buttons in changelog
+
 
 # Version Swamp Sparrow Changelog
 * Refactor code to make it easier to edit.
@@ -74,6 +79,7 @@ Features under consideration
 * Improve culling.html so that default behavior on unrated scenes is to reject with user-customizable option within the culling options. 
 * refresh behavior keeps refreshing when paused.
 * Some group detection failures in low-feature-point space. (ex. scene #30 high island 2024) - fixed
+
 
 # Version Willow Ptarmigan Changelog
 * Major improvements to Kestrel User Interface! Kestrel now shows your scenes in a filmstrip style view, allowing you to rapidly relive your memories and select which ones to edit and share.
