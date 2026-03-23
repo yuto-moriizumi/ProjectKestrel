@@ -9,6 +9,12 @@ import torchvision.transforms as T
 
 from ..config import MASK_RCNN_WEIGHTS_PATH
 
+# Full-resolution RAW inference is memory-heavy; cap RPN proposals so the RoI / mask
+# heads never see more than this many regions per image (defaults are ~1000+).
+_MASK_RCNN_RPN_PRE_NMS_TOP_N_TEST = 10
+_MASK_RCNN_RPN_POST_NMS_TOP_N_TEST = 10
+_MASK_RCNN_BOX_DETECTIONS_PER_IMG = 10
+
 
 class MaskRCNNWrapper:
     def __init__(self):
@@ -33,7 +39,12 @@ class MaskRCNNWrapper:
                 "The weights file should be bundled with the application."
             )
 
-        self.model = detection_models.maskrcnn_resnet50_fpn_v2(weights=None)
+        self.model = detection_models.maskrcnn_resnet50_fpn_v2(
+            weights=None,
+            rpn_pre_nms_top_n_test=_MASK_RCNN_RPN_PRE_NMS_TOP_N_TEST,
+            rpn_post_nms_top_n_test=_MASK_RCNN_RPN_POST_NMS_TOP_N_TEST,
+            box_detections_per_img=_MASK_RCNN_BOX_DETECTIONS_PER_IMG,
+        )
         state_dict = torch.load(weights_path, map_location="cpu", weights_only=True)
         self.model.load_state_dict(state_dict)
         self.model.eval()

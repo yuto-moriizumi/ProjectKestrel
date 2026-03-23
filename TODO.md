@@ -5,7 +5,7 @@ Bugs
 * Add "Parent folder" button to analyze folders directory so you can walk up the folder tree if needed. 
 * Fix GPU non-supported in Github documentation.
 * RAW+JPG co-movement problem in Culling Assistant.
-* Frequent failures when running on images with many subjects; find a way to lower Mask-RCNN region proposal threshold to improve performance.
+* Frequent failures when running on images with many subjects; find a way to lower Mask-RCNN region proposal threshold to improve performance. - FIX IMPLEMENTED - NOT TESTED
 
 
 Features under consideration
