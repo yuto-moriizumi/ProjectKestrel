@@ -1,16 +1,19 @@
 # Project Kestrel To-Do and Changelog
-* Investigate GPU support from recent pull request #14
 
 Bugs
-* known issue that skipping to next scene works inconsistently, and the background view should scroll to match the current scene opened in the film strip.
+* Known issue that skipping to next scene works inconsistently, and the background view should scroll to match the current scene opened in the film strip.
 * Add "Parent folder" button to analyze folders directory so you can walk up the folder tree if needed. 
+* Fix GPU non-supported in Github documentation.
+* RAW+JPG co-movement problem in Culling Assistant.
+
 
 Features under consideration
 - Build debug platform that runs Kestrel analysis, but saves the full output at every step for detailed troubleshooting and root-cause analysis. (Under Consideration, likely requires simple modification of CLI)
     - e.g. save all masks, all bird species probabilities, all quality scores, etc. and visualize everything for easy detection.
     - This may be either a python notebook or a script, unsure.
-
-
+* Add a "Quick Export" system or copy thumbnail system.
+* Potentially skip species analysis?
+* Investigate GPU support from recent pull request #14
 
 
 # Version Yellow Warbler Changelog
@@ -27,7 +30,6 @@ Features under consideration
 * Added "Accept All" and "Reject All" buttons in changelog
 
 # Version Swamp Sparrow Changelog
-
 * Refactor code to make it easier to edit.
 * Investigate poor performance in poorly-lit circumstances, even if it is just to add an up to 1-2 stop exposure adjust.? - For this we need to finish Kestrel Workshop. 
 * Improve star rating system - this sort of punishes people with different equipment by setting all their photos to "1 star" and thus making the system pretty bad. Add a normalization option in settings that essentially fits the ratings distribution folder-wide to a uniform distribution with 20% splits. this would make sure the star ratings cover the entire breadth of the folder and propbably improve culling performance too ? Default = within folder normalization
