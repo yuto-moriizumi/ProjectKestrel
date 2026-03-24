@@ -17,6 +17,7 @@ Features under consideration
 * Multi-subject mode is not handled super consistently. Consider reworking pipeline to store crop exports of all detected subjects for improved analysis.
 * Implement "Analyze JPGs instead of RAWs" with clear warning that analysis on RAWs is strongly preferred since JPG compression artifacts can dramatically alter quality scores.
 * Investigate GPU support from recent pull request #14
+* Alter search "show only manually reviewed photos" to include those with manual culling decisions or species selections.
 
 ===================================================================================================================
 
