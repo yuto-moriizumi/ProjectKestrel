@@ -1,19 +1,18 @@
 # Project Kestrel To-Do and Changelog
 
 Bugs
-* Known issue that skipping to next scene works inconsistently, and the background view should scroll to match the current scene opened in the film strip.
+* Known issue that skipping to next scene works inconsistently, and the background view should scroll to match the current scene opened in the film strip. [DONE]
 * Add "Parent folder" button to analyze folders directory so you can walk up the folder tree if needed. 
 * Fix GPU non-supported in Github documentation.
 * RAW+JPG co-movement problem in Culling Assistant.
 * Frequent failures when running on images with many subjects; find a way to lower Mask-RCNN region proposal threshold to improve performance. - FIX IMPLEMENTED - NOT TESTED
+* Known issue where exposure compensation still tends to be slightly too dark, particularly for noisy images. Root cause unknown.
+* Known issue where Kestrel quality algorithm may rank extremely blurry images slightly above other, fairly blurry, images.
 
 
 Features under consideration
-- Build debug platform that runs Kestrel analysis, but saves the full output at every step for detailed troubleshooting and root-cause analysis. (Under Consideration, likely requires simple modification of CLI)
-    - e.g. save all masks, all bird species probabilities, all quality scores, etc. and visualize everything for easy detection.
-    - This may be either a python notebook or a script, unsure.
 * Add a "Quick Export" system or copy thumbnail system.
-* Potentially skip species analysis?
+* Implement "Suggested" system to manually reclassify species quickly based on majority vote of all scene components.
 * Multi-subject mode is not handled super consistently. Consider reworking pipeline to store crop exports of all detected subjects for improved analysis.
 * Implement "Analyze JPGs instead of RAWs" with clear warning that analysis on RAWs is strongly preferred since JPG compression artifacts can dramatically alter quality scores.
 * Investigate GPU support from recent pull request #14
