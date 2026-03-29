@@ -1660,7 +1660,7 @@
       // Step 1: Immediately show the already-loaded thumbnail as a placeholder
       const thumbImgSrc = thumbEl.querySelector('img')?.src;
       if (thumbImgSrc) {
-        previewBox.innerHTML = '';
+        _clearScenePreviewBox(previewBox);
         const stub = document.createElement('img');
         stub.src = thumbImgSrc;
         stub.style.imageRendering = 'crisp-edges';
@@ -1678,7 +1678,7 @@
         if (!sceneZoomActive || sceneZoomRow !== row) return;
         const cachedRaw = sceneRawCache.get(key);
         if (cachedRaw) {
-          previewBox.innerHTML = '';
+          _clearScenePreviewBox(previewBox);
           const imgEl = document.createElement('img');
           imgEl.src = cachedRaw;
           imgEl.dataset.isRaw = '1';
@@ -1695,7 +1695,7 @@
           const url = await getBlobUrlForPath(row.export_path || row.crop_path, row.__rootPath);
           if (!sceneZoomActive || sceneZoomRow !== row) return;
           if (url && url !== thumbImgSrc) {
-            previewBox.innerHTML = '';
+            _clearScenePreviewBox(previewBox);
             const imgEl = document.createElement('img');
             imgEl.src = url;
             imgEl.style.imageRendering = 'crisp-edges';
@@ -1799,6 +1799,91 @@
       row.culled = status || ''; // 'accept', 'reject', or ''
       row.culled_origin = status ? 'manual' : '';
       markDirty();
+    }
+
+    async function _blobUrlToBlob(url) {
+      const resp = await fetch(url);
+      if (!resp.ok) throw new Error(`Failed to fetch image blob (${resp.status})`);
+      return await resp.blob();
+    }
+
+    async function _convertImageBlobToPng(blob) {
+      if (blob.type === 'image/png') return blob;
+      return await new Promise((resolve, reject) => {
+        const srcUrl = URL.createObjectURL(blob);
+        const img = new Image();
+        img.onload = () => {
+          try {
+            const w = img.naturalWidth || img.width;
+            const h = img.naturalHeight || img.height;
+            if (!w || !h) throw new Error('Invalid image dimensions');
+            const canvas = document.createElement('canvas');
+            canvas.width = w;
+            canvas.height = h;
+            const ctx = canvas.getContext('2d');
+            if (!ctx) throw new Error('Canvas context unavailable');
+            ctx.drawImage(img, 0, 0, w, h);
+            canvas.toBlob((pngBlob) => {
+              URL.revokeObjectURL(srcUrl);
+              if (!pngBlob) {
+                reject(new Error('PNG conversion failed'));
+                return;
+              }
+              resolve(pngBlob);
+            }, 'image/png');
+          } catch (e) {
+            URL.revokeObjectURL(srcUrl);
+            reject(e);
+          }
+        };
+        img.onerror = () => {
+          URL.revokeObjectURL(srcUrl);
+          reject(new Error('Image decode failed'));
+        };
+        img.src = srcUrl;
+      });
+    }
+
+    function _clearScenePreviewBox(box) {
+      if (!box) return;
+      for (const child of Array.from(box.children)) {
+        if (child.classList && child.classList.contains('scene-preview-copy-btn')) continue;
+        child.remove();
+      }
+    }
+
+    async function copyRowImageToClipboard(row, relPathOverride, copyLabel = 'image') {
+      const relPath = relPathOverride || row?.export_path || row?.crop_path;
+      if (!relPath) {
+        showToast('No image available to copy', 2500);
+        return;
+      }
+      if (!navigator.clipboard || typeof navigator.clipboard.write !== 'function' || typeof window.ClipboardItem === 'undefined') {
+        setStatus('Clipboard image copy is not supported on this system');
+        showToast('Clipboard image copy is not supported on this system', 3500);
+        return;
+      }
+      try {
+        // Keep clipboard.write close to the user gesture for better compatibility.
+        const pngBlobPromise = (async () => {
+          const blobUrl = await getBlobUrlForPath(relPath, row.__rootPath);
+          if (!blobUrl) throw new Error('Image unavailable');
+          const blob = await _blobUrlToBlob(blobUrl);
+          if (!blob || !blob.size) throw new Error('Empty image payload');
+          return await _convertImageBlobToPng(blob);
+        })();
+        await navigator.clipboard.write([
+          new window.ClipboardItem({ 'image/png': pngBlobPromise })
+        ]);
+
+        const label = row.filename ? `Copied ${copyLabel} (${row.filename})` : `Copied ${copyLabel}`;
+        setStatus('Image copied to clipboard');
+        showToast(`${label} to clipboard`, 2200);
+      } catch (e) {
+        console.error('copyRowImageToClipboard failed:', e);
+        setStatus('Failed to copy image to clipboard');
+        showToast('Failed to copy image to clipboard', 3500);
+      }
     }
 
     function renderFilmstrip(scene) {
@@ -1934,25 +2019,72 @@
       // Load export preview
       const exportBox = el('#previewBox');
       if (exportBox) {
-        exportBox.innerHTML = '';
+        _clearScenePreviewBox(exportBox);
         const eurl = await getBlobUrlForPath(r.export_path, r.__rootPath);
         if (eurl) {
           const eimg = document.createElement('img');
           eimg.src = eurl;
           exportBox.appendChild(eimg);
-        } else { exportBox.innerHTML = '<span class="muted">No export preview</span>'; }
+        } else {
+          const muted = document.createElement('span');
+          muted.className = 'muted';
+          muted.textContent = 'No export preview';
+          exportBox.appendChild(muted);
+        }
       }
 
       // Load crop preview
       const cropBox = el('#previewCropBox');
       if (cropBox) {
-        cropBox.innerHTML = '';
+        _clearScenePreviewBox(cropBox);
         const curl = await getBlobUrlForPath(r.crop_path, r.__rootPath);
         if (curl) {
           const cimg = document.createElement('img');
           cimg.src = curl;
           cropBox.appendChild(cimg);
-        } else { cropBox.innerHTML = '<span class="muted">No crop preview</span>'; }
+        } else {
+          const muted = document.createElement('span');
+          muted.className = 'muted';
+          muted.textContent = 'No crop preview';
+          cropBox.appendChild(muted);
+        }
+      }
+
+      // Wire preview copy actions for the currently displayed row.
+      const copyExportBtn = el('#sceneCopyExportBtn');
+      if (copyExportBtn) {
+        copyExportBtn.disabled = !r.export_path;
+        copyExportBtn.onmousedown = (ev) => {
+          ev.stopPropagation();
+          ev.preventDefault();
+        };
+        copyExportBtn.ondblclick = (ev) => {
+          ev.stopPropagation();
+          ev.preventDefault();
+        };
+        copyExportBtn.onclick = async (ev) => {
+          ev.stopPropagation();
+          ev.preventDefault();
+          await copyRowImageToClipboard(r, r.export_path, 'full image');
+        };
+      }
+
+      const copyCropBtn = el('#sceneCopyCropBtn');
+      if (copyCropBtn) {
+        copyCropBtn.disabled = !r.crop_path;
+        copyCropBtn.onmousedown = (ev) => {
+          ev.stopPropagation();
+          ev.preventDefault();
+        };
+        copyCropBtn.ondblclick = (ev) => {
+          ev.stopPropagation();
+          ev.preventDefault();
+        };
+        copyCropBtn.onclick = async (ev) => {
+          ev.stopPropagation();
+          ev.preventDefault();
+          await copyRowImageToClipboard(r, r.crop_path, 'bird crop');
+        };
       }
 
       // Update preview panel accept/reject glow

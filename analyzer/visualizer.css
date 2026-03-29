@@ -1308,6 +1308,38 @@
       image-rendering: auto;
       display: block;
     }
+    .scene-preview-copy-btn {
+      position: absolute;
+      right: 10px;
+      bottom: 10px;
+      z-index: 6;
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      padding: 4px 8px;
+      border: 1px solid #2a3040;
+      border-radius: 7px;
+      background: rgba(14,17,23,0.88);
+      color: #cbd2dc;
+      font-size: 11px;
+      font-weight: 600;
+      line-height: 1.1;
+      cursor: pointer;
+      transition: background .12s ease, border-color .12s ease, color .12s ease, opacity .12s ease;
+    }
+    .scene-preview-copy-btn:hover {
+      background: #1b2a42;
+      border-color: #3a84e6;
+      color: #fff;
+    }
+    .scene-preview-copy-btn:disabled {
+      cursor: not-allowed;
+      opacity: 0.45;
+    }
+    .scene-preview-copy-btn .copy-icon {
+      font-size: 12px;
+      line-height: 1;
+    }
     .scene-zoom-bar {
       display: flex;
       align-items: center;
