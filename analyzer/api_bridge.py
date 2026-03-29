@@ -19,12 +19,13 @@ from settings_utils import load_persisted_settings, save_persisted_settings, log
 from queue_manager import _queue_manager
 
 try:
-    from kestrel_analyzer.config import JPEG_EXTENSIONS as _JPEG_EXTENSIONS
+    from kestrel_analyzer.config import JPEG_EXTENSIONS as _JPEG_EXTENSIONS, RAW_EXTENSIONS as _RAW_EXTENSIONS
 except ImportError:
     try:
-        from analyzer.kestrel_analyzer.config import JPEG_EXTENSIONS as _JPEG_EXTENSIONS
+        from analyzer.kestrel_analyzer.config import JPEG_EXTENSIONS as _JPEG_EXTENSIONS, RAW_EXTENSIONS as _RAW_EXTENSIONS
     except ImportError:
         _JPEG_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.tif', '.tiff']
+        _RAW_EXTENSIONS = ['.cr2', '.cr3', '.nef', '.arw', '.dng', '.raf', '.orf', '.rw2', '.srw']
 
 # Telemetry — failsafe import (never blocks startup)
 try:
@@ -70,6 +71,10 @@ def _normalize_extensions(exts):
 
 _CULLING_COMPANION_EXTENSIONS = tuple(
     _normalize_extensions(['.xmp', *(_JPEG_EXTENSIONS or [])])
+)
+_RAW_EXTENSION_SET = set(_normalize_extensions(_RAW_EXTENSIONS or []))
+_CULLING_PRIMARY_IMAGE_EXTENSIONS = set(
+    _normalize_extensions([*(_RAW_EXTENSIONS or []), *(_JPEG_EXTENSIONS or [])])
 )
 
 
@@ -1312,6 +1317,72 @@ class Api:
         except Exception as e:
             log(f"undo_reject_move error: {e}")
             return {"success": False, "error": str(e)}
+
+    def get_reject_restore_state(self, root_path: str):
+        """Inspect on-disk traces from prior moves to determine if Undo should be offered."""
+        try:
+            root_path = str(root_path or '').strip()
+            if not root_path or not os.path.isdir(root_path):
+                return {'success': False, 'error': 'Invalid root path'}
+
+            reject_dir = os.path.join(root_path, '_KESTREL_Rejects')
+            kestrel_dir = os.path.join(root_path, '.kestrel')
+            csv_backup = os.path.join(kestrel_dir, 'kestrel_database_old.csv')
+            scenedata_backup = os.path.join(kestrel_dir, 'kestrel_scenedata_old.json')
+
+            has_reject_folder = os.path.isdir(reject_dir)
+            has_csv_backup = os.path.isfile(csv_backup)
+            has_scenedata_backup = os.path.isfile(scenedata_backup)
+
+            if not has_reject_folder:
+                return {
+                    'success': True,
+                    'can_restore': False,
+                    'reject_folder_exists': False,
+                    'reject_count': 0,
+                    'reject_filenames': [],
+                    'has_csv_backup': has_csv_backup,
+                    'has_scenedata_backup': has_scenedata_backup,
+                }
+
+            files = []
+            for name in os.listdir(reject_dir):
+                full = os.path.join(reject_dir, name)
+                if os.path.isfile(full):
+                    files.append(name)
+
+            candidates = []
+            for name in files:
+                ext = os.path.splitext(name)[1].lower()
+                if ext in _CULLING_PRIMARY_IMAGE_EXTENSIONS:
+                    candidates.append(name)
+
+            # Prefer RAW files as primaries so RAW+JPG pairs restore in one operation.
+            candidates.sort(key=lambda n: (0 if os.path.splitext(n)[1].lower() in _RAW_EXTENSION_SET else 1, n.lower()))
+
+            reject_filenames = []
+            excluded = set()
+            for name in candidates:
+                key = name.lower()
+                if key in excluded:
+                    continue
+                reject_filenames.append(name)
+                companions = self._find_companion_files(reject_dir, name)
+                for comp in companions:
+                    excluded.add(comp.lower())
+
+            return {
+                'success': True,
+                'can_restore': len(reject_filenames) > 0,
+                'reject_folder_exists': True,
+                'reject_count': len(reject_filenames),
+                'reject_filenames': reject_filenames,
+                'has_csv_backup': has_csv_backup,
+                'has_scenedata_backup': has_scenedata_backup,
+            }
+        except Exception as e:
+            log(f'get_reject_restore_state error: {e}')
+            return {'success': False, 'error': str(e)}
 
     def backup_kestrel_csv(self, root_path: str):
         """Copy kestrel_database.csv to kestrel_database_old.csv as backup.

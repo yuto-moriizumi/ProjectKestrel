@@ -1184,26 +1184,53 @@
     }
 
     // ---- Wait for pywebview ----
-    function waitForPywebview(timeout = 5000) {
+    function waitForPywebview(requiredMethods = ['read_kestrel_csv'], timeout = 8000) {
+      const methods = Array.isArray(requiredMethods) && requiredMethods.length > 0
+        ? requiredMethods
+        : ['read_kestrel_csv'];
       return new Promise((resolve) => {
-        const checkApi = () => {
-          // Check for both the api object AND a known method
-          if (window.pywebview?.api && typeof window.pywebview.api.read_kestrel_csv === 'function') {
-            resolve(true);
-            return true;
-          }
-          return false;
+        let done = false;
+        let iv = null;
+
+        const finish = (ok) => {
+          if (done) return;
+          done = true;
+          if (iv) clearInterval(iv);
+          window.removeEventListener('pywebviewready', onReady);
+          resolve(ok);
         };
-        
-        if (checkApi()) return;
-        
+
+        const checkApi = () => {
+          const api = window.pywebview?.api;
+          if (!api) return false;
+          return methods.every((methodName) => typeof api[methodName] === 'function');
+        };
+
+        const onReady = () => {
+          if (checkApi()) finish(true);
+        };
+
+        window.addEventListener('pywebviewready', onReady);
+
+        if (checkApi()) {
+          finish(true);
+          return;
+        }
+
         const start = Date.now();
-        const iv = setInterval(() => {
-          if (checkApi()) { clearInterval(iv); resolve(true); }
-          else if (Date.now() - start > timeout) { 
-            clearInterval(iv); 
-            console.error('Timeout waiting for pywebview API. window.pywebview:', window.pywebview, 'api:', window.pywebview?.api);
-            resolve(false); 
+        iv = setInterval(() => {
+          if (checkApi()) {
+            finish(true);
+          } else if (Date.now() - start > timeout) {
+            console.error(
+              'Timeout waiting for pywebview API methods:',
+              methods,
+              'window.pywebview:',
+              window.pywebview,
+              'api:',
+              window.pywebview?.api
+            );
+            finish(false);
           }
         }, 100);
       });
@@ -2175,6 +2202,11 @@
           return;
         }
 
+        if (undoRes.errors && undoRes.errors.length > 0) {
+          console.warn('undo_reject_move errors:', undoRes.errors);
+          showToast(`${undoRes.errors.length} file(s) could not be restored - check console`, 5000);
+        }
+
         // 2. Restore backup CSV
         const restoreRes = await window.pywebview.api.restore_kestrel_db_backup(rootPath);
         if (!restoreRes.success) {
@@ -2188,6 +2220,7 @@
         try { await window.pywebview.api.notify_main_window_refresh(); } catch(_) {}
 
         moveCompleted = false;
+        rejectFilenames = [];
         el('#undoBtn').style.display = 'none';
         el('#doneCullingBtn').disabled = false;
 
@@ -2208,8 +2241,11 @@
       console.log('[culling] typeof read_kestrel_csv:', typeof window.pywebview?.api?.read_kestrel_csv);
       
       if (typeof window.pywebview?.api?.read_kestrel_csv !== 'function') {
-        console.error('[culling] read_kestrel_csv is not available! Available properties:', Object.keys(window.pywebview?.api || {}));
-        throw new Error('read_kestrel_csv is not available on the API');
+        const ready = await waitForPywebview(['read_kestrel_csv'], 8000);
+        if (!ready || typeof window.pywebview?.api?.read_kestrel_csv !== 'function') {
+          console.error('[culling] read_kestrel_csv is not available! Available properties:', Object.keys(window.pywebview?.api || {}));
+          throw new Error('read_kestrel_csv is not available on the API');
+        }
       }
 
       // Compute runtime normalized ratings map (no CSV write)
@@ -2263,6 +2299,39 @@
         } catch (e) {
           console.warn('Legacy cull origin upgrade save failed', e);
         }
+      }
+    }
+
+    async function syncUndoStateFromDisk() {
+      if (typeof window.pywebview?.api?.get_reject_restore_state !== 'function') return;
+      const undoBtn = el('#undoBtn');
+      if (!undoBtn) return;
+
+      try {
+        const state = await window.pywebview.api.get_reject_restore_state(rootPath);
+        if (!state?.success || !state.can_restore || !Array.isArray(state.reject_filenames) || state.reject_filenames.length === 0) {
+          return;
+        }
+
+        rejectFilenames = state.reject_filenames;
+        moveCompleted = true;
+        undoBtn.style.display = '';
+        undoBtn.disabled = false;
+
+        const doneBtn = el('#doneCullingBtn');
+        if (doneBtn) doneBtn.disabled = true;
+
+        const parsedCount = parseInt(state.reject_count, 10);
+        const count = Number.isFinite(parsedCount) && parsedCount >= 0 ? parsedCount : rejectFilenames.length;
+        const suffix = count === 1 ? '' : 's';
+        if (state.has_csv_backup) {
+          el('#statusLabel').textContent = `Previous reject move detected (${count} file${suffix}). Click "Undo Move" to restore.`;
+        } else {
+          el('#statusLabel').textContent = `Previous reject move detected (${count} file${suffix}). Undo can restore files, but backup CSV is missing.`;
+          showToast('Previous reject move detected. Backup CSV is missing; Undo will restore files only.', 5500);
+        }
+      } catch (e) {
+        console.warn('syncUndoStateFromDisk error', e);
       }
     }
 
@@ -2787,7 +2856,7 @@
       const folderName = rootPath.replace(/.*[/\\]/, '') || rootPath;
       el('#folderName').textContent = folderName;
 
-      const ready = await waitForPywebview();
+      const ready = await waitForPywebview(['read_kestrel_csv', 'get_settings'], 10000);
       if (!ready) {
         el('#statusLabel').textContent = 'Error: pywebview API not available';
         return;
@@ -2800,6 +2869,8 @@
         await loadData();
         el('#doneCullingBtn').disabled = false;
         el('#statusLabel').textContent = 'Ready \u2014 Drag images to zoom (auto-loads RAW), Shift+Click to decide, Click \u2605 to rate';
+
+        await syncUndoStateFromDisk();
 
         // Auto-launch tutorial on first run
         const seen = await checkTutorialSeen();

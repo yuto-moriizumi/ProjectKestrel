@@ -6,21 +6,28 @@ Bugs
 * Fix GPU non-supported in Github documentation. [DONE]
 * RAW+JPG co-movement problem in Culling Assistant. [DONE]
 * Frequent failures when running on images with many subjects; find a way to lower Mask-RCNN region proposal threshold to improve performance. [DONE]
-* Test fix to ^
 * Known issue where exposure compensation still tends to be slightly too dark, particularly for noisy images. Root cause unknown. [DONE]
 * Known issue where Kestrel quality algorithm may rank extremely blurry images slightly above other, fairly blurry, images.
 * Auto-save may save all folders rather than just the ones that have been modified.
 * Bug where un-loading a folder that has recently been analyzed sometimes causes it to auto-check itself. Uncertain why. In this situation, hitting the next arrow to skip to the next scene sometimes goes to the next scene of a different folder, if it is loaded with a similar capture time. We need to make sure that the next scene is consistent with the way that the scenes are displayed in the main view. 
 * PIPELINE CHANGE New ML model is needed to correctly handle the exposure shift adjustements.
 * Delete cache files after folder unloaded or software closed. [DONE]
+* Fix bad UI problem when splitting a scene. 
 
 Features under consideration
 * Add a "Quick Export" system or copy thumbnail system. [DONE]
-* Implement "Suggested" system to manually reclassify species quickly based on majority vote of all scene components.
+* Implement "Suggested" system to manually reclassify species quickly based on majority confidence-weighted vote of all scene components.
 * Multi-subject mode is not handled super consistently. Consider reworking pipeline to store crop exports of all detected subjects for improved analysis.
 * Implement "Analyze JPGs instead of RAWs" with clear warning that analysis on RAWs is strongly preferred since JPG compression artifacts can dramatically alter quality scores.
 * Investigate GPU support from recent pull request #14
 * Alter search "show only manually reviewed photos" to include those with manual culling decisions or species selections.
+* Add restore capability that persists after closing/reopening Culling Assistant/Kestrel
+
+Test before release:
+* Fix to Mask-RCNN Region Proposal System
+* Quality classifier performance on revised pipeline
+* RAW+JPG co-movement fix in Culing Assistant
+
 
 ===================================================================================================================
 
