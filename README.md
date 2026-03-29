@@ -152,7 +152,7 @@ Kestrel's quality scoring model is trained on RAW images, and may not work as we
 ## 🔧 Configuration
 
 ### GPU Acceleration
-When running the analyzer, you'll be prompted to choose between:
+GPU is currently NOT supported in the distributed versions of Project Kestrel. GPU may be supported in a future date, but for now, the only option to use GPU is to run Kestrel from source. This will contribute marginal improvements to analysis times, but requires a capable system, and is extremely unstable/not formally supported at this time. To do this, when running the analyzer, you'll be prompted to choose between:
 - **GPU Mode**: Uses DirectML on Windows (faster, requires compatible GPU and Windows OS)
 - **CPU Mode**: Uses CPU execution provider (slightly, but works on all systems)
 
