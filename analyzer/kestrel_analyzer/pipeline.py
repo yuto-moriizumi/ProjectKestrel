@@ -190,7 +190,6 @@ class AnalysisPipeline:
                 # any remaining highlight detail.
                 preserve = 0.8 if stops > 0 else 0.0
                 return raw_obj.postprocess(
-                    no_auto_bright=True,
                     exp_shift=linear_scale,
                     exp_preserve_highlights=preserve,
                 )
