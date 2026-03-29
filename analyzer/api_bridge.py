@@ -18,6 +18,14 @@ import webbrowser
 from settings_utils import load_persisted_settings, save_persisted_settings, log
 from queue_manager import _queue_manager
 
+try:
+    from kestrel_analyzer.config import JPEG_EXTENSIONS as _JPEG_EXTENSIONS
+except ImportError:
+    try:
+        from analyzer.kestrel_analyzer.config import JPEG_EXTENSIONS as _JPEG_EXTENSIONS
+    except ImportError:
+        _JPEG_EXTENSIONS = ['.jpg', '.jpeg', '.png', '.tif', '.tiff']
+
 # Telemetry — failsafe import (never blocks startup)
 try:
     import kestrel_telemetry as _telemetry
@@ -44,6 +52,27 @@ except ImportError:
 HOST = '127.0.0.1'
 
 
+def _normalize_extensions(exts):
+    normalized = []
+    seen = set()
+    for ext in exts or []:
+        e = str(ext or '').strip().lower()
+        if not e:
+            continue
+        if not e.startswith('.'):
+            e = f'.{e}'
+        if e in seen:
+            continue
+        seen.add(e)
+        normalized.append(e)
+    return normalized
+
+
+_CULLING_COMPANION_EXTENSIONS = tuple(
+    _normalize_extensions(['.xmp', *(_JPEG_EXTENSIONS or [])])
+)
+
+
 class Api:
     """JavaScript API exposed to webview for native file/folder operations."""
 
@@ -61,6 +90,7 @@ class Api:
         self._realpath_cache: dict = {}
         self._has_unsaved_changes: bool = False
         self._cache_cleanup_roots: set[str] = set()
+        self._culling_companion_extensions: tuple[str, ...] = _CULLING_COMPANION_EXTENSIONS
 
     def notify_dirty(self, is_dirty: bool) -> dict:
         """Called from JS whenever the dirty flag changes."""
@@ -1143,17 +1173,33 @@ class Api:
             if os.path.exists(alt_sidecar_path):
                 return base_name + ext
         
-        log(f'_find_sidecar_file: Not found for {filename}')
         return None
 
+    def _find_companion_files(self, root_path: str, filename: str) -> list[str]:
+        """Find configured companion files (XMP + JPEG variants) for an image."""
+        companions: list[str] = []
+        seen: set[str] = set()
+        filename_key = str(filename or '').lower()
+
+        for ext in self._culling_companion_extensions:
+            companion = self._find_sidecar_file(root_path, filename, ext)
+            if not companion:
+                continue
+            key = companion.lower()
+            if key == filename_key or key in seen:
+                continue
+            seen.add(key)
+            companions.append(companion)
+
+        return companions
+
     def _move_file_with_sidecars(self, root_path: str, filename: str, reject_dir: str):
-        """Move a file and its sidecar files (.xmp) to reject directory.
+        """Move a file and its configured companion files to reject directory.
         
         Returns (success: bool, moved_files: list[str])
         """
         moved_files = []
-        errors = []
-        
+
         # Move main file
         src = os.path.join(root_path, filename)
         dst = os.path.join(reject_dir, filename)
@@ -1162,33 +1208,31 @@ class Api:
                 shutil.move(src, dst)
                 moved_files.append(filename)
             else:
-                errors.append(f'{filename}: file not found')
-        except Exception as e:
-            errors.append(f'{filename}: {e}')
+                return False, moved_files
+        except Exception:
             return False, moved_files
-        
-        # Move XMP sidecar if it exists
-        xmp_sidecar = self._find_sidecar_file(root_path, filename, '.xmp')
-        if xmp_sidecar:
-            xmp_src = os.path.join(root_path, xmp_sidecar)
-            xmp_dst = os.path.join(reject_dir, xmp_sidecar)
-            try:
-                if os.path.exists(xmp_src):
-                    shutil.move(xmp_src, xmp_dst)
-                    moved_files.append(xmp_sidecar)
-                    
-                else:
-                    log(f'move_rejects: Warning - XMP detected but not found at: {xmp_src}')
-            except Exception as e:
-                # Log warning but don't fail the main move if XMP fails
-                log(f'move_rejects: Warning - Failed to move {xmp_sidecar}: {e}')
+
+        companion_files = self._find_companion_files(root_path, filename)
+        if companion_files:
+            for companion in companion_files:
+                companion_src = os.path.join(root_path, companion)
+                companion_dst = os.path.join(reject_dir, companion)
+                try:
+                    if os.path.exists(companion_src):
+                        shutil.move(companion_src, companion_dst)
+                        moved_files.append(companion)
+                    else:
+                        log(f'move_rejects: Warning - companion detected but not found at: {companion_src}')
+                except Exception as e:
+                    # Log warning but don't fail the main move if a companion fails
+                    log(f'move_rejects: Warning - Failed to move {companion}: {e}')
         else:
-            log(f'move_rejects: No XMP sidecar found for: {filename}')
-        
+            log(f'move_rejects: No companion sidecars found for: {filename}')
+
         return True, moved_files
 
     def move_rejects_to_folder(self, root_path: str, filenames):
-        """Move original photo files and their XMP sidecars into _KESTREL_Rejects subfolder."""
+        """Move original photo files and sidecars into _KESTREL_Rejects subfolder."""
         try:
             if not root_path or not os.path.isdir(root_path):
                 return {'success': False, 'error': 'Invalid root path'}
@@ -1215,13 +1259,12 @@ class Api:
         return _write_xmp_metadata(root_path, image_data, overwrite_external, use_auto_labels)
 
     def _restore_file_with_sidecars(self, reject_dir: str, root_path: str, filename: str):
-        """Restore a file and its sidecar files (.xmp) from reject directory.
-        
-        Checks multiple XMP naming conventions to ensure compatibility.
+        """Restore a file and its configured companion files from reject directory.
+
         Returns (success: bool, restored_files: list[str])
         """
         restored_files = []
-        
+
         # Restore main file
         src = os.path.join(reject_dir, filename)
         dst = os.path.join(root_path, filename)
@@ -1229,50 +1272,29 @@ class Api:
             if os.path.exists(src):
                 shutil.move(src, dst)
                 restored_files.append(filename)
-                
             else:
-                
                 return False, restored_files
-        except Exception as e:
-            
+        except Exception:
             return False, restored_files
-        
-        # Restore XMP sidecar - check multiple naming conventions
-        xmp_sidecar = None
-        
-        # Check primary naming: filename + .xmp (e.g., IMG_001.CR3.xmp)
-        xmp_primary = filename + '.xmp'
-        xmp_src_primary = os.path.join(reject_dir, xmp_primary)
-        if os.path.exists(xmp_src_primary):
-            xmp_sidecar = xmp_primary
-            
+
+        companion_files = self._find_companion_files(reject_dir, filename)
+        if companion_files:
+            for companion in companion_files:
+                companion_src = os.path.join(reject_dir, companion)
+                companion_dst = os.path.join(root_path, companion)
+                try:
+                    shutil.move(companion_src, companion_dst)
+                    restored_files.append(companion)
+                except Exception as e:
+                    # Log warning but don't fail if companion restore fails
+                    log(f'undo_reject_move: Warning - Failed to restore {companion}: {e}')
         else:
-            # Check secondary naming: name_without_ext + .xmp (e.g., IMG_001.xmp)
-            if '.' in filename:
-                base_name = filename.rsplit('.', 1)[0]
-                xmp_secondary = base_name + '.xmp'
-                xmp_src_secondary = os.path.join(reject_dir, xmp_secondary)
-                if os.path.exists(xmp_src_secondary):
-                    xmp_sidecar = xmp_secondary
-                    
-        
-        if xmp_sidecar:
-            xmp_src = os.path.join(reject_dir, xmp_sidecar)
-            xmp_dst = os.path.join(root_path, xmp_sidecar)
-            try:
-                shutil.move(xmp_src, xmp_dst)
-                restored_files.append(xmp_sidecar)
-                
-            except Exception as e:
-                # Log warning but don't fail if XMP restore fails
-                log(f'undo_reject_move: Warning - Failed to restore {xmp_sidecar}: {e}')
-        else:
-            log(f'undo_reject_move: No XMP sidecar found for: {filename}')
-        
+            log(f'undo_reject_move: No companion sidecars found for: {filename}')
+
         return True, restored_files
 
     def undo_reject_move(self, root_path: str, filenames):
-        """Move files and their XMP sidecars back from _KESTREL_Rejects to the root folder."""
+        """Move files and their sidecars back from _KESTREL_Rejects to the root folder."""
         try:
             reject_dir = os.path.join(root_path, "_KESTREL_Rejects")
             if not os.path.isdir(reject_dir):
@@ -1290,9 +1312,10 @@ class Api:
         except Exception as e:
             log(f"undo_reject_move error: {e}")
             return {"success": False, "error": str(e)}
+
     def backup_kestrel_csv(self, root_path: str):
         """Copy kestrel_database.csv to kestrel_database_old.csv as backup.
-        
+
         Deprecated: Use backup_kestrel_db instead for dual backup.
         Kept for backward compatibility.
         """
@@ -1300,11 +1323,11 @@ class Api:
 
     def backup_kestrel_db(self, root_path: str):
         """Backup both kestrel_database.csv and kestrel_scenedata.json before major operations.
-        
+
         Creates:
         - .kestrel/kestrel_database_old.csv (from kestrel_database.csv)
         - .kestrel/kestrel_scenedata_old.json (from kestrel_scenedata.json)
-        
+
         Returns:
             {"success": bool, "backup_csv": str, "backup_scenedata": str, "error": str}
         """
@@ -1314,21 +1337,21 @@ class Api:
             scenedata_path = os.path.join(kestrel_dir, "kestrel_scenedata.json")
             csv_backup = os.path.join(kestrel_dir, "kestrel_database_old.csv")
             scenedata_backup = os.path.join(kestrel_dir, "kestrel_scenedata_old.json")
-            
+
             if not os.path.exists(csv_path):
                 return {"success": False, "error": "kestrel_database.csv not found", "backup_csv": "", "backup_scenedata": ""}
-            
+
             # Backup CSV
             shutil.copy2(csv_path, csv_backup)
             log(f"backup_kestrel_db: CSV backed up to {csv_backup}")
-            
+
             # Backup scenedata if it exists
             scenedata_backed = False
             if os.path.exists(scenedata_path):
                 shutil.copy2(scenedata_path, scenedata_backup)
                 scenedata_backed = True
                 log(f"backup_kestrel_db: Scenedata backed up to {scenedata_backup}")
-            
+
             return {
                 "success": True,
                 "backup_csv": csv_backup,
@@ -1341,7 +1364,7 @@ class Api:
 
     def restore_kestrel_csv_backup(self, root_path: str):
         """Restore kestrel_database_old.csv back to kestrel_database.csv.
-        
+
         Deprecated: Use restore_kestrel_db_backup instead for dual restore.
         Kept for backward compatibility.
         """
@@ -1349,11 +1372,11 @@ class Api:
 
     def restore_kestrel_db_backup(self, root_path: str):
         """Restore both kestrel_database.csv and kestrel_scenedata.json from backups.
-        
+
         Restores from:
         - .kestrel/kestrel_database_old.csv (to kestrel_database.csv)
         - .kestrel/kestrel_scenedata_old.json (to kestrel_scenedata.json, if backup exists)
-        
+
         Returns:
             {"success": bool, "error": str}
         """
@@ -1363,23 +1386,24 @@ class Api:
             csv_backup = os.path.join(kestrel_dir, "kestrel_database_old.csv")
             scenedata_path = os.path.join(kestrel_dir, "kestrel_scenedata.json")
             scenedata_backup = os.path.join(kestrel_dir, "kestrel_scenedata_old.json")
-            
+
             if not os.path.exists(csv_backup):
                 return {"success": False, "error": "kestrel_database_old.csv not found"}
-            
+
             # Restore CSV
             shutil.copy2(csv_backup, csv_path)
             log(f"restore_kestrel_db_backup: CSV restored from {csv_backup}")
-            
+
             # Restore scenedata if backup exists
             if os.path.exists(scenedata_backup):
                 shutil.copy2(scenedata_backup, scenedata_path)
                 log(f"restore_kestrel_db_backup: Scenedata restored from {scenedata_backup}")
-            
+
             return {"success": True, "error": ""}
         except Exception as e:
             log(f"restore_kestrel_db_backup error: {e}")
             return {"success": False, "error": str(e)}
+
     def open_reject_folder(self, root_path: str):
         """Open the _KESTREL_Rejects folder in the system file browser."""
         reject_dir = os.path.join(root_path, '_KESTREL_Rejects')
@@ -1406,7 +1430,7 @@ class Api:
         """Process a RAW file and return full-resolution JPEG as base64.
         Results are cached in {root}/.kestrel/culling_TMP/ for fast subsequent loads.
         Falls back to read_image_file for non-RAW formats.
-        
+
         exp_correction: exposure offset in stops applied during postprocessing.
             0.0 (default) = no correction, matches standard display preview.
             Positive = brighten, negative = darken.  Clamped to [-1.5, +3.0].
@@ -1503,10 +1527,10 @@ class Api:
                     }
                 except Exception:
                     raw_sizes = {}
-                
+
                 # Match pipeline postprocess flow: first call with defaults, then expose-shift if needed
                 rgb = raw.postprocess()
-                
+
                 if exp_correction != 0.0:
                     linear_scale = float(max(0.25, min(8.0, 2.0 ** exp_correction)))
                     preserve = 0.8 if exp_correction > 0 else 0.0
