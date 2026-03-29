@@ -6,11 +6,12 @@ Bugs
 * Fix GPU non-supported in Github documentation.
 * RAW+JPG co-movement problem in Culling Assistant.
 * Frequent failures when running on images with many subjects; find a way to lower Mask-RCNN region proposal threshold to improve performance. - FIX IMPLEMENTED - NOT TESTED
-* Known issue where exposure compensation still tends to be slightly too dark, particularly for noisy images. Root cause unknown.
+* Known issue where exposure compensation still tends to be slightly too dark, particularly for noisy images. Root cause unknown. [DONE]
 * Known issue where Kestrel quality algorithm may rank extremely blurry images slightly above other, fairly blurry, images.
 * Auto-save may save all folders rather than just the ones that have been modified.
 * Bug where un-loading a folder that has recently been analyzed sometimes causes it to auto-check itself. Uncertain why. In this situation, hitting the next arrow to skip to the next scene sometimes goes to the next scene of a different folder, if it is loaded with a similar capture time. We need to make sure that the next scene is consistent with the way that the scenes are displayed in the main view. 
-
+* PIPELINE CHANGE New ML model is needed to correctly handle the exposure shift adjustements.
+* Delete cache files after folder unloaded or software closed. [DONE]
 
 Features under consideration
 * Add a "Quick Export" system or copy thumbnail system. [DONE]

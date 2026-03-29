@@ -485,6 +485,7 @@ def main():
                 pass
         t = threading.Thread(target=_serve, daemon=True)
         t.start()
+        api = None
         try:
             log('Starting windowed UI via pywebview...')
             api = Api() # start maximized
@@ -498,6 +499,13 @@ def main():
                 # Check for unsaved changes via the Python-side flag
                 # (avoid evaluate_js here — it deadlocks because closing runs on the GUI thread)
                 has_unsaved = getattr(api, '_has_unsaved_changes', False)
+
+                def _cleanup_preview_cache_before_exit():
+                    try:
+                        if hasattr(api, 'cleanup_tracked_culling_caches'):
+                            api.cleanup_tracked_culling_caches()
+                    except Exception as e:
+                        log('Cache cleanup on close failed:', e)
 
                 # When an analysis is running or paused, prompt the user with
                 # options to Minimize, Exit (cancel) or Cancel the close.
@@ -523,6 +531,7 @@ def main():
                                     _queue_manager.cancel()
                                 except Exception:
                                     pass
+                                _cleanup_preview_cache_before_exit()
                                 return True
                             if resp == 7:
                                 try:
@@ -549,6 +558,7 @@ def main():
                                     _queue_manager.cancel()
                                 except Exception:
                                     pass
+                                _cleanup_preview_cache_before_exit()
                                 return True
                             if res is False:
                                 try:
@@ -576,6 +586,7 @@ def main():
                             title = 'Unsaved Changes'
                             resp = ctypes.windll.user32.MessageBoxW(0, msg, title, MB_YESNO | MB_ICONWARNING)
                             if resp == 6:  # Yes – close and discard
+                                _cleanup_preview_cache_before_exit()
                                 return True
                             return False  # No – don't close
                         else:
@@ -587,12 +598,15 @@ def main():
                                                'You have unsaved changes that will be lost. Close anyway?')
                             root.destroy()
                             if res:
+                                _cleanup_preview_cache_before_exit()
                                 return True
                             return False
                             return True
                     except Exception:
+                        _cleanup_preview_cache_before_exit()
                         return True  # on failure, allow close
 
+                _cleanup_preview_cache_before_exit()
                 return True  # allow normal close
 
             try:
@@ -608,6 +622,11 @@ def main():
             except Exception:
                 pass
         finally:
+            try:
+                if api is not None and hasattr(api, 'cleanup_tracked_culling_caches'):
+                    api.cleanup_tracked_culling_caches()
+            except Exception as e:
+                log('Cache cleanup during shutdown failed:', e)
             server.shutdown()
             server.server_close()
             log('Server stopped.')

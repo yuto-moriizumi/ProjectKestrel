@@ -60,6 +60,7 @@ class Api:
         # but realpath() does a GetFinalPathNameByHandle syscall on Windows each time.
         self._realpath_cache: dict = {}
         self._has_unsaved_changes: bool = False
+        self._cache_cleanup_roots: set[str] = set()
 
     def notify_dirty(self, is_dirty: bool) -> dict:
         """Called from JS whenever the dirty flag changes."""
@@ -71,6 +72,16 @@ class Api:
         if root_path not in self._realpath_cache:
             self._realpath_cache[root_path] = os.path.realpath(root_path)
         return self._realpath_cache[root_path]
+
+    def _track_cache_root(self, root_path: str) -> None:
+        """Record a folder root whose RAW preview cache should be cleaned on app close."""
+        try:
+            rp = str(root_path or '').strip().rstrip('/\\')
+            if not rp:
+                return
+            self._cache_cleanup_roots.add(os.path.abspath(rp))
+        except Exception:
+            pass
 
     def get_legal_status(self) -> dict:
         """Check if the user has agreed to the terms and if install telemetry was sent."""
@@ -256,6 +267,8 @@ class Api:
             
             with open(csv_path, 'r', encoding='utf-8') as f:
                 data = f.read()
+
+            self._track_cache_root(parent_folder)
             
             
             return {
@@ -684,6 +697,7 @@ class Api:
         """
         try:
             folder_path = str(folder_path).strip().rstrip('/\\')
+            self._track_cache_root(folder_path)
             folder_name = os.path.basename(folder_path)
             if folder_name == '.kestrel':
                 scenedata_path = os.path.join(folder_path, 'kestrel_scenedata.json')
@@ -1406,6 +1420,7 @@ class Api:
             full_path = os.path.normpath(full_path)
             full_path_real = os.path.realpath(full_path)
             root_path_real = os.path.realpath(root_path)
+            self._track_cache_root(root_path_real)
             # Ensure the requested file is inside root_path (or exactly root_path).
             if full_path_real != root_path_real and not full_path_real.startswith(root_path_real + os.sep):
                 return {'success': False, 'error': 'Path escapes root directory'}
@@ -1556,3 +1571,26 @@ class Api:
         except Exception as e:
             log(f'cleanup_culling_cache error: {e}')
             return {'success': False, 'error': str(e)}
+
+    def cleanup_tracked_culling_caches(self):
+        """Clear RAW preview caches for all roots touched in this app session."""
+        try:
+            roots = sorted(self._cache_cleanup_roots)
+            if not roots:
+                return {'success': True, 'cleared': 0, 'failed': []}
+
+            failed = []
+            cleared = 0
+            for root in roots:
+                res = self.cleanup_culling_cache(root)
+                if res.get('success'):
+                    cleared += 1
+                else:
+                    failed.append({'root': root, 'error': res.get('error', 'Unknown error')})
+
+            # Always clear the tracking set; future sessions can re-populate it.
+            self._cache_cleanup_roots.clear()
+            return {'success': len(failed) == 0, 'cleared': cleared, 'failed': failed}
+        except Exception as e:
+            log(f'cleanup_tracked_culling_caches error: {e}')
+            return {'success': False, 'cleared': 0, 'failed': [{'root': '', 'error': str(e)}]}

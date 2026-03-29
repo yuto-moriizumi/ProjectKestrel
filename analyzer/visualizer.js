@@ -3110,6 +3110,7 @@
     // Attempt to notify backend to shutdown when the page is fully unloaded
     window.addEventListener('unload', () => {
       try {
+        _cleanupCachesOnAppClose();
         const backendUrl = getSetting('backendUrl', window.location.origin).replace(/\/$/, '');
         const headers = { 'Content-Type': 'application/json' };
         if (window.__BRIDGE_TOKEN) headers['X-Bridge-Token'] = window.__BRIDGE_TOKEN;
@@ -3737,6 +3738,7 @@
     let treeExpandedPaths = new Set();
     let treeActivePath = null;       // currently single-loaded folder
     let checkedFolderPaths = new Set(); // folders checked for multi-load
+    let _checkedFolderPathSnapshot = new Map(); // normalized path -> original path
     let queuedFolderPaths = new Set(); // folders queued for analysis (dialog selection)
     let _treeFlatOrder = [];           // flat ordered list of visible tree paths for range-select
     let _appVersion = '';              // current app version, fetched once
@@ -5479,6 +5481,73 @@
       return false;
     }
 
+    function _normalizeFolderPathForCache(path) {
+      return String(path || '').trim().replace(/\\/g, '/').replace(/\/+$/, '');
+    }
+
+    function _snapshotCheckedFolderPathMap() {
+      const snapshot = new Map();
+      for (const rawPath of checkedFolderPaths) {
+        const normalized = _normalizeFolderPathForCache(rawPath);
+        if (!normalized || snapshot.has(normalized)) continue;
+        snapshot.set(normalized, rawPath);
+      }
+      return snapshot;
+    }
+
+    async function _cleanupCullingCachesForPaths(paths, reason = '') {
+      if (!paths || paths.length === 0) return;
+
+      // Also clear in-memory caches so the UI can't show stale previews.
+      try { blobUrlCache.clear(); } catch (_) {}
+      try { sceneRawCache.clear(); } catch (_) {}
+      try { sceneRawLoading.clear(); } catch (_) {}
+
+      if (!hasPywebviewApi || !window.pywebview?.api?.cleanup_culling_cache) return;
+      await Promise.all(paths.map(async (rootPath) => {
+        try {
+          const res = await window.pywebview.api.cleanup_culling_cache(rootPath);
+          if (!res?.success) {
+            console.warn('[cache] cleanup_culling_cache failed:', rootPath, res?.error || 'Unknown error', reason);
+          }
+        } catch (e) {
+          console.warn('[cache] cleanup_culling_cache error:', rootPath, reason, e);
+        }
+      }));
+    }
+
+    async function _cleanupUncheckedFolderCaches() {
+      const current = _snapshotCheckedFolderPathMap();
+      const removed = [];
+      for (const [normalized, rawPath] of _checkedFolderPathSnapshot.entries()) {
+        if (!current.has(normalized)) removed.push(rawPath);
+      }
+      _checkedFolderPathSnapshot = current;
+      if (removed.length > 0) {
+        await _cleanupCullingCachesForPaths(removed, 'folder_unchecked');
+      }
+    }
+
+    function _collectLoadedRootsForCleanup() {
+      const roots = new Set();
+      try {
+        for (const p of checkedFolderPaths) if (p) roots.add(p);
+      } catch (_) {}
+      try {
+        for (const r of rows) {
+          if (r && r.__rootPath) roots.add(r.__rootPath);
+        }
+      } catch (_) {}
+      if (rootPath) roots.add(rootPath);
+      return Array.from(roots);
+    }
+
+    function _cleanupCachesOnAppClose() {
+      const roots = _collectLoadedRootsForCleanup();
+      if (!roots.length) return;
+      _cleanupCullingCachesForPaths(roots, 'app_close').catch(() => {});
+    }
+
     /** Start or stop auto-refresh timers for checked in-progress folders. */
     function _updateAutoRefreshTimers() {
       try {
@@ -5557,6 +5626,7 @@
     // Auto-load: fires after a short debounce whenever checkboxes change.
     // If nothing is checked, clears the view gracefully.
     const debouncedAutoLoad = debounce(async () => {
+      await _cleanupUncheckedFolderCaches();
       if (checkedFolderPaths.size > 0) {
         await loadMultipleFolders(Array.from(checkedFolderPaths));
       } else {
@@ -5742,6 +5812,7 @@
           treeActivePath = loadedPath;
           checkedFolderPaths.clear();
           checkedFolderPaths.add(loadedPath);
+          _checkedFolderPathSnapshot = _snapshotCheckedFolderPathMap();
           renderFolderTree();
         }
       } catch (e) {
