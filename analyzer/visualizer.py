@@ -391,11 +391,13 @@ class Handler(SimpleHTTPRequestHandler):
 
     def do_OPTIONS(self):  # Minimal preflight (only allow same-origin JS; token still required)
         if not (LEGACY_HTTP_API_ENABLED or LEGACY_OPEN_ENDPOINT_ENABLED):
+            log('[security] Reject OPTIONS: legacy HTTP API disabled')
             self.send_response(410)
             self.end_headers()
             return
         origin = self.headers.get('Origin')
         if origin and origin != f'http://{HOST}:{self.server.server_port}':  # type: ignore[attr-defined]
+            log('[security] Reject OPTIONS: origin mismatch', origin)
             self.send_response(403); self.end_headers(); return
         self.send_response(204)
         self.send_header('Access-Control-Allow-Origin', origin or f'http://{HOST}:{self.server.server_port}')  # type: ignore[attr-defined]
@@ -491,8 +493,10 @@ class Handler(SimpleHTTPRequestHandler):
         target = build_original_path(root, rel)
         log('open', editor, root, rel, '->', target)
         if not target:
+            log('[security] Reject /open: invalid path payload', {'root': root, 'relative': rel})
             self._json(400, {'ok': False, 'error': 'Invalid path'}); return
         if not _is_within_root(target):
+            log('[security] Reject /open: path escapes allowed root', target)
             self._json(403, {'ok': False, 'error': 'Path escapes allowed root'}); return
         if not os.path.exists(target):
             self._json(404, {
@@ -502,6 +506,7 @@ class Handler(SimpleHTTPRequestHandler):
                 'hint': 'Ensure Settings -> Local Root points to the folder containing your RAW files.'
             }); return
         if not _extension_allowed(target):
+            log('[security] Reject /open: extension not allowed', target)
             self._json(415, {'ok': False, 'error': 'Extension not allowed', 'target': target, 'allowed': sorted(ALLOWED_EXTENSIONS)}); return
         try:
             launch(target, editor)
@@ -543,6 +548,7 @@ class Handler(SimpleHTTPRequestHandler):
         # Best-effort origin check: browsers send Origin on CORS/XHR/fetch.
         # We allow missing Origin for compatibility with some local clients.
         if origin and origin != expected_origin:
+            log('[security] Reject request: origin mismatch', {'origin': origin, 'expected': expected_origin, 'path': self.path})
             self._json(403, {'ok': False, 'error': 'Origin mismatch'})
             return False
         return True
@@ -552,6 +558,7 @@ class Handler(SimpleHTTPRequestHandler):
         if AUTH_TOKEN:
             token = self.headers.get('X-Bridge-Token') or ''
             if token != AUTH_TOKEN:
+                log('[security] Reject request: auth token mismatch', {'path': self.path, 'origin': self.headers.get('Origin')})
                 self._json(401, {'ok': False, 'error': 'Unauthorized'})
                 return False
         return self._check_origin()

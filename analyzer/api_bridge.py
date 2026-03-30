@@ -187,6 +187,138 @@ class Api:
         _, ext = os.path.splitext(path)
         return ext.lower() in _ALLOWED_EDITOR_EXTENSIONS
 
+    def _strip_wrapping_quotes(self, value: str) -> str:
+        s = str(value or '').strip()
+        if (s.startswith('"') and s.endswith('"')) or (s.startswith("'") and s.endswith("'")):
+            s = s[1:-1].strip()
+        return s
+
+    def _log_security_reject(self, context: str, reason: str, **details) -> None:
+        try:
+            parts = []
+            for key, val in details.items():
+                if val is None:
+                    continue
+                txt = str(val)
+                if len(txt) > 300:
+                    txt = txt[:300] + '...'
+                parts.append(f'{key}={txt!r}')
+            suffix = f' ({", ".join(parts)})' if parts else ''
+            log(f'[security] Reject {context}: {reason}{suffix}')
+        except Exception:
+            pass
+
+    def _normalize_input_path(self, value: str) -> str:
+        s = self._strip_wrapping_quotes(value)
+        if not s:
+            return ''
+        try:
+            s = os.path.expanduser(s)
+            return os.path.abspath(os.path.normpath(s))
+        except Exception:
+            return ''
+
+    def _validate_root_dir(self, root_path: str, context: str, require_exists: bool = True) -> tuple[str, str]:
+        root_norm = self._normalize_input_path(root_path)
+        if not root_norm:
+            self._log_security_reject(context, 'Invalid root path', root=root_path)
+            return '', 'Invalid root path'
+
+        root_real = os.path.realpath(root_norm)
+        if _ALLOWED_ROOT and not self._is_within_root(root_real, _ALLOWED_ROOT):
+            self._log_security_reject(context, 'Path outside allowed root', root=root_real, allowed_root=_ALLOWED_ROOT)
+            return '', 'Path outside allowed root'
+
+        if require_exists and not os.path.isdir(root_real):
+            self._log_security_reject(context, 'Root path is not a directory', root=root_real)
+            return '', 'Invalid root path'
+
+        return root_real, ''
+
+    def _resolve_folder_root_and_kestrel(
+        self,
+        folder_path: str,
+        context: str,
+        require_root_exists: bool = True,
+    ) -> tuple[str, str, str, str]:
+        folder_norm = self._normalize_input_path(folder_path)
+        if not folder_norm:
+            self._log_security_reject(context, 'Invalid folder path', folder_path=folder_path)
+            return '', '', '', 'Invalid folder path'
+
+        is_kestrel_folder = os.path.basename(folder_norm).lower() == '.kestrel'
+        root_candidate = os.path.dirname(folder_norm) if is_kestrel_folder else folder_norm
+        root_real, err = self._validate_root_dir(root_candidate, context=context, require_exists=require_root_exists)
+        if err:
+            return '', '', '', err
+
+        kestrel_candidate = folder_norm if is_kestrel_folder else os.path.join(root_real, '.kestrel')
+        kestrel_real = os.path.realpath(os.path.abspath(kestrel_candidate))
+        expected_kestrel = os.path.realpath(os.path.join(root_real, '.kestrel'))
+        if kestrel_real != expected_kestrel:
+            self._log_security_reject(
+                context,
+                'Resolved .kestrel path mismatch',
+                folder_path=folder_path,
+                kestrel_path=kestrel_real,
+                expected=expected_kestrel,
+            )
+            return '', '', '', 'Invalid folder path'
+
+        return root_real, kestrel_real, folder_norm, ''
+
+    def _resolve_path_in_root(
+        self,
+        root_path: str,
+        requested_path: str,
+        context: str,
+        allow_absolute: bool = True,
+    ) -> tuple[str, str, str]:
+        root_real, err = self._validate_root_dir(root_path, context=context, require_exists=True)
+        if err:
+            return '', '', err
+
+        raw = self._strip_wrapping_quotes(requested_path)
+        if not raw:
+            self._log_security_reject(context, 'Empty path value', requested_path=requested_path)
+            return '', '', 'Invalid path'
+
+        raw = raw.replace('\\', '/')
+        if os.path.isabs(raw):
+            if not allow_absolute:
+                self._log_security_reject(context, 'Absolute path not allowed', requested_path=requested_path)
+                return '', '', 'Invalid path'
+            target_abs = self._normalize_input_path(raw)
+        else:
+            rel = raw.lstrip('/\\')
+            if not rel:
+                self._log_security_reject(context, 'Relative path is empty after normalization', requested_path=requested_path)
+                return '', '', 'Invalid path'
+            target_abs = os.path.abspath(os.path.join(root_real, rel))
+
+        target_real = os.path.realpath(target_abs)
+        if not self._is_within_root(target_real, root_real):
+            self._log_security_reject(
+                context,
+                'Path escapes root directory',
+                root=root_real,
+                requested_path=requested_path,
+                resolved_path=target_real,
+            )
+            return '', '', 'Path escapes root directory'
+
+        return root_real, target_real, ''
+
+    def _sanitize_plain_filename(self, filename: str, context: str) -> str:
+        name = self._strip_wrapping_quotes(filename).replace('\\', '/').strip().lstrip('/\\')
+        if not name or name in {'.', '..'}:
+            self._log_security_reject(context, 'Invalid filename', filename=filename)
+            return ''
+        if '/' in name or ':' in name:
+            self._log_security_reject(context, 'Filename must not contain path separators', filename=filename)
+            return ''
+        return name
+
     def get_legal_status(self) -> dict:
         """Check if the user has agreed to the terms and if install telemetry was sent."""
         settings = load_persisted_settings()
@@ -271,28 +403,25 @@ class Api:
 
     def open_file_explorer(self, folder_path):
         """Open a folder in the native file explorer."""
-        if not folder_path:
-            return
-        
+        root_real, err = self._validate_root_dir(folder_path, context='open_file_explorer', require_exists=True)
+        if err:
+            return {'success': False, 'error': err}
+
         try:
-            abs_path = os.path.abspath(folder_path)
-            if not os.path.exists(abs_path):
-                print(f"[API] open_file_explorer: Path does not exist {abs_path}", flush=True)
-                return
-                
             if sys.platform.startswith('win'):
                 if hasattr(os, 'startfile'):
-                    os.startfile(abs_path)
+                    os.startfile(root_real)
                 else:
                     # Fallback for Windows if startfile is somehow missing (e.g. specialized python builds)
-                    subprocess.run(['explorer', abs_path], check=False)
+                    subprocess.run(['explorer', root_real], check=False)
             elif sys.platform == 'darwin':
-                subprocess.run(['open', abs_path], check=False)
+                subprocess.run(['open', root_real], check=False)
             else:
-                subprocess.run(['xdg-open', abs_path], check=False)
+                subprocess.run(['xdg-open', root_real], check=False)
+            return {'success': True, 'path': root_real}
         except Exception as e:
             print(f"[API] open_file_explorer error: {e}", flush=True)
-            return
+            return {'success': False, 'error': str(e)}
 
     def choose_application(self):
         """Open native file picker for choosing an application executable.
@@ -337,29 +466,20 @@ class Api:
         """
         
         try:
-            # Normalize path: remove trailing separators to ensure reliable basename detection
-            folder_path = folder_path.strip()
-            while folder_path and folder_path[-1] in ('/', '\\'):
-                folder_path = folder_path[:-1]
-            
-            if not folder_path:
-                raise ValueError("Empty folder path")
-            
-            
-            # Determine if this IS the .kestrel folder or contains one
-            folder_name = os.path.basename(folder_path)
-            
-            is_kestrel_folder = (folder_name == '.kestrel')
-            
-            if is_kestrel_folder:
-                csv_path = os.path.join(folder_path, 'kestrel_database.csv')
-                parent_folder = os.path.dirname(folder_path)
-                
-            else:
-                csv_path = os.path.join(folder_path, '.kestrel', 'kestrel_database.csv')
-                parent_folder = folder_path
-                
-            
+            parent_folder, kestrel_dir, _, err = self._resolve_folder_root_and_kestrel(
+                folder_path,
+                context='read_kestrel_csv',
+                require_root_exists=True,
+            )
+            if err:
+                return {
+                    'success': False,
+                    'error': err,
+                    'path': '',
+                    'data': ''
+                }
+
+            csv_path = os.path.join(kestrel_dir, 'kestrel_database.csv')
             if not os.path.exists(csv_path):
                 
                 return {
@@ -394,8 +514,15 @@ class Api:
     def read_kestrel_metadata(self, folder_path: str):
         """Read kestrel_metadata.json from a folder's .kestrel directory."""
         try:
-            folder_path = str(folder_path).strip()
-            meta_path = os.path.join(folder_path, '.kestrel', 'kestrel_metadata.json')
+            _, kestrel_dir, _, err = self._resolve_folder_root_and_kestrel(
+                folder_path,
+                context='read_kestrel_metadata',
+                require_root_exists=True,
+            )
+            if err:
+                return {'success': False, 'error': err}
+
+            meta_path = os.path.join(kestrel_dir, 'kestrel_metadata.json')
             if not os.path.isfile(meta_path):
                 return {'success': False, 'error': 'Metadata file not found'}
             with open(meta_path, 'r', encoding='utf-8') as f:
@@ -407,17 +534,19 @@ class Api:
     def clear_kestrel_data(self, folder_path: str):
         """Delete the contents of the .kestrel folder within the given folder."""
         try:
-            folder_path = str(folder_path).strip()
-            kestrel_dir = os.path.join(folder_path, '.kestrel')
+            _, kestrel_dir, _, err = self._resolve_folder_root_and_kestrel(
+                folder_path,
+                context='clear_kestrel_data',
+                require_root_exists=True,
+            )
+            if err:
+                return {'success': False, 'error': err}
+
             if not os.path.isdir(kestrel_dir):
                 return {'success': True, 'message': 'No .kestrel folder found'}
-            # Verify the .kestrel dir is actually inside folder_path (prevent path traversal)
-            real_parent = os.path.realpath(folder_path)
-            real_kestrel = os.path.realpath(kestrel_dir)
-            if not real_kestrel.startswith(real_parent + os.sep) and real_kestrel != os.path.join(real_parent, '.kestrel'):
-                return {'success': False, 'error': 'Invalid path'}
+
             shutil.rmtree(kestrel_dir)
-            print(f"[API] clear_kestrel_data() -> Removed .kestrel from {folder_path}", flush=True)
+            print(f"[API] clear_kestrel_data() -> Removed .kestrel from {kestrel_dir}", flush=True)
             return {'success': True, 'message': 'Kestrel analysis data cleared'}
         except Exception as e:
             print(f"[API] clear_kestrel_data() -> Error: {e}", flush=True)
@@ -491,6 +620,10 @@ class Api:
     def inspect_folder(self, folder_path: str):
         """Return lightweight folder summary (total images, processed count)."""
         try:
+            folder_real, err = self._validate_root_dir(folder_path, context='inspect_folder', require_exists=True)
+            if err:
+                return {'success': False, 'error': err}
+
             import importlib
             inspector = None
             try:
@@ -502,7 +635,7 @@ class Api:
                     inspector = None
             if inspector is None or not hasattr(inspector, 'inspect_folder'):
                 return {'success': False, 'error': 'Inspector unavailable'}
-            info = inspector.inspect_folder(folder_path)
+            info = inspector.inspect_folder(folder_real)
             return {'success': True, 'info': info}
         except Exception as e:
             print(f"[API] inspect_folder() -> Error: {e}", flush=True)
@@ -527,7 +660,29 @@ class Api:
                     paths = json.loads(paths)
                 except Exception:
                     paths = [paths]
-            results = inspector.inspect_folders(list(paths))
+
+            if not isinstance(paths, list):
+                return {'success': False, 'error': 'paths must be a list', 'results': {}}
+
+            validated_paths = []
+            invalid_paths = []
+            for raw in paths:
+                root_real, err = self._validate_root_dir(raw, context='inspect_folders', require_exists=True)
+                if err:
+                    invalid_paths.append(str(raw))
+                    continue
+                validated_paths.append(root_real)
+
+            if invalid_paths:
+                self._log_security_reject('inspect_folders', 'One or more invalid folder paths', invalid_count=len(invalid_paths))
+                return {
+                    'success': False,
+                    'error': 'Invalid folder path in request',
+                    'invalid_paths': invalid_paths,
+                    'results': {},
+                }
+
+            results = inspector.inspect_folders(validated_paths)
             return {'success': True, 'results': results}
         except Exception as e:
             print(f"[API] inspect_folders() -> Error: {e}", flush=True)
@@ -545,23 +700,14 @@ class Api:
             dict with 'success': bool, 'data': str (base64), 'mime': str, 'error': str
         """
         try:
-            # Normalize separators
-            root_path = root_path.rstrip('/\\')
-            relative_path = relative_path.replace('\\', '/')
-
-            # Resolve to full path
-            if os.path.isabs(relative_path):
-                full_path = relative_path
-            else:
-                relative_path = relative_path.lstrip('/\\')
-                full_path = os.path.join(root_path, relative_path)
-
-            # Security check — fast path: no '..' means path cannot escape root.
-            # Slow path: resolve symlinks only when traversal sequences are present.
-            if '..' in relative_path or os.path.isabs(relative_path):
-                root_path_real = self._root_realpath(root_path)
-                if not os.path.realpath(full_path).startswith(root_path_real):
-                    return {'success': False, 'error': 'Path escapes root directory', 'data': '', 'mime': ''}
+            _, full_path, err = self._resolve_path_in_root(
+                root_path,
+                relative_path,
+                context='read_image_file',
+                allow_absolute=True,
+            )
+            if err:
+                return {'success': False, 'error': err, 'data': '', 'mime': ''}
 
             # Read — let open() raise FileNotFoundError rather than a separate stat call
             try:
@@ -595,9 +741,9 @@ class Api:
             Each node: {name, path, has_kestrel, children: [...]}
         """
         try:
-            root_path = root_path.strip().rstrip('/\\')
-            if not root_path or not os.path.isdir(root_path):
-                return {'success': False, 'tree': [], 'error': f'Not a directory: {root_path}'}
+            root_path, err = self._validate_root_dir(root_path, context='list_subfolders', require_exists=True)
+            if err:
+                return {'success': False, 'tree': [], 'error': err}
 
             # Safety caps
             max_depth = max(1, min(int(max_depth), 6))
@@ -674,11 +820,15 @@ class Api:
     def write_kestrel_csv(self, folder_path: str, csv_content: str):
         """Write CSV content back to .kestrel/kestrel_database.csv for the given folder."""
         try:
-            folder_name = os.path.basename(folder_path)
-            if folder_name == '.kestrel':
-                csv_path = os.path.join(folder_path, 'kestrel_database.csv')
-            else:
-                csv_path = os.path.join(folder_path, '.kestrel', 'kestrel_database.csv')
+            _, kestrel_dir, _, err = self._resolve_folder_root_and_kestrel(
+                folder_path,
+                context='write_kestrel_csv',
+                require_root_exists=True,
+            )
+            if err:
+                return {'success': False, 'error': err}
+
+            csv_path = os.path.join(kestrel_dir, 'kestrel_database.csv')
             if not os.path.exists(csv_path):
                 return {'success': False, 'error': f'CSV not found: {csv_path}'}
             with open(csv_path, 'w', encoding='utf-8', newline='') as f:
@@ -725,8 +875,14 @@ class Api:
                     quality_to_rating,
                 )
 
-            folder_path = str(folder_path).strip().rstrip('/\\')
-            kestrel_dir = os.path.join(folder_path, '.kestrel')
+            folder_path, kestrel_dir, _, err = self._resolve_folder_root_and_kestrel(
+                folder_path,
+                context='apply_normalization',
+                require_root_exists=True,
+            )
+            if err:
+                return {'success': False, 'error': err, 'normalized_ratings': {}, 'mode_used': ''}
+
             csv_path = os.path.join(kestrel_dir, 'kestrel_database.csv')
             metadata_path = os.path.join(kestrel_dir, 'kestrel_metadata.json')
 
@@ -793,13 +949,16 @@ class Api:
             {'success': bool, 'data': dict, 'error': str}
         """
         try:
-            folder_path = str(folder_path).strip().rstrip('/\\')
-            self._track_cache_root(folder_path)
-            folder_name = os.path.basename(folder_path)
-            if folder_name == '.kestrel':
-                scenedata_path = os.path.join(folder_path, 'kestrel_scenedata.json')
-            else:
-                scenedata_path = os.path.join(folder_path, '.kestrel', 'kestrel_scenedata.json')
+            root_path, kestrel_dir, _, err = self._resolve_folder_root_and_kestrel(
+                folder_path,
+                context='read_kestrel_scenedata',
+                require_root_exists=True,
+            )
+            if err:
+                return {'success': False, 'data': {}, 'error': err}
+
+            self._track_cache_root(root_path)
+            scenedata_path = os.path.join(kestrel_dir, 'kestrel_scenedata.json')
 
             if not os.path.exists(scenedata_path):
                 # Return an empty-but-valid structure; the UI will fall back to scene_count grouping
@@ -829,12 +988,13 @@ class Api:
             {'success': bool, 'path': str, 'error': str}
         """
         try:
-            folder_path = str(folder_path).strip().rstrip('/\\')
-            folder_name = os.path.basename(folder_path)
-            if folder_name == '.kestrel':
-                kestrel_dir = folder_path
-            else:
-                kestrel_dir = os.path.join(folder_path, '.kestrel')
+            _, kestrel_dir, _, err = self._resolve_folder_root_and_kestrel(
+                folder_path,
+                context='write_kestrel_scenedata',
+                require_root_exists=True,
+            )
+            if err:
+                return {'success': False, 'error': err, 'path': ''}
 
             if not os.path.isdir(kestrel_dir):
                 return {'success': False, 'error': f'.kestrel directory not found at: {kestrel_dir}', 'path': ''}
@@ -853,6 +1013,10 @@ class Api:
     def open_folder(self, path: str):
         """Open a folder in the system file browser (pywebview desktop mode)."""
         try:
+            path, err = self._validate_root_dir(path, context='open_folder', require_exists=True)
+            if err:
+                return {'success': False, 'error': err}
+
             import platform as _platform
             p = _platform.system()
             if p == 'Windows':
@@ -1172,7 +1336,33 @@ class Api:
                 paths = json.loads(paths)
             if not isinstance(paths, list):
                 return {'success': False, 'error': 'paths must be a list'}
-            paths = [str(p).strip() for p in paths if p]
+
+            validated_paths = []
+            invalid_paths = []
+            for raw in paths:
+                if not raw:
+                    continue
+                root_real, err = self._validate_root_dir(raw, context='start_analysis_queue', require_exists=True)
+                if err:
+                    invalid_paths.append(str(raw))
+                    continue
+                if root_real not in validated_paths:
+                    validated_paths.append(root_real)
+
+            if invalid_paths:
+                self._log_security_reject(
+                    'start_analysis_queue',
+                    'One or more queue paths are invalid',
+                    invalid_count=len(invalid_paths),
+                )
+                return {
+                    'success': False,
+                    'error': 'Invalid folder path in queue request',
+                    'invalid_paths': invalid_paths,
+                }
+            if not validated_paths:
+                return {'success': False, 'error': 'No valid paths provided'}
+
             sett = load_persisted_settings()
             detection_threshold = float(sett.get('detection_threshold', 0.75))
             detection_threshold = max(0.1, min(0.99, detection_threshold))
@@ -1180,7 +1370,7 @@ class Api:
             scene_time_threshold = max(0.0, scene_time_threshold)
             mask_threshold = float(sett.get('mask_threshold', 0.5))
             mask_threshold = max(0.5, min(0.95, mask_threshold))
-            return _queue_manager.enqueue(paths, use_gpu=bool(use_gpu),
+            return _queue_manager.enqueue(validated_paths, use_gpu=bool(use_gpu),
                                           wildlife_enabled=bool(wildlife_enabled),
                                           detection_threshold=detection_threshold,
                                           scene_time_threshold=scene_time_threshold,
@@ -1299,11 +1489,16 @@ class Api:
         try:
             if not WEBVIEW_IMPORT_SUCCESS:
                 return {'success': False, 'error': 'pywebview not available'}
+
+            root_real, err = self._validate_root_dir(root_path, context='open_culling_window', require_exists=True)
+            if err:
+                return {'success': False, 'error': err}
+
             import webview as _wv
-            folder_name = os.path.basename(root_path) if root_path else 'Unknown'
+            folder_name = os.path.basename(root_real) if root_real else 'Unknown'
             port = self._server_port or 8765
             from urllib.parse import quote
-            culling_url = f'http://{HOST}:{port}/culling.html?root={quote(root_path, safe="")}'
+            culling_url = f'http://{HOST}:{port}/culling.html?root={quote(root_real, safe="")}'
             
             methods = [m for m in dir(self) if not m.startswith('_') and callable(getattr(self, m))]
             log(f'[culling] Creating window with Api instance')
@@ -1409,20 +1604,44 @@ class Api:
     def move_rejects_to_folder(self, root_path: str, filenames):
         """Move original photo files and sidecars into _KESTREL_Rejects subfolder."""
         try:
-            if not root_path or not os.path.isdir(root_path):
-                return {'success': False, 'error': 'Invalid root path'}
-            reject_dir = os.path.join(root_path, '_KESTREL_Rejects')
+            root_real, err = self._validate_root_dir(root_path, context='move_rejects_to_folder', require_exists=True)
+            if err:
+                return {'success': False, 'error': err}
+
+            reject_dir = os.path.join(root_real, '_KESTREL_Rejects')
+            reject_real = os.path.realpath(reject_dir)
+            if not self._is_within_root(reject_real, root_real):
+                self._log_security_reject('move_rejects_to_folder', 'Reject folder escapes root', root=root_real, reject=reject_real)
+                return {'success': False, 'error': 'Invalid reject folder path'}
+
             os.makedirs(reject_dir, exist_ok=True)
             moved = []
             errors = []
-            for fn in (filenames or []):
-                success, moved_files = self._move_file_with_sidecars(root_path, fn, reject_dir)
+
+            if isinstance(filenames, list):
+                raw_filenames = filenames
+            elif isinstance(filenames, (tuple, set)):
+                raw_filenames = list(filenames)
+            elif filenames:
+                raw_filenames = [filenames]
+            else:
+                raw_filenames = []
+            sanitized_filenames = []
+            for raw in raw_filenames:
+                clean = self._sanitize_plain_filename(raw, context='move_rejects_to_folder')
+                if clean:
+                    sanitized_filenames.append(clean)
+                else:
+                    errors.append(f'{raw}: invalid filename')
+
+            for fn in sanitized_filenames:
+                success, moved_files = self._move_file_with_sidecars(root_real, fn, reject_dir)
                 if success:
                     moved.extend(moved_files)
                 else:
                     errors.append(f'{fn}: move failed')
             log(f'move_rejects: moved {len(moved)} file(s) (including sidecars), errors {len(errors)}')
-            return {'success': True, 'moved': len(moved), 'errors': errors, 'reject_folder': reject_dir}
+            return {'success': True, 'moved': len(moved), 'errors': errors, 'reject_folder': reject_real}
         except Exception as e:
             log(f'move_rejects_to_folder error: {e}')
             return {'success': False, 'error': str(e)}
@@ -1431,7 +1650,10 @@ class Api:
         """Write XMP sidecar files for each image, embedding star rating and culling label."""
         if _write_xmp_metadata is None:
             return {'success': False, 'error': 'metadata_writer module not available'}
-        return _write_xmp_metadata(root_path, image_data, overwrite_external, use_auto_labels)
+        root_real, err = self._validate_root_dir(root_path, context='write_xmp_metadata', require_exists=True)
+        if err:
+            return {'success': False, 'error': err}
+        return _write_xmp_metadata(root_real, image_data, overwrite_external, use_auto_labels)
 
     def _restore_file_with_sidecars(self, reject_dir: str, root_path: str, filename: str):
         """Restore a file and its configured companion files from reject directory.
@@ -1471,13 +1693,40 @@ class Api:
     def undo_reject_move(self, root_path: str, filenames):
         """Move files and their sidecars back from _KESTREL_Rejects to the root folder."""
         try:
-            reject_dir = os.path.join(root_path, "_KESTREL_Rejects")
+            root_real, err = self._validate_root_dir(root_path, context='undo_reject_move', require_exists=True)
+            if err:
+                return {'success': False, 'error': err}
+
+            reject_dir = os.path.join(root_real, "_KESTREL_Rejects")
             if not os.path.isdir(reject_dir):
                 return {"success": False, "error": "_KESTREL_Rejects folder not found"}
+
+            reject_real = os.path.realpath(reject_dir)
+            if not self._is_within_root(reject_real, root_real):
+                self._log_security_reject('undo_reject_move', 'Reject folder escapes root', root=root_real, reject=reject_real)
+                return {'success': False, 'error': 'Invalid reject folder path'}
+
             restored = []
             errors = []
-            for fn in (filenames or []):
-                success, restored_files = self._restore_file_with_sidecars(reject_dir, root_path, fn)
+
+            if isinstance(filenames, list):
+                raw_filenames = filenames
+            elif isinstance(filenames, (tuple, set)):
+                raw_filenames = list(filenames)
+            elif filenames:
+                raw_filenames = [filenames]
+            else:
+                raw_filenames = []
+            sanitized_filenames = []
+            for raw in raw_filenames:
+                clean = self._sanitize_plain_filename(raw, context='undo_reject_move')
+                if clean:
+                    sanitized_filenames.append(clean)
+                else:
+                    errors.append(f'{raw}: invalid filename')
+
+            for fn in sanitized_filenames:
+                success, restored_files = self._restore_file_with_sidecars(reject_dir, root_real, fn)
                 if success:
                     restored.extend(restored_files)
                 else:
@@ -1491,9 +1740,9 @@ class Api:
     def get_reject_restore_state(self, root_path: str):
         """Inspect on-disk traces from prior moves to determine if Undo should be offered."""
         try:
-            root_path = str(root_path or '').strip()
-            if not root_path or not os.path.isdir(root_path):
-                return {'success': False, 'error': 'Invalid root path'}
+            root_path, err = self._validate_root_dir(root_path, context='get_reject_restore_state', require_exists=True)
+            if err:
+                return {'success': False, 'error': err}
 
             reject_dir = os.path.join(root_path, '_KESTREL_Rejects')
             kestrel_dir = os.path.join(root_path, '.kestrel')
@@ -1573,7 +1822,16 @@ class Api:
             {"success": bool, "backup_csv": str, "backup_scenedata": str, "error": str}
         """
         try:
+            root_path, err = self._validate_root_dir(root_path, context='backup_kestrel_db', require_exists=True)
+            if err:
+                return {'success': False, 'error': err, 'backup_csv': '', 'backup_scenedata': ''}
+
             kestrel_dir = os.path.join(root_path, ".kestrel")
+            kestrel_real = os.path.realpath(kestrel_dir)
+            if not self._is_within_root(kestrel_real, root_path):
+                self._log_security_reject('backup_kestrel_db', 'Resolved .kestrel path escapes root', root=root_path, kestrel=kestrel_real)
+                return {'success': False, 'error': 'Invalid .kestrel path', 'backup_csv': '', 'backup_scenedata': ''}
+
             csv_path = os.path.join(kestrel_dir, "kestrel_database.csv")
             scenedata_path = os.path.join(kestrel_dir, "kestrel_scenedata.json")
             csv_backup = os.path.join(kestrel_dir, "kestrel_database_old.csv")
@@ -1622,7 +1880,16 @@ class Api:
             {"success": bool, "error": str}
         """
         try:
+            root_path, err = self._validate_root_dir(root_path, context='restore_kestrel_db_backup', require_exists=True)
+            if err:
+                return {'success': False, 'error': err}
+
             kestrel_dir = os.path.join(root_path, ".kestrel")
+            kestrel_real = os.path.realpath(kestrel_dir)
+            if not self._is_within_root(kestrel_real, root_path):
+                self._log_security_reject('restore_kestrel_db_backup', 'Resolved .kestrel path escapes root', root=root_path, kestrel=kestrel_real)
+                return {'success': False, 'error': 'Invalid .kestrel path'}
+
             csv_path = os.path.join(kestrel_dir, "kestrel_database.csv")
             csv_backup = os.path.join(kestrel_dir, "kestrel_database_old.csv")
             scenedata_path = os.path.join(kestrel_dir, "kestrel_scenedata.json")
@@ -1647,7 +1914,16 @@ class Api:
 
     def open_reject_folder(self, root_path: str):
         """Open the _KESTREL_Rejects folder in the system file browser."""
+        root_path, err = self._validate_root_dir(root_path, context='open_reject_folder', require_exists=True)
+        if err:
+            return {'success': False, 'error': err}
+
         reject_dir = os.path.join(root_path, '_KESTREL_Rejects')
+        reject_real = os.path.realpath(reject_dir)
+        if not self._is_within_root(reject_real, root_path):
+            self._log_security_reject('open_reject_folder', 'Reject folder escapes root', root=root_path, reject=reject_real)
+            return {'success': False, 'error': 'Invalid reject folder path'}
+
         if os.path.isdir(reject_dir):
             return self.open_folder(reject_dir)
         return {'success': False, 'error': '_KESTREL_Rejects folder not found'}
@@ -1681,14 +1957,17 @@ class Api:
         try:
             # Normalize separators from CSV/JS so macOS/Linux don't treat '\\' as a literal char.
             filename = str(filename or '').replace('\\', '/')
-            full_path = os.path.join(root_path, filename)
-            full_path = os.path.normpath(full_path)
-            full_path_real = os.path.realpath(full_path)
-            root_path_real = os.path.realpath(root_path)
+            root_path_real, full_path_real, err = self._resolve_path_in_root(
+                root_path,
+                filename,
+                context='read_raw_full',
+                allow_absolute=True,
+            )
+            if err:
+                return {'success': False, 'error': err}
+
+            full_path = full_path_real
             self._track_cache_root(root_path_real)
-            # Ensure the requested file is inside root_path (or exactly root_path).
-            if full_path_real != root_path_real and not full_path_real.startswith(root_path_real + os.sep):
-                return {'success': False, 'error': 'Path escapes root directory'}
             if not os.path.exists(full_path):
                 return {'success': False, 'error': f'File not found: {filename}'}
 
@@ -1696,7 +1975,7 @@ class Api:
             ext = os.path.splitext(filename)[1].lower()
 
             if ext not in raw_extensions:
-                return self.read_image_file(filename, root_path)
+                return self.read_image_file(filename, root_path_real)
 
             # Clamp exposure correction to the same limits as the pipeline
             try:
@@ -1709,7 +1988,7 @@ class Api:
             use_cache = bool(settings.get('raw_preview_cache_enabled', True))
             debug_logging_enabled = bool(settings.get('raw_preview_debug_logging_enabled', True))
 
-            cache_dir = os.path.join(root_path, '.kestrel', 'culling_TMP')
+            cache_dir = os.path.join(root_path_real, '.kestrel', 'culling_TMP')
             # Cache key includes relative path + extension + file identity.
             # Exposure is intentionally excluded: the UI requests one RAW preview
             # variant per file, already using the selected exposure correction.
@@ -1821,13 +2100,25 @@ class Api:
                 log(f'read_raw_full: Done, {len(jpg_bytes)//1024}KB JPEG ({img.width}x{img.height}), cache disabled')
             return {'success': True, 'data': b64, 'mime': 'image/jpeg', 'debug': debug_meta}
         except Exception as e:
-            log(f'read_raw_full error: {e} (filename={filename}, root_path={root_path})')
+            log(f'read_raw_full error: {e} (filename={filename}, root_path={root_path_real if "root_path_real" in locals() else root_path})')
             return {'success': False, 'error': str(e)}
 
     def cleanup_culling_cache(self, root_path: str):
         """Remove the .kestrel/culling_TMP folder to free up space."""
         try:
-            cache_dir = os.path.join(root_path, '.kestrel', 'culling_TMP')
+            root_real, err = self._validate_root_dir(root_path, context='cleanup_culling_cache', require_exists=False)
+            if err:
+                return {'success': False, 'error': err}
+
+            if not os.path.isdir(root_real):
+                return {'success': True}
+
+            cache_dir = os.path.join(root_real, '.kestrel', 'culling_TMP')
+            cache_real = os.path.realpath(cache_dir)
+            if not self._is_within_root(cache_real, root_real):
+                self._log_security_reject('cleanup_culling_cache', 'Cache path escapes root', root=root_real, cache=cache_real)
+                return {'success': False, 'error': 'Invalid cache path'}
+
             if os.path.exists(cache_dir):
                 shutil.rmtree(cache_dir)
                 log(f'cleanup_culling_cache: Removed {cache_dir}')

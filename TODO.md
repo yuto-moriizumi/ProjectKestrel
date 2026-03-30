@@ -20,8 +20,8 @@ Bugs
 --> remove telemetry debug calls 
 * Canon EOS R5 Mark II RAW Decode Issue --> Bumped Rawpy dependency from 0.23.1 to 0.26.1 [DONE]
 * Resolve dependabot dependency security vulnerability alerts [DONE]
-* Conduct comprehensive security review.
-* Security Fixes: remove browser mode fallback, tighten exposed API endpoints, enforce schema validation for settings files, tighten path normalization escapes, and reduce blast radius of auth token breach. [IN PROGRESS]
+* Conduct comprehensive security review. [DONE]
+* Security Fixes: remove browser mode fallback, tighten exposed API endpoints, enforce schema validation for settings files, tighten path normalization escapes, and reduce blast radius of auth token breach. [DONE]
 
 
 Features under consideration
@@ -38,7 +38,7 @@ Test before release:
 * Fix to Mask-RCNN Region Proposal System [DONE]
 * Quality classifier performance on revised pipeline
 * RAW+JPG co-movement fix in Culing Assistant + test restore capability persists after Kestrel re-opens. [DONE, FIXED]
-* Improvement to crash handling and error logging. 
+* Improvement to crash handling and error logging. [DONE]
 * Test rawpy decode issue. [DONE, FIXED]
 
 
