@@ -12,11 +12,11 @@ Bugs
 * Bug where un-loading a folder that has recently been analyzed sometimes causes it to auto-check itself. Uncertain why. In this situation, hitting the next arrow to skip to the next scene sometimes goes to the next scene of a different folder, if it is loaded with a similar capture time. We need to make sure that the next scene is consistent with the way that the scenes are displayed in the main view. 
 * PIPELINE CHANGE New ML model is needed to correctly handle the exposure shift adjustements.
 * Delete cache files after folder unloaded or software closed. [DONE]
-* Fix bad UI problem when splitting a scene. 
+* Fix bad UI problem when splitting a scene. [DONE]
 
 Features under consideration
 * Add a "Quick Export" system or copy thumbnail system. [DONE]
-* Implement "Suggested" system to manually reclassify species quickly based on majority confidence-weighted vote of all scene components.
+* Implement "Suggested" system to manually reclassify species quickly based on majority confidence-weighted vote of all scene components. [DONE]
 * Multi-subject mode is not handled super consistently. Consider reworking pipeline to store crop exports of all detected subjects for improved analysis.
 * Implement "Analyze JPGs instead of RAWs" with clear warning that analysis on RAWs is strongly preferred since JPG compression artifacts can dramatically alter quality scores.
 * Investigate GPU support from recent pull request #14

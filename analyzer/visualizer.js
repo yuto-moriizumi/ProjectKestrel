@@ -2202,6 +2202,82 @@
       return { ...computed, approved: false };
     }
 
+    function _normalizeTagKey(tagName) {
+      return String(tagName || '').trim().toLowerCase();
+    }
+
+    function _computeConfidenceWeightedSuggestion(sceneRows, tagType) {
+      if (!Array.isArray(sceneRows) || !sceneRows.length) return null;
+      const tallies = new Map();
+      let totalWeight = 0;
+      const invalid = new Set(tagType === 'species'
+        ? ['no bird', 'unknown', 'n/a']
+        : ['unknown', 'n/a', 'no bird']);
+
+      for (const row of sceneRows) {
+        const rawName = tagType === 'species' ? row.species : row.family;
+        const name = String(rawName || '').trim();
+        if (!name) continue;
+        const key = _normalizeTagKey(name);
+        if (!key || invalid.has(key)) continue;
+
+        const rawConfidence = tagType === 'species' ? row.species_confidence : row.family_confidence;
+        const parsedConfidence = parseNumber(rawConfidence);
+        const weight = parsedConfidence >= 0 ? parsedConfidence : 1;
+        if (!(weight > 0)) continue;
+
+        const existing = tallies.get(key);
+        if (existing) {
+          existing.weight += weight;
+          existing.count += 1;
+        } else {
+          tallies.set(key, { name, weight, count: 1 });
+        }
+        totalWeight += weight;
+      }
+
+      if (!tallies.size || !(totalWeight > 0)) return null;
+
+      const ranked = Array.from(tallies.values()).sort((a, b) => {
+        if (b.weight !== a.weight) return b.weight - a.weight;
+        if (b.count !== a.count) return b.count - a.count;
+        return a.name.localeCompare(b.name);
+      });
+
+      const winner = ranked[0];
+      const share = winner.weight / totalWeight;
+      if (!(share > 0.5)) return null;
+
+      return {
+        name: winner.name,
+        share,
+      };
+    }
+
+    function _computeSceneTagSuggestions(sceneId, selectedSpecies = [], selectedFamilies = []) {
+      const sceneRows = getSceneRows(sceneId);
+      if (!sceneRows.length) return { species: null, family: null };
+
+      const speciesSuggestion = _computeConfidenceWeightedSuggestion(sceneRows, 'species');
+      const familySuggestion = _computeConfidenceWeightedSuggestion(sceneRows, 'family');
+
+      const selectedSpeciesKeys = new Set((selectedSpecies || []).map(_normalizeTagKey));
+      const selectedFamilyKeys = new Set((selectedFamilies || []).map(_normalizeTagKey));
+
+      return {
+        species: speciesSuggestion && !selectedSpeciesKeys.has(_normalizeTagKey(speciesSuggestion.name)) ? speciesSuggestion : null,
+        family: familySuggestion && !selectedFamilyKeys.has(_normalizeTagKey(familySuggestion.name)) ? familySuggestion : null,
+      };
+    }
+
+    function _buildSuggestedTagButton(tagType, suggestion) {
+      if (!suggestion || !suggestion.name) return '';
+      const escapedName = escapeHtml(suggestion.name);
+      const pct = Math.round((suggestion.share || 0) * 100);
+      const readableType = tagType === 'species' ? 'species' : 'family';
+      return `<button class="scene-chip-suggested" data-suggest-type="${readableType}" data-suggest-value="${escapedName}" title="Suggested ${readableType} (${pct}% confidence-weighted vote)">+ <em>${escapedName}</em></button>`;
+    }
+
     let _activeTagInputType = null; // 'species' or 'family'
     let _activeTagInputSceneId = null;
 
@@ -2209,6 +2285,7 @@
       const tagsEl = el('#sceneTopbarTags');
       if (!tagsEl) return;
       const { species, families, approved } = collectSceneSpecies(scene.id);
+      const suggestions = _computeSceneTagSuggestions(scene.id, species, families);
       const chipClass = approved ? 'chip manual-approved' : 'chip';
 
       let html = '';
@@ -2220,6 +2297,9 @@
         }
       } else {
         html += '<span class="muted" style="font-size:11px">—</span>';
+      }
+      if (suggestions.species) {
+        html += _buildSuggestedTagButton('species', suggestions.species);
       }
       if (_activeTagInputType === 'species' && _activeTagInputSceneId === String(scene.id)) {
         html += `<span class="chip-input-wrap"><input type="text" class="chip-input" id="inlineTagInput" placeholder="Species..." /><button class="chip-commit-btn" title="Save">✓</button></span>`;
@@ -2237,6 +2317,9 @@
         }
       } else {
         html += '<span class="muted" style="font-size:11px">—</span>';
+      }
+      if (suggestions.family) {
+        html += _buildSuggestedTagButton('family', suggestions.family);
       }
       if (_activeTagInputType === 'family' && _activeTagInputSceneId === String(scene.id)) {
         html += `<span class="chip-input-wrap"><input type="text" class="chip-input" id="inlineTagInput" placeholder="Family..." /><button class="chip-commit-btn" title="Save">✓</button></span>`;
@@ -2288,6 +2371,43 @@
           renderTopbarTags(scene);
           const inp = el('#inlineTagInput');
           if (inp) inp.focus();
+        };
+      });
+
+      // Wire suggested tag buttons
+      tagsEl.querySelectorAll('.scene-chip-suggested').forEach(btn => {
+        btn.onclick = () => {
+          const suggestType = btn.dataset.suggestType;
+          const suggestValue = String(btn.dataset.suggestValue || '').trim();
+          if (!suggestValue || (suggestType !== 'species' && suggestType !== 'family')) return;
+
+          if (!_sceneEditDraft) _beginSceneEditDraft(scene.id);
+          _sceneEditMode = true;
+
+          let changed = false;
+          if (suggestType === 'species') {
+            const before = _sceneEditDraft.species.length;
+            _sceneEditDraft.species = Array.from(new Set([..._sceneEditDraft.species, suggestValue])).sort();
+            changed = _sceneEditDraft.species.length !== before;
+          } else {
+            const before = _sceneEditDraft.families.length;
+            _sceneEditDraft.families = Array.from(new Set([..._sceneEditDraft.families, suggestValue])).sort();
+            changed = _sceneEditDraft.families.length !== before;
+          }
+
+          if (changed) {
+            _finalizeSceneReview(scene.id);
+            showToast(`Added suggested ${suggestType} "${suggestValue}"`, 2000);
+          }
+
+          _sceneEditMode = false;
+          _sceneEditDraft = null;
+          _activeTagInputType = null;
+          _activeTagInputSceneId = null;
+
+          const updatedScene = reloadScene(scene.id) || scene;
+          renderTopbarTags(updatedScene);
+          renderScenes();
         };
       });
 
