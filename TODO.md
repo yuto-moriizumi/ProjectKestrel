@@ -21,12 +21,13 @@ Features under consideration
 * Implement "Analyze JPGs instead of RAWs" with clear warning that analysis on RAWs is strongly preferred since JPG compression artifacts can dramatically alter quality scores.
 * Investigate GPU support from recent pull request #14
 * Alter search "show only manually reviewed photos" to include those with manual culling decisions or species selections.
-* Add restore capability that persists after closing/reopening Culling Assistant/Kestrel
+* Add restore capability that persists after closing/reopening Culling Assistant/Kestrel [DONE]
 
 Test before release:
 * Fix to Mask-RCNN Region Proposal System
 * Quality classifier performance on revised pipeline
-* RAW+JPG co-movement fix in Culing Assistant
+* RAW+JPG co-movement fix in Culing Assistant + test restore capability persists after Kestrel re-opens.
+
 
 
 ===================================================================================================================

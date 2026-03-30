@@ -1609,6 +1609,27 @@
       outline-offset: -2px;
     }
 
+    @keyframes split-scene-btn-flash {
+      0% {
+        box-shadow: 0 0 0 0 rgba(245, 197, 66, 0);
+        transform: translateY(0);
+      }
+      35% {
+        box-shadow: 0 0 0 3px rgba(245, 197, 66, 0.45);
+        border-color: #f5c542;
+        background: #2f3d5a;
+        color: #fff0bf;
+      }
+      100% {
+        box-shadow: 0 0 0 0 rgba(245, 197, 66, 0);
+        transform: translateY(0);
+      }
+    }
+
+    #splitSceneBtn.split-scene-btn-flash {
+      animation: split-scene-btn-flash 180ms ease-in-out 2;
+    }
+
     /* Metadata tooltip on hover over filmstrip filename */
     .filmstrip-card .filmstrip-tooltip {
       display: none;
