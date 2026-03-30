@@ -14,6 +14,11 @@ Bugs
 * Delete cache files after folder unloaded or software closed. [DONE]
 * Fix bad UI problem when splitting a scene. [DONE]
 * Tweak exposure compensation algorithm to be slightly more aggressive in correcting exposure changes; making sure that highlights are not blown out while also making sure that shadows or highly underexposed birds are properly adjusted and lifted. Potentially exclude some of the boundary pixel layers during exposure compensation calculation as they my reflect mask-rcnn boundary inconsistencies. [DONE]
+* Restore Queue bugs - It doesn't seem to be working. The intention is if the program crashes mid-analysis, Kestrel can detect that something went wrong. It will then 1) say "I crashed. want me to send crash report?" 2) "clean crash log"
+* No clean crash log; all current print statements go to terminal output. Need a cleaner way to pipe these into a userprofile's kestrel logs folder. Also too many terminal outputs; some of these need to be cleared to the extent possible.
+--> Remove all "read_image_for_pipeline" logs
+--> remove telemetry debug calls 
+
 
 Features under consideration
 * Add a "Quick Export" system or copy thumbnail system. [DONE]

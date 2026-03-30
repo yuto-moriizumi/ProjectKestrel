@@ -94,14 +94,15 @@ class AnalysisPipeline:
     def _compute_exposure_stops(img: np.ndarray, mask: np.ndarray, profile: str = "normal") -> float:
         """Estimate exposure correction in stops for the masked subject region.
 
-        This is histogram-aware (percentile based), not mean-only. It balances
-        two goals:
-        1) center subject mid-tones toward a neutral target, and
-        2) protect highlight/shadow detail in mixed-contrast scenes.
+        This is histogram-aware (percentile based), not mean-only.
+
+        The solver first finds the maximum exposure lift that still respects
+        highlight and clipping guardrails, then applies profile-specific
+        aggressiveness.
 
         Profile can be "lenient", "normal", or "aggressive".
 
-        Returns a value in [-1.75, +3.0] where positive lifts exposure and
+        Returns a value in [-2.0, +3.0] where positive lifts exposure and
         negative pulls it down.
         """
         EPS = 1e-3
@@ -111,59 +112,58 @@ class AnalysisPipeline:
 
         profile_cfg = {
             "lenient": {
-                "TARGET_MID": 0.49,
-                "TARGET_HI_P90": 0.91,
-                "TARGET_HI_P98": 0.982,
-                "TARGET_HI_P95_HOT": 0.865,
-                "SHADOW_FLOOR_P10": 0.065,
-                "SHADOW_LIFT_TRIGGER_P10": 0.11,
-                "SHADOW_LIFT_MAX": 0.16,
-                "HOT_CLIP_RATIO": 0.012,
-                "MAX_BRIGHTEN": 2.25,
+                "TARGET_HI_P95": 0.90,
+                "TARGET_HI_P98": 0.97,
+                "TARGET_SHADOW_P10": 0.12,
+                "CLIP_THRESH": 0.99,
+                "MAX_CLIP_RATIO": 0.025,
+                "BRIGHTEN_STRENGTH": 0.74,
+                "DARKEN_STRENGTH": 0.7,
+                "MAX_DARKEN": -1.8,
+                "MAX_BRIGHTEN": 1.85,
                 "MAX_ERODE_ITERS": 1,
             },
             "normal": {
-                "TARGET_MID": 0.505,
-                "TARGET_HI_P90": 0.915,
-                "TARGET_HI_P98": 0.983,
-                "TARGET_HI_P95_HOT": 0.87,
-                "SHADOW_FLOOR_P10": 0.065,
-                "SHADOW_LIFT_TRIGGER_P10": 0.13,
-                "SHADOW_LIFT_MAX": 0.3,
-                "HOT_CLIP_RATIO": 0.015,
-                "MAX_BRIGHTEN": 2.75,
+                "TARGET_HI_P95": 0.86,
+                "TARGET_HI_P98": 0.945,
+                "TARGET_SHADOW_P10": 0.15,
+                "CLIP_THRESH": 0.985,
+                "MAX_CLIP_RATIO": 0.012,
+                "BRIGHTEN_STRENGTH": 0.88,
+                "DARKEN_STRENGTH": 0.85,
+                "MAX_DARKEN": -1.9,
+                "MAX_BRIGHTEN": 2.45,
                 "MAX_ERODE_ITERS": 3,
             },
             "aggressive": {
-                "TARGET_MID": 0.525,
-                "TARGET_HI_P90": 0.92,
-                "TARGET_HI_P98": 0.985,
-                "TARGET_HI_P95_HOT": 0.875,
-                "SHADOW_FLOOR_P10": 0.07,
-                "SHADOW_LIFT_TRIGGER_P10": 0.15,
-                "SHADOW_LIFT_MAX": 0.46,
-                "HOT_CLIP_RATIO": 0.018,
+                "TARGET_HI_P95": 0.76,
+                "TARGET_HI_P98": 0.84,
+                "TARGET_SHADOW_P10": 0.19,
+                "CLIP_THRESH": 0.965,
+                "MAX_CLIP_RATIO": 0.0015,
+                "BRIGHTEN_STRENGTH": 1.0,
+                "DARKEN_STRENGTH": 1.0,
+                "MAX_DARKEN": -2.0,
                 "MAX_BRIGHTEN": 3.0,
                 "MAX_ERODE_ITERS": 5,
             },
         }[profile_name]
 
-        TARGET_MID = profile_cfg["TARGET_MID"]
-        TARGET_HI_P90 = profile_cfg["TARGET_HI_P90"]
+        TARGET_HI_P95 = profile_cfg["TARGET_HI_P95"]
         TARGET_HI_P98 = profile_cfg["TARGET_HI_P98"]
-        TARGET_HI_P95_HOT = profile_cfg["TARGET_HI_P95_HOT"]
-        SHADOW_FLOOR_P10 = profile_cfg["SHADOW_FLOOR_P10"]
-        SHADOW_LIFT_TRIGGER_P10 = profile_cfg["SHADOW_LIFT_TRIGGER_P10"]
-        SHADOW_LIFT_MAX = profile_cfg["SHADOW_LIFT_MAX"]
-        HOT_CLIP_RATIO = profile_cfg["HOT_CLIP_RATIO"]
+        TARGET_SHADOW_P10 = profile_cfg["TARGET_SHADOW_P10"]
+        CLIP_THRESH = profile_cfg["CLIP_THRESH"]
+        MAX_CLIP_RATIO = profile_cfg["MAX_CLIP_RATIO"]
+        BRIGHTEN_STRENGTH = profile_cfg["BRIGHTEN_STRENGTH"]
+        DARKEN_STRENGTH = profile_cfg["DARKEN_STRENGTH"]
+        MAX_DARKEN = profile_cfg["MAX_DARKEN"]
         MAX_BRIGHTEN = profile_cfg["MAX_BRIGHTEN"]
         MAX_ERODE_ITERS = int(profile_cfg["MAX_ERODE_ITERS"])
-
-        CLIP_THRESH = 0.985
-        MAX_DARKEN = -1.75
         try:
             img_f = img.astype(np.float32) / 255.0
-            mask_bool = mask.astype(bool) if mask is not None else None
+            # Exposure compensation uses a detached mask copy so any erosion
+            # done here cannot alter masks used by overlays/crops/classifier.
+            mask_bool = np.array(mask, dtype=bool, copy=True) if mask is not None else None
             if (
                 mask_bool is not None
                 and mask_bool.any()
@@ -172,7 +172,7 @@ class AnalysisPipeline:
             ):
                 # Exclude edge pixels from the exposure histogram because mask
                 # boundaries often contain mixed foreground/background values.
-                mask_u8 = mask_bool.astype(np.uint8)
+                mask_u8 = np.array(mask_bool, dtype=np.uint8, copy=True)
                 area = int(np.count_nonzero(mask_u8))
                 if area >= 256:
                     erode_iters = 1
@@ -196,49 +196,84 @@ class AnalysisPipeline:
             lum = lum[np.isfinite(lum)]
             if lum.size == 0:
                 return 0.0
-            p10, p35, p50, p90, p95, p98 = np.percentile(lum, [10, 35, 50, 90, 95, 98])
-            clip_ratio = float(np.mean(lum >= CLIP_THRESH))
+            p10, p95, p98 = np.percentile(lum, [10, 95, 98])
 
-            # Midtone intent uses a lower-percentile anchor so underexposed
-            # subjects are lifted a little more aggressively.
-            mid_anchor = 0.7 * float(p50) + 0.3 * float(p35)
-            mid_stop = float(np.log2(TARGET_MID / max(mid_anchor, EPS)))
+            # Find maximum stop value that still satisfies clipped-pixel ratio.
+            def _clip_ratio_after(stops_val: float) -> float:
+                scale = 2.0 ** float(stops_val)
+                return float(np.mean((lum * scale) >= CLIP_THRESH))
 
-            # Add a bounded shadow lift for very dark subjects.
-            if p50 < TARGET_MID:
-                darkness = float(
-                    np.clip(
-                        (SHADOW_LIFT_TRIGGER_P10 - float(p10))
-                        / max(SHADOW_LIFT_TRIGGER_P10, EPS),
-                        0.0,
-                        1.0,
-                    )
-                )
-                mid_stop += darkness * SHADOW_LIFT_MAX
+            if _clip_ratio_after(MAX_DARKEN) > MAX_CLIP_RATIO:
+                clip_ceiling = MAX_DARKEN
+            elif _clip_ratio_after(MAX_BRIGHTEN) <= MAX_CLIP_RATIO:
+                clip_ceiling = MAX_BRIGHTEN
+            else:
+                lo = MAX_DARKEN
+                hi = MAX_BRIGHTEN
+                for _ in range(20):
+                    mid = (lo + hi) / 2.0
+                    if _clip_ratio_after(mid) <= MAX_CLIP_RATIO:
+                        lo = mid
+                    else:
+                        hi = mid
+                clip_ceiling = lo
 
-            # Highlight ceilings prevent over-bright outputs.
-            hi90_stop = float(np.log2(TARGET_HI_P90 / max(float(p90), EPS)))
+            hi95_stop = float(np.log2(TARGET_HI_P95 / max(float(p95), EPS)))
             hi98_stop = float(np.log2(TARGET_HI_P98 / max(float(p98), EPS)))
-            highlight_ceiling = min(hi90_stop, hi98_stop, MAX_BRIGHTEN)
+            highlight_ceiling = min(hi95_stop, hi98_stop, clip_ceiling, MAX_BRIGHTEN)
 
-            # Shadow floor prevents excessive darkening in high dynamic-range masks.
-            shadow_floor = max(MAX_DARKEN, float(np.log2(SHADOW_FLOOR_P10 / max(float(p10), EPS))))
+            # Ensure dark subjects are still lifted when highlight headroom allows.
+            shadow_push_stop = float(np.log2(TARGET_SHADOW_P10 / max(float(p10), EPS)))
 
-            # Start from midtone intent, then clamp by highlight/shadow guardrails.
-            stops = float(np.clip(mid_stop, shadow_floor, highlight_ceiling))
+            if highlight_ceiling >= 0.0:
+                stops = highlight_ceiling * BRIGHTEN_STRENGTH
+                if shadow_push_stop > 0.0:
+                    stops = max(stops, min(shadow_push_stop, highlight_ceiling))
+            else:
+                # Negative stops darken bright subjects; aggressive mode uses full
+                # darken strength while other profiles back off.
+                stops = highlight_ceiling * DARKEN_STRENGTH
 
-            # If a meaningful chunk is clipped/highlight-hot, bias a little darker
-            # to recover structure in bright regions.
-            if clip_ratio >= HOT_CLIP_RATIO:
-                hot_stop = float(np.log2(TARGET_HI_P95_HOT / max(float(p95), EPS)))
-                stops = min(stops, hot_stop)
-                stops = float(np.clip(stops, MAX_DARKEN, MAX_BRIGHTEN))
+            stops = float(np.clip(stops, MAX_DARKEN, MAX_BRIGHTEN))
 
             if not np.isfinite(stops):
                 return 0.0
             return stops
         except Exception:
             return 0.0
+
+    @staticmethod
+    def _refine_exposure_stops(
+        img: np.ndarray,
+        mask: np.ndarray,
+        initial_stops: float,
+        profile: str,
+        raw_obj=None,
+    ) -> float:
+        """Iteratively refine exposure stops for residual clipping/highlights.
+
+        This is used as a safety pass for aggressive profile darkening where
+        one-shot estimation can under-correct very hot highlights.
+        """
+        total = float(initial_stops)
+        profile_name = str(profile or "normal").strip().lower()
+        if profile_name != "aggressive":
+            return total
+        # Refinement is only needed when we're already in highlight-recovery mode.
+        if total >= -0.05:
+            return total
+
+        for _ in range(2):
+            corrected = AnalysisPipeline._apply_exposure_correction(img, total, raw_obj)
+            residual = AnalysisPipeline._compute_exposure_stops(corrected, mask, profile_name)
+            # Only accumulate additional darkening from residual highlight pressure.
+            if not np.isfinite(residual) or residual >= -0.03:
+                break
+            total += residual * 0.85
+            total = float(np.clip(total, -2.0, 3.0))
+            if total <= -1.95:
+                break
+        return total
 
     @staticmethod
     def _apply_exposure_correction(
@@ -653,6 +688,13 @@ class AnalysisPipeline:
                     def process_nonbird(primary_mask_i):
                         stage_ctx["stage"] = "process_nonbird"
                         stops = self._compute_exposure_stops(img, masks[primary_mask_i], exposure_profile)
+                        stops = self._refine_exposure_stops(
+                            img,
+                            masks[primary_mask_i],
+                            stops,
+                            exposure_profile,
+                            raw_obj=raw_obj,
+                        )
                         img_src = self._apply_exposure_correction(img, stops, raw_obj)
                         quality_crop, quality_mask = self.mask_rcnn.get_square_crop(
                             masks[primary_mask_i], img_src, resize=True
@@ -676,6 +718,13 @@ class AnalysisPipeline:
                             # Process per-crop results. Pause is checked at the
                             # top of the image loop so we avoid pausing mid-image.
                             stops = self._compute_exposure_stops(img, masks[i], exposure_profile)
+                            stops = self._refine_exposure_stops(
+                                img,
+                                masks[i],
+                                stops,
+                                exposure_profile,
+                                raw_obj=raw_obj,
+                            )
                             img_src = self._apply_exposure_correction(img, stops, raw_obj)
                             species_crop = self.mask_rcnn.get_species_crop(pred_boxes[i], img_src)
                             quality_crop, quality_mask = self.mask_rcnn.get_square_crop(masks[i], img_src, resize=True)
