@@ -963,6 +963,25 @@ class Api:
             if not isinstance(existing, dict):
                 existing = {}
             merged = {**existing, **settings_dict}
+
+            # Keep cumulative impact counters monotonic so stale UI payloads cannot
+            # accidentally reset totals to a lower value.
+            def _coerce_number(v):
+                try:
+                    return float(v)
+                except (TypeError, ValueError):
+                    return None
+
+            prev_files = _coerce_number(existing.get('kestrel_impact_total_files'))
+            new_files = _coerce_number(merged.get('kestrel_impact_total_files'))
+            if prev_files is not None and (new_files is None or new_files < prev_files):
+                merged['kestrel_impact_total_files'] = int(prev_files)
+
+            prev_secs = _coerce_number(existing.get('kestrel_impact_total_seconds'))
+            new_secs = _coerce_number(merged.get('kestrel_impact_total_seconds'))
+            if prev_secs is not None and (new_secs is None or new_secs < prev_secs):
+                merged['kestrel_impact_total_seconds'] = prev_secs
+
             save_persisted_settings(merged)
             return {'success': True}
         except Exception as e:

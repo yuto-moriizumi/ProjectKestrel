@@ -16,10 +16,12 @@ Build single-file EXE (example):
     pyinstaller --onefile --name kestrel_viz visualizer/visualizer.py
 
 Optionally set env vars (same as editor_bridge):
-    KESTREL_ALLOWED_ROOT=C:/Photos/Trip  (restrict paths)
-  KESTREL_BRIDGE_TOKEN=secret              (require auth header)
-  KESTREL_ALLOWED_EXTENSIONS=.cr3,.jpg,... (override allowed list)
-  KESTREL_ALLOW_ANY_EXTENSION=1            (disable extension filtering)
+        KESTREL_ALLOWED_ROOT=C:/Photos/Trip  (restrict paths)
+    KESTREL_BRIDGE_TOKEN=secret              (require auth header)
+    KESTREL_ALLOWED_EXTENSIONS=.cr3,.jpg,... (override allowed list)
+    KESTREL_ALLOW_ANY_EXTENSION=1            (disable extension filtering)
+    KESTREL_ENABLE_LEGACY_HTTP_API=1         (re-enable legacy local HTTP control routes)
+    KESTREL_ENABLE_LEGACY_OPEN_ENDPOINT=1    (re-enable legacy HTTP /open endpoint)
 
 """
 
@@ -65,7 +67,8 @@ HOST = '127.0.0.1'
 # a unified token+origin security policy while the local HTTP bridge exists.
 SECURITY_POLICY_VERSION = '2026-03-30'
 BROWSER_ONLY_MODE_SUPPORTED = False
-API_AUTH_POLICY = 'desktop-api-preferred;token+origin-required-for-legacy-http-api'
+API_AUTH_POLICY = 'desktop-api-preferred;legacy-http-api-disabled-by-default'
+LEGACY_HTTP_API_ENABLED = os.environ.get('KESTREL_ENABLE_LEGACY_HTTP_API') == '1'
 LEGACY_OPEN_ENDPOINT_ENABLED = os.environ.get('KESTREL_ENABLE_LEGACY_OPEN_ENDPOINT') == '1'
 LEGAL_SELF_HEAL_MIGRATION_KEY = 'legal_upgrade_self_heal_2026_03'
 
@@ -322,16 +325,25 @@ class Handler(SimpleHTTPRequestHandler):
             self.wfile.write(body)
             return
         if self.path == '/settings':
+            if not LEGACY_HTTP_API_ENABLED:
+                self._json(410, {'ok': False, 'error': 'Legacy HTTP API disabled; use pywebview API.'})
+                return
             if not self._check_auth():
                 return
             self._json(200, {'ok': True, 'settings': load_persisted_settings()})
             return
         if self.path == '/queue/status':
+            if not LEGACY_HTTP_API_ENABLED:
+                self._json(410, {'ok': False, 'error': 'Legacy HTTP API disabled; use pywebview API.'})
+                return
             if not self._check_auth():
                 return
             self._json(200, _queue_manager.get_status())
             return
         if self.path == '/recovery/status':
+            if not LEGACY_HTTP_API_ENABLED:
+                self._json(410, {'ok': False, 'error': 'Legacy HTTP API disabled; use pywebview API.'})
+                return
             if not self._check_auth():
                 return
             self.handle_recovery_status()
@@ -378,6 +390,10 @@ class Handler(SimpleHTTPRequestHandler):
         return super().do_GET()
 
     def do_OPTIONS(self):  # Minimal preflight (only allow same-origin JS; token still required)
+        if not (LEGACY_HTTP_API_ENABLED or LEGACY_OPEN_ENDPOINT_ENABLED):
+            self.send_response(410)
+            self.end_headers()
+            return
         origin = self.headers.get('Origin')
         if origin and origin != f'http://{HOST}:{self.server.server_port}':  # type: ignore[attr-defined]
             self.send_response(403); self.end_headers(); return
@@ -390,25 +406,49 @@ class Handler(SimpleHTTPRequestHandler):
     def do_POST(self):  # type: ignore[override]
         parsed = urlparse(self.path)
         if parsed.path == '/open':
-            if LEGACY_OPEN_ENDPOINT_ENABLED:
+            if LEGACY_OPEN_ENDPOINT_ENABLED or LEGACY_HTTP_API_ENABLED:
                 self.handle_open()
             else:
                 self._json(410, {'ok': False, 'error': 'HTTP /open is disabled; use pywebview open_in_editor API.'})
         elif parsed.path == '/settings':
+            if not LEGACY_HTTP_API_ENABLED:
+                self._json(410, {'ok': False, 'error': 'Legacy HTTP API disabled; use pywebview API.'})
+                return
             self.handle_settings()
         elif parsed.path == '/feedback':
+            if not LEGACY_HTTP_API_ENABLED:
+                self._json(410, {'ok': False, 'error': 'Legacy HTTP API disabled; use pywebview API.'})
+                return
             self.handle_feedback()
         elif parsed.path == '/shutdown':
+            if not LEGACY_HTTP_API_ENABLED:
+                self._json(410, {'ok': False, 'error': 'Legacy HTTP API disabled; use pywebview API.'})
+                return
             self.handle_shutdown()
         elif parsed.path == '/queue/start':
+            if not LEGACY_HTTP_API_ENABLED:
+                self._json(410, {'ok': False, 'error': 'Legacy HTTP API disabled; use pywebview API.'})
+                return
             self.handle_queue_start()
         elif parsed.path in ('/queue/pause', '/queue/resume', '/queue/cancel', '/queue/clear'):
+            if not LEGACY_HTTP_API_ENABLED:
+                self._json(410, {'ok': False, 'error': 'Legacy HTTP API disabled; use pywebview API.'})
+                return
             self.handle_queue_control(parsed.path)
         elif parsed.path == '/recovery/restore':
+            if not LEGACY_HTTP_API_ENABLED:
+                self._json(410, {'ok': False, 'error': 'Legacy HTTP API disabled; use pywebview API.'})
+                return
             self.handle_recovery_restore()
         elif parsed.path == '/recovery/clear':
+            if not LEGACY_HTTP_API_ENABLED:
+                self._json(410, {'ok': False, 'error': 'Legacy HTTP API disabled; use pywebview API.'})
+                return
             self.handle_recovery_clear()
         elif parsed.path == '/recovery/report':
+            if not LEGACY_HTTP_API_ENABLED:
+                self._json(410, {'ok': False, 'error': 'Legacy HTTP API disabled; use pywebview API.'})
+                return
             self.handle_recovery_report()
         else:
             self.send_response(404); self.end_headers(); self.wfile.write(b'{}')
@@ -657,6 +697,7 @@ def main():
     if runtime_log_path:
         log('Runtime log capture enabled:', runtime_log_path)
     log('Security policy:', SECURITY_POLICY_VERSION, API_AUTH_POLICY, 'browser_mode_supported=', BROWSER_ONLY_MODE_SUPPORTED)
+    log('Legacy HTTP control API enabled =', LEGACY_HTTP_API_ENABLED, '| legacy /open enabled =', LEGACY_OPEN_ENDPOINT_ENABLED)
     _mark_session_start()
 
     # When visualizer.py is run from inside analyzer/ (merged layout) set
@@ -679,7 +720,10 @@ def main():
         os.chdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..') or '.')
     server = ThreadingHTTPServer((HOST, args.port), Handler)
     log(f'Serving visualizer at http://{HOST}:{args.port}/  (Press Ctrl+C to stop)')
-    log('HTTP bridge token initialized for legacy endpoint compatibility.')
+    if LEGACY_HTTP_API_ENABLED or LEGACY_OPEN_ENDPOINT_ENABLED:
+        log('HTTP bridge token initialized for legacy endpoint compatibility.')
+    else:
+        log('Legacy HTTP control endpoints are disabled by default.')
 
     # ── Settings init: ensure machine_id and version are persisted ──
     try:

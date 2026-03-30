@@ -3736,7 +3736,10 @@
       } catch (_) { }
     }
 
-    function showSettings() {
+    async function showSettings() {
+      // Refresh local cache from persisted settings before rendering values.
+      try { await hydrateSettingsFromServer(); } catch (_) { }
+
       const dlg = document.getElementById('settingsDlg');
       const editor = getSetting('editor', 'darktable');
       const editorSelect = document.getElementById('editorChoice');
@@ -3798,7 +3801,7 @@
         ? (optedIn === true ? 'Opted in' : 'Not sharing')
         : 'Not yet decided';
       
-      // Display total impact (photos analyzed) - read from localStorage settings
+      // Display total impact (photos analyzed) from hydrated local settings.
       const totalPhotos = getSetting('kestrel_impact_total_files', 0);
       const impactEl = document.getElementById('settingsTotalImpact');
       if (impactEl) {
@@ -3916,7 +3919,7 @@
     document.getElementById('settingsDlg').addEventListener('change', () => _setSettingsDirty(true));
     document.getElementById('settingsDlg').addEventListener('input', () => _setSettingsDirty(true));
 
-    document.getElementById('openSettings').addEventListener('click', showSettings);
+    document.getElementById('openSettings').addEventListener('click', () => { void showSettings(); });
     document.getElementById('settingsSave').addEventListener('click', async () => {
       await applySettings();
       _setSettingsDirty(false);
@@ -4120,8 +4123,12 @@
       try {
         let total = 0;
         if (hasPywebviewApi && window.pywebview?.api?.get_settings) {
-          const s = await window.pywebview.api.get_settings();
-          total = (s && s.kestrel_impact_total_files) ? s.kestrel_impact_total_files : 0;
+          const res = await window.pywebview.api.get_settings();
+          const s = (res && res.success && res.settings && typeof res.settings === 'object') ? res.settings : null;
+          if (s) {
+            saveSettings({ ...loadSettings(), ...s });
+            total = Number(s.kestrel_impact_total_files || 0);
+          }
         }
         if (total <= 0) return;
         const thresholds = [1000, 5000, 10000, 25000, 50000, 100000, 200000];
@@ -4141,8 +4148,18 @@
     /** Check donation threshold on app startup (only once). */
     async function checkDonationThresholdOnStartup() {
       try {
-        // Read from localStorage (same source as the settings dialog)
+        // Prefer persisted settings from backend, then local cache as fallback.
         let total = getSetting('kestrel_impact_total_files', 0);
+        if (hasPywebviewApi && window.pywebview?.api?.get_settings) {
+          try {
+            const res = await window.pywebview.api.get_settings();
+            const s = (res && res.success && res.settings && typeof res.settings === 'object') ? res.settings : null;
+            if (s) {
+              saveSettings({ ...loadSettings(), ...s });
+              total = Number(s.kestrel_impact_total_files || total || 0);
+            }
+          } catch (_) { }
+        }
         console.log('[donation] checkDonationThresholdOnStartup: total =', total);
         if (total < 1000) {
           console.log('[donation] Total < 1000, skipping');
