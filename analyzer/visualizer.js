@@ -874,6 +874,24 @@
     // Helper: is this image manually rated (>0 stars)?
     function isManualRated(r) { return getRating(r) > 0 && getOrigin(r) === 'manual'; }
 
+    function isManualCullDecision(r) {
+      const status = getCullStatus(r);
+      return status === 'accept' || status === 'reject';
+    }
+
+    function hasReviewedSceneMetadata(scene) {
+      if (!scene) return false;
+      if (scene.isApproved) return true;
+      return String(scene.sceneName || '').trim().length > 0;
+    }
+
+    function isManuallyReviewedScene(scene) {
+      if (!scene) return false;
+      if (hasReviewedSceneMetadata(scene)) return true;
+      return Array.isArray(scene.images)
+        && scene.images.some(r => isManualRated(r) || isManualCullDecision(r));
+    }
+
     function aggregateScenes(minSpeciesConf, searchTerm, sortBy, includeSecondary, includeFamilies) {
       const groups = new Map();
       for (const r of rows) {
@@ -1045,7 +1063,7 @@
       const minC = parseFloat(el('#speciesConf').value) || 0;
       const search = el('#search').value;
       const sortBy = el('#sortBy').value;
-      const onlyRatedScenes = !!document.getElementById('filterScenesManualRated')?.checked;
+      const onlyReviewedScenes = !!document.getElementById('filterScenesManualRated')?.checked;
       const groupByFolder = document.getElementById('groupByFolder')?.checked ?? getSetting('groupByFolder', true);
       const groupByTime = document.getElementById('groupByTime')?.checked ?? getSetting('groupByTime', true);
       const includeSecondaryCheckbox = document.getElementById('includeSecondarySpecies');
@@ -1061,8 +1079,12 @@
         if (refreshed) _currentScene = refreshed;
       }
 
-      // Apply scene-level manual-rated filter without mutating global scenes
-      const visibleScenes = onlyRatedScenes ? scenes.filter(s => s.images.some(isManualRated)) : scenes;
+      // Apply scene-level manual-reviewed filter without mutating global scenes.
+      // Reviewed means any of:
+      //  - scene tags finalized by user, or scene renamed by user
+      //  - manual/verified accept-reject culling decision on any image
+      //  - manual star rating on any image
+      const visibleScenes = onlyReviewedScenes ? scenes.filter(isManuallyReviewedScene) : scenes;
 
       updateStatusBar(visibleScenes);
       sceneGrid.innerHTML = '';
@@ -6243,7 +6265,7 @@
     if (zoomInBtn) zoomInBtn.addEventListener('click', () => { uiZoom = Math.min(1.4, uiZoom + 0.1); applyZoom(); });
     if (zoomOutBtn) zoomOutBtn.addEventListener('click', () => { uiZoom = Math.max(0.7, uiZoom - 0.1); applyZoom(); });
 
-    // Initialize toolbar toggle for scene-level manual-rated filter
+    // Initialize toolbar toggle for scene-level manual-reviewed filter
     (function initScenesManualFilter() {
       const t = document.getElementById('filterScenesManualRated');
       if (!t) return;
