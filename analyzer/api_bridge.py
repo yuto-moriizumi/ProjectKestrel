@@ -823,7 +823,7 @@ class Api:
             log_tail = ''
             if data.get('include_logs', False):
                 active_folder = str(settings.get('active_analysis_path', '') or '').strip()
-                log_tail = _telemetry.get_recent_log_tail(folder=active_folder or None)
+                log_tail = _telemetry.get_recent_log_tail(folder=active_folder or None, runtime_log_files=3)
             _telemetry.send_feedback(
                 report_type=data.get('type', 'general'),
                 description=data.get('description', ''),
@@ -1105,6 +1105,61 @@ class Api:
     def is_analysis_running(self):
         """Return True if the analysis queue is actively running."""
         return {'running': _queue_manager.is_running}
+
+    def get_recovery_status(self):
+        """Return persisted queue-recovery and unclean-shutdown state."""
+        try:
+            settings = load_persisted_settings()
+            queue_state = _queue_manager.get_persisted_recovery_state()
+            unclean_utc = str(settings.get('last_unclean_shutdown_utc', '') or '').strip()
+            return {
+                'success': True,
+                'unclean_shutdown': bool(unclean_utc),
+                'unclean_shutdown_utc': unclean_utc,
+                'queue_recovery': queue_state,
+            }
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    def restore_analysis_queue(self):
+        """Restore a previous queue snapshot persisted in user settings."""
+        return _queue_manager.restore_from_persisted_state()
+
+    def clear_recovery_state(self, clear_queue_state: bool = True):
+        """Clear persisted unclean-shutdown flag and optionally queue recovery snapshot."""
+        try:
+            settings = load_persisted_settings()
+            settings.pop('last_unclean_shutdown_utc', None)
+            if bool(clear_queue_state):
+                settings.pop('queue_recovery_state', None)
+            save_persisted_settings(settings)
+            return {'success': True}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
+
+    def send_recovery_crash_report(self):
+        """Send a crash report generated from persisted recovery state and recent logs."""
+        try:
+            if _telemetry is None:
+                return {'success': False, 'error': 'Telemetry module not available'}
+            settings = load_persisted_settings()
+            machine_id = _telemetry.get_machine_id(settings)
+            active_folder = str(settings.get('active_analysis_path', '') or '').strip()
+            log_tail = _telemetry.get_recent_log_tail(folder=active_folder or None, runtime_log_files=3)
+            _telemetry.send_crash_report(
+                exc=None,
+                tb_str='Recovered unclean shutdown report requested by user.',
+                log_tail=log_tail,
+                session_analytics={
+                    'recovery_report': True,
+                    'active_analysis_path': active_folder,
+                },
+                machine_id=machine_id,
+                version=_telemetry._read_version(),
+            )
+            return {'success': True}
+        except Exception as e:
+            return {'success': False, 'error': str(e)}
 
     # ------------------------------------------------------------------ #
     #  Culling Assistant API                                               #

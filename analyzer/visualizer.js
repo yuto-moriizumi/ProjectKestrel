@@ -5291,6 +5291,121 @@
       return res.json();
     }
 
+    async function apiGetRecoveryStatus() {
+      if (hasPywebviewApi && window.pywebview?.api?.get_recovery_status) {
+        return window.pywebview.api.get_recovery_status();
+      }
+      const headers = window.__BRIDGE_TOKEN ? { 'X-Bridge-Token': window.__BRIDGE_TOKEN } : {};
+      const res = await fetch('/recovery/status', { headers });
+      return res.json();
+    }
+
+    async function apiRestoreRecoveryQueue() {
+      if (hasPywebviewApi && window.pywebview?.api?.restore_analysis_queue) {
+        return window.pywebview.api.restore_analysis_queue();
+      }
+      const headers = { 'Content-Type': 'application/json', ...(window.__BRIDGE_TOKEN ? { 'X-Bridge-Token': window.__BRIDGE_TOKEN } : {}) };
+      const res = await fetch('/recovery/restore', { method: 'POST', headers, body: '{}' });
+      return res.json();
+    }
+
+    async function apiClearRecoveryState(clearQueueState = true) {
+      if (hasPywebviewApi && window.pywebview?.api?.clear_recovery_state) {
+        return window.pywebview.api.clear_recovery_state(!!clearQueueState);
+      }
+      const headers = { 'Content-Type': 'application/json', ...(window.__BRIDGE_TOKEN ? { 'X-Bridge-Token': window.__BRIDGE_TOKEN } : {}) };
+      const res = await fetch('/recovery/clear', {
+        method: 'POST',
+        headers,
+        body: JSON.stringify({ clear_queue_state: !!clearQueueState }),
+      });
+      return res.json();
+    }
+
+    async function apiSendRecoveryCrashReport() {
+      if (hasPywebviewApi && window.pywebview?.api?.send_recovery_crash_report) {
+        return window.pywebview.api.send_recovery_crash_report();
+      }
+      const headers = { 'Content-Type': 'application/json', ...(window.__BRIDGE_TOKEN ? { 'X-Bridge-Token': window.__BRIDGE_TOKEN } : {}) };
+      const res = await fetch('/recovery/report', { method: 'POST', headers, body: '{}' });
+      return res.json();
+    }
+
+    let _startupRecoveryHandled = false;
+
+    async function maybeHandleStartupRecovery() {
+      if (_startupRecoveryHandled) return;
+      _startupRecoveryHandled = true;
+
+      let recovery = null;
+      try {
+        recovery = await apiGetRecoveryStatus();
+      } catch (_) {
+        return;
+      }
+      if (!recovery || recovery.success === false) return;
+
+      const restorePaths = Array.isArray(recovery.queue_recovery?.restore_paths)
+        ? recovery.queue_recovery.restore_paths
+        : [];
+      const hasQueueRecovery = restorePaths.length > 0;
+      const hadUncleanShutdown = !!recovery.unclean_shutdown;
+      if (!hasQueueRecovery && !hadUncleanShutdown) return;
+
+      let queueDismissed = false;
+      if (hasQueueRecovery) {
+        const doRestore = confirm(
+          `Kestrel detected an interrupted analysis queue with ${restorePaths.length} folder${restorePaths.length === 1 ? '' : 's'}.\n\nRestore it now?`
+        );
+        if (doRestore) {
+          try {
+            const restoreResult = await apiRestoreRecoveryQueue();
+            if (restoreResult && restoreResult.success !== false) {
+              startPollingQueue();
+              const status = await apiGetQueueStatus();
+              renderQueuePanel(status);
+              setStatus(`Recovered previous analysis queue (${restoreResult.restored || restorePaths.length} folder(s)).`);
+            } else {
+              const msg = restoreResult?.error || 'Unknown error';
+              alert('Could not restore the previous queue:\n\n' + msg);
+              queueDismissed = true;
+            }
+          } catch (e) {
+            alert('Could not restore the previous queue:\n\n' + (e.message || e));
+            queueDismissed = true;
+          }
+        } else {
+          queueDismissed = true;
+        }
+      }
+
+      if (hadUncleanShutdown) {
+        const sendReport = confirm(
+          'Kestrel detected that the previous session did not shut down cleanly.\n\nSend a crash report now?'
+        );
+        if (sendReport) {
+          try {
+            const reportResult = await apiSendRecoveryCrashReport();
+            if (reportResult && reportResult.success === false) {
+              alert('Could not send crash report:\n\n' + (reportResult.error || 'Unknown error'));
+            } else {
+              showToast('Crash report sent. Thank you.', 3500);
+            }
+          } catch (e) {
+            alert('Could not send crash report:\n\n' + (e.message || e));
+          }
+        }
+      }
+
+      try {
+        if (queueDismissed) {
+          await apiClearRecoveryState(true);
+        } else if (hadUncleanShutdown) {
+          await apiClearRecoveryState(false);
+        }
+      } catch (_) { }
+    }
+
     /** Format a duration in seconds to a readable string like "2m 30s". */
     function formatDuration(secs) {
       if (!isFinite(secs) || secs < 0) return '–';
@@ -6807,6 +6922,9 @@
           renderQueuePanel(status);
           if (status.running) startPollingQueue();
         }
+      } catch (_) { }
+      try {
+        await maybeHandleStartupRecovery();
       } catch (_) { }
     })();
 

@@ -44,6 +44,7 @@ _MAX_LOG_ENTRIES = 50
 _MAX_SCREENSHOT_BYTES = 2 * 1024 * 1024  # 2 MB cap for screenshot payloads
 _MAX_RUNTIME_LOG_LINES = 200
 _MAX_RUNTIME_LOG_CHARS = 40_000
+_MAX_RUNTIME_LOG_TOTAL_CHARS = 60_000
 
 
 # ---------------------------------------------------------------------------
@@ -348,7 +349,11 @@ def send_folder_analytics(
 # Public API: Log Tail
 # ---------------------------------------------------------------------------
 
-def get_recent_log_tail(folder: Optional[str] = None, max_entries: int = _MAX_LOG_ENTRIES) -> str:
+def get_recent_log_tail(
+    folder: Optional[str] = None,
+    max_entries: int = _MAX_LOG_ENTRIES,
+    runtime_log_files: int = 1,
+) -> str:
     """Return recent structured analysis logs and runtime stdout/stderr tail.
 
     Completely failsafe — returns an empty string if anything goes wrong
@@ -361,6 +366,8 @@ def get_recent_log_tail(folder: Optional[str] = None, max_entries: int = _MAX_LO
         If None, tries the user home ``~/.kestrel/`` directory.
     max_entries : int
         Maximum number of log entries to include (most recent first).
+    runtime_log_files : int
+        Number of most-recent runtime stdout/stderr log files to include.
 
     Returns
     -------
@@ -416,11 +423,12 @@ def get_recent_log_tail(folder: Optional[str] = None, max_entries: int = _MAX_LO
                 payload['analysis_entries'] = data[-max_entries:]
 
         # Runtime logs are plain text files in <...>/.kestrel/logs/
-        runtime_path = None
-        runtime_mtime = 0
+        runtime_file_limit = max(1, min(int(runtime_log_files or 1), 5))
         runtime_dirs = []
         for base_dir in candidates:
             runtime_dirs.append(os.path.join(base_dir, 'logs'))
+
+        runtime_files = []
 
         for runtime_dir in runtime_dirs:
             if not os.path.isdir(runtime_dir):
@@ -434,25 +442,40 @@ def get_recent_log_tail(folder: Optional[str] = None, max_entries: int = _MAX_LO
                     fp = os.path.join(runtime_dir, fname)
                     try:
                         mt = os.path.getmtime(fp)
-                        if mt > runtime_mtime:
-                            runtime_mtime = mt
-                            runtime_path = fp
+                        runtime_files.append((mt, fp))
                     except OSError:
                         continue
             except OSError:
                 continue
 
-        if runtime_path:
+        runtime_files.sort(key=lambda x: x[0], reverse=True)
+        selected_runtime_files = runtime_files[:runtime_file_limit]
+        runtime_tails = []
+        per_file_char_budget = max(2_000, int(_MAX_RUNTIME_LOG_TOTAL_CHARS / max(1, runtime_file_limit)))
+        per_file_char_budget = min(per_file_char_budget, _MAX_RUNTIME_LOG_CHARS)
+
+        for _, runtime_path in selected_runtime_files:
             try:
                 with open(runtime_path, 'r', encoding='utf-8', errors='replace') as f:
                     lines = f.readlines()
                 runtime_tail = ''.join(lines[-_MAX_RUNTIME_LOG_LINES:])
-                if len(runtime_tail) > _MAX_RUNTIME_LOG_CHARS:
-                    runtime_tail = runtime_tail[-_MAX_RUNTIME_LOG_CHARS:]
-                if runtime_tail:
-                    payload['runtime_output_tail'] = runtime_tail
+                if len(runtime_tail) > per_file_char_budget:
+                    runtime_tail = runtime_tail[-per_file_char_budget:]
+                if not runtime_tail:
+                    continue
+                runtime_tails.append(
+                    {
+                        'file': os.path.basename(runtime_path),
+                        'tail': runtime_tail,
+                    }
+                )
             except Exception:
-                pass
+                continue
+
+        if runtime_tails:
+            payload['runtime_output_tails'] = runtime_tails
+            # Backward-compatible single-tail key for older consumers.
+            payload['runtime_output_tail'] = runtime_tails[0].get('tail', '')
 
         if not payload:
             return ''

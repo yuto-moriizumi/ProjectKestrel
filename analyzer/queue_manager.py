@@ -10,6 +10,7 @@ import os
 import sys
 import threading
 import time as _time_mod
+from datetime import datetime
 
 from settings_utils import load_persisted_settings, save_persisted_settings, log
 
@@ -30,6 +31,10 @@ except ImportError:
 # ---------------------------------------------------------------------------
 _pipeline_import_error = ''
 _AnalysisPipeline = None   # populated lazily on first use
+
+
+def _utc_timestamp() -> str:
+    return datetime.utcnow().isoformat() + 'Z'
 
 
 def _ensure_pipeline_path() -> bool:
@@ -168,6 +173,128 @@ class QueueManager:
         self._scene_time_threshold = 1.0
         self._mask_threshold = 0.5
 
+    def _collect_restore_paths_locked(self) -> list:
+        restore_statuses = {'pending', 'running', 'cancelled'}
+        seen = set()
+        restore_paths = []
+        for it in self._items:
+            if it.status not in restore_statuses:
+                continue
+            p = str(it.path or '').strip()
+            if not p or p in seen:
+                continue
+            seen.add(p)
+            restore_paths.append(p)
+        return restore_paths
+
+    def _build_recovery_state_locked(self) -> dict:
+        return {
+            'updated_utc': _utc_timestamp(),
+            'running': self.is_running,
+            'paused': self.is_paused,
+            'restore_paths': self._collect_restore_paths_locked(),
+            'options': {
+                'use_gpu': bool(self._use_gpu),
+                'wildlife_enabled': bool(self._wildlife_enabled),
+                'detection_threshold': float(self._detection_threshold),
+                'scene_time_threshold': float(self._scene_time_threshold),
+                'mask_threshold': float(self._mask_threshold),
+            },
+            'items': [
+                {
+                    'path': it.path,
+                    'name': it.name,
+                    'status': it.status,
+                    'processed': int(it.processed or 0),
+                    'total': int(it.total or 0),
+                }
+                for it in self._items
+            ],
+        }
+
+    def _persist_recovery_state(self) -> None:
+        try:
+            with self._lock:
+                state = self._build_recovery_state_locked()
+            settings = load_persisted_settings()
+            if state.get('restore_paths'):
+                settings['queue_recovery_state'] = state
+            else:
+                settings.pop('queue_recovery_state', None)
+            save_persisted_settings(settings)
+        except Exception:
+            pass
+
+    def get_persisted_recovery_state(self) -> dict:
+        try:
+            settings = load_persisted_settings()
+            state = settings.get('queue_recovery_state')
+            return state if isinstance(state, dict) else {}
+        except Exception:
+            return {}
+
+    def restore_from_persisted_state(self) -> dict:
+        if self.is_running:
+            return {'success': False, 'error': 'Queue is already running'}
+
+        def _safe_float(val, default):
+            try:
+                return float(val)
+            except (TypeError, ValueError):
+                return float(default)
+
+        state = self.get_persisted_recovery_state()
+        if not state:
+            return {'success': False, 'error': 'No persisted queue recovery state found'}
+
+        raw_paths = state.get('restore_paths')
+        if not isinstance(raw_paths, list):
+            return {'success': False, 'error': 'Persisted queue recovery state is invalid'}
+
+        restore_paths = []
+        missing_paths = []
+        seen = set()
+        for p in raw_paths:
+            path = str(p or '').strip()
+            if not path or path in seen:
+                continue
+            seen.add(path)
+            if os.path.isdir(path):
+                restore_paths.append(path)
+            else:
+                missing_paths.append(path)
+
+        if not restore_paths:
+            return {
+                'success': False,
+                'error': 'No valid folders found for queue recovery',
+                'missing_paths': missing_paths,
+            }
+
+        options = state.get('options') if isinstance(state.get('options'), dict) else {}
+        result = self.enqueue(
+            restore_paths,
+            use_gpu=bool(options.get('use_gpu', True)),
+            wildlife_enabled=bool(options.get('wildlife_enabled', True)),
+            detection_threshold=_safe_float(options.get('detection_threshold', 0.75), 0.75),
+            scene_time_threshold=_safe_float(options.get('scene_time_threshold', 1.0), 1.0),
+            mask_threshold=_safe_float(options.get('mask_threshold', 0.5), 0.5),
+        )
+        if result.get('success'):
+            result['restored'] = len(restore_paths)
+            if missing_paths:
+                result['missing_paths'] = missing_paths
+        return result
+
+    def clear_persisted_recovery_state(self) -> dict:
+        try:
+            settings = load_persisted_settings()
+            settings.pop('queue_recovery_state', None)
+            save_persisted_settings(settings)
+            return {'success': True}
+        except Exception as exc:
+            return {'success': False, 'error': str(exc)}
+
     # ---- public read-only properties ----
 
     @property
@@ -232,8 +359,10 @@ class QueueManager:
             self._wildlife_enabled = wildlife_enabled
             self._detection_threshold = float(detection_threshold)
             self._scene_time_threshold = float(scene_time_threshold)
+            self._mask_threshold = float(mask_threshold)
             self._thread = threading.Thread(target=self._run, daemon=True, name='kestrel-queue')
             self._thread.start()
+        self._persist_recovery_state()
         return {'success': True, 'added': added}
 
     def pause(self) -> dict:
@@ -242,6 +371,7 @@ class QueueManager:
             running = next((it for it in self._items if it.status == 'running'), None)
             if running is not None and running.pause_start_time is None:
                 running.pause_start_time = _time_mod.time()
+        self._persist_recovery_state()
         return {'success': True, 'paused': True}
 
     def resume(self) -> dict:
@@ -251,6 +381,7 @@ class QueueManager:
                 running.paused_duration += _time_mod.time() - running.pause_start_time
                 running.pause_start_time = None
         self._pause_event.set()
+        self._persist_recovery_state()
         return {'success': True, 'paused': False}
 
     def cancel(self) -> dict:
@@ -263,11 +394,13 @@ class QueueManager:
             running = next((it for it in self._items if it.status == 'running'), None)
             if running is not None:
                 running.current_status_msg = 'Cancelling\u2026'
+        self._persist_recovery_state()
         return {'success': True}
 
     def clear_done(self) -> dict:
         with self._lock:
             self._items = [it for it in self._items if it.status not in ('done', 'error', 'cancelled')]
+        self._persist_recovery_state()
         return {'success': True}
 
     def remove_pending_item(self, path: str) -> dict:
@@ -278,6 +411,7 @@ class QueueManager:
             if idx is None:
                 return {'success': False, 'error': 'Item not found or not pending'}
             self._items.pop(idx)
+        self._persist_recovery_state()
         return {'success': True}
 
     def reorder_pending(self, ordered_paths: list) -> dict:
@@ -294,6 +428,7 @@ class QueueManager:
                 if it.path in path_to_item:
                     reordered.append(it)
             self._items = non_pending + reordered
+        self._persist_recovery_state()
         return {'success': True}
 
     # ---- internal ----
@@ -308,6 +443,7 @@ class QueueManager:
                             it.status = 'error'
                             it.error = f'Pipeline unavailable: {_pipeline_import_error}'
                 log('[queue] Pipeline unavailable, aborting:', _pipeline_import_error)
+                self._persist_recovery_state()
                 return
             self._pipeline = cls(use_gpu=self._use_gpu)
 
@@ -321,6 +457,7 @@ class QueueManager:
                 item.status = 'running'
                 item.start_time = _time_mod.time()
                 item.initial_processed = 0
+            self._persist_recovery_state()
 
             try:
                 current_settings = load_persisted_settings()
@@ -452,6 +589,7 @@ class QueueManager:
                         item.end_time = _time_mod.time()
                         if item.total > 0:
                             item.processed = item.total
+                self._persist_recovery_state()
                 self._send_folder_analytics(item)
             except Exception as exc:
                 log(f'[queue] Error processing {item.path!r}:', exc)
@@ -459,9 +597,11 @@ class QueueManager:
                     item.status = 'error'
                     item.end_time = _time_mod.time()
                     item.error = str(exc)
+                self._persist_recovery_state()
                 self._send_folder_analytics(item)
 
         log('[queue] Run thread finished.')
+        self._persist_recovery_state()
 
     def _send_folder_analytics(self, item):
         """Send per-folder analytics (if opted-in) and completion telemetry (non-optional)."""

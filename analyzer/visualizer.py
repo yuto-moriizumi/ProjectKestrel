@@ -159,6 +159,37 @@ def _enable_runtime_log_capture() -> str:
         return ''
 
 
+def _utc_now_iso() -> str:
+    return datetime.utcnow().isoformat() + 'Z'
+
+
+def _mark_session_start() -> None:
+    """Mark this app session as active and detect unclean prior shutdown."""
+    try:
+        settings = load_persisted_settings()
+        prev_started = str(settings.get('app_session_started_utc', '') or '').strip()
+        prev_clean = bool(settings.get('app_session_closed_cleanly', True))
+        if prev_started and not prev_clean:
+            settings['last_unclean_shutdown_utc'] = prev_started
+        settings['app_session_started_utc'] = _utc_now_iso()
+        settings['app_session_closed_cleanly'] = False
+        settings['app_session_pid'] = int(os.getpid())
+        save_persisted_settings(settings)
+    except Exception:
+        pass
+
+
+def _mark_session_clean_exit() -> None:
+    """Mark this app session as closed cleanly."""
+    try:
+        settings = load_persisted_settings()
+        settings['app_session_closed_cleanly'] = True
+        settings['last_session_closed_utc'] = _utc_now_iso()
+        save_persisted_settings(settings)
+    except Exception:
+        pass
+
+
 def build_original_path(root: str, rel: str) -> str:
     if ALLOWED_ROOT:
         root = ALLOWED_ROOT
@@ -265,6 +296,11 @@ class Handler(SimpleHTTPRequestHandler):
         if self.path == '/queue/status':
             self._json(200, _queue_manager.get_status())
             return
+        if self.path == '/recovery/status':
+            if not self._check_auth():
+                return
+            self.handle_recovery_status()
+            return
         if self.path in ('/', '/index.html'):
             # Prefer analyzer/visualizer.html when present (merged layout).
             # Check multiple locations across dev, frozen, and installed builds.
@@ -330,6 +366,12 @@ class Handler(SimpleHTTPRequestHandler):
             self.handle_queue_start()
         elif parsed.path in ('/queue/pause', '/queue/resume', '/queue/cancel', '/queue/clear'):
             self.handle_queue_control(parsed.path)
+        elif parsed.path == '/recovery/restore':
+            self.handle_recovery_restore()
+        elif parsed.path == '/recovery/clear':
+            self.handle_recovery_clear()
+        elif parsed.path == '/recovery/report':
+            self.handle_recovery_report()
         else:
             self.send_response(404); self.end_headers(); self.wfile.write(b'{}')
 
@@ -456,7 +498,7 @@ class Handler(SimpleHTTPRequestHandler):
             log_tail = ''
             if payload.get('include_logs', False):
                 active_folder = str(settings.get('active_analysis_path', '') or '').strip()
-                log_tail = _telemetry.get_recent_log_tail(folder=active_folder or None)
+                log_tail = _telemetry.get_recent_log_tail(folder=active_folder or None, runtime_log_files=3)
             _telemetry.send_feedback(
                 report_type=payload.get('type', 'general'),
                 description=payload.get('description', ''),
@@ -498,6 +540,76 @@ class Handler(SimpleHTTPRequestHandler):
         else:
             self._json(404, {'ok': False, 'error': 'Not found'})
 
+    def handle_recovery_status(self):
+        try:
+            settings = load_persisted_settings()
+            queue_state = _queue_manager.get_persisted_recovery_state()
+            unclean_utc = str(settings.get('last_unclean_shutdown_utc', '') or '').strip()
+            self._json(
+                200,
+                {
+                    'ok': True,
+                    'success': True,
+                    'unclean_shutdown': bool(unclean_utc),
+                    'unclean_shutdown_utc': unclean_utc,
+                    'queue_recovery': queue_state,
+                },
+            )
+        except Exception as e:
+            self._json(400, {'ok': False, 'success': False, 'error': str(e)})
+
+    def handle_recovery_restore(self):
+        if not self._check_auth():
+            return
+        try:
+            result = _queue_manager.restore_from_persisted_state()
+            self._json(200, {'ok': bool(result.get('success')), **result})
+        except Exception as e:
+            self._json(400, {'ok': False, 'success': False, 'error': str(e)})
+
+    def handle_recovery_clear(self):
+        if not self._check_auth():
+            return
+        try:
+            payload = self._read_json()
+            clear_queue_state = True
+            if isinstance(payload, dict):
+                clear_queue_state = bool(payload.get('clear_queue_state', True))
+            settings = load_persisted_settings()
+            settings.pop('last_unclean_shutdown_utc', None)
+            if clear_queue_state:
+                settings.pop('queue_recovery_state', None)
+            save_persisted_settings(settings)
+            self._json(200, {'ok': True, 'success': True})
+        except Exception as e:
+            self._json(400, {'ok': False, 'success': False, 'error': str(e)})
+
+    def handle_recovery_report(self):
+        if not self._check_auth():
+            return
+        try:
+            if _telemetry is None:
+                self._json(200, {'ok': False, 'success': False, 'error': 'Telemetry unavailable'})
+                return
+            settings = load_persisted_settings()
+            machine_id = _telemetry.get_machine_id(settings)
+            active_folder = str(settings.get('active_analysis_path', '') or '').strip()
+            log_tail = _telemetry.get_recent_log_tail(folder=active_folder or None, runtime_log_files=3)
+            _telemetry.send_crash_report(
+                exc=None,
+                tb_str='Recovered unclean shutdown report requested by user.',
+                log_tail=log_tail,
+                session_analytics={
+                    'recovery_report': True,
+                    'active_analysis_path': active_folder,
+                },
+                machine_id=machine_id,
+                version=_telemetry._read_version(),
+            )
+            self._json(200, {'ok': True, 'success': True})
+        except Exception as e:
+            self._json(400, {'ok': False, 'success': False, 'error': str(e)})
+
 
 def parse_args():
     ap = argparse.ArgumentParser(description='Serve Project Kestrel visualizer with local /open bridge.')
@@ -514,6 +626,7 @@ def main():
     runtime_log_path = _enable_runtime_log_capture()
     if runtime_log_path:
         log('Runtime log capture enabled:', runtime_log_path)
+    _mark_session_start()
 
     # When visualizer.py is run from inside analyzer/ (merged layout) set
     # the working directory to the repository root so assets and shared
@@ -728,12 +841,14 @@ def main():
             server.server_close()
             log('Server stopped.')
 
+    _mark_session_clean_exit()
+
 
 if __name__ == '__main__':
     try:
         main()
     except KeyboardInterrupt:
-        pass
+        _mark_session_clean_exit()
     except Exception as _main_exc:
         # Top-level crash handler — send crash report before re-raising
         try:
@@ -745,9 +860,9 @@ if __name__ == '__main__':
                 # Fetch recent log tail, passing the active folder's log if available
                 _folder_path = _crash_settings.get('active_analysis_path', '')
                 if _folder_path:
-                    _log_tail = _telemetry.get_recent_log_tail(folder=_folder_path)
+                    _log_tail = _telemetry.get_recent_log_tail(folder=_folder_path, runtime_log_files=3)
                 else:
-                    _log_tail = _telemetry.get_recent_log_tail()
+                    _log_tail = _telemetry.get_recent_log_tail(runtime_log_files=3)
                 
                 _telemetry.send_crash_report(
                     exc=_main_exc,
