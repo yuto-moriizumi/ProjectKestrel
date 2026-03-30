@@ -19,6 +19,14 @@ from settings_utils import load_persisted_settings, save_persisted_settings, log
 from queue_manager import _queue_manager
 
 try:
+    from editor_launch import launch as _launch_editor
+except ImportError:
+    try:
+        from analyzer.editor_launch import launch as _launch_editor
+    except ImportError:
+        _launch_editor = None
+
+try:
     from kestrel_analyzer.config import JPEG_EXTENSIONS as _JPEG_EXTENSIONS, RAW_EXTENSIONS as _RAW_EXTENSIONS
 except ImportError:
     try:
@@ -52,6 +60,23 @@ except ImportError:
 
 HOST = '127.0.0.1'
 
+_ALLOWED_ROOT = os.environ.get('KESTREL_ALLOWED_ROOT')
+if _ALLOWED_ROOT:
+    _ALLOWED_ROOT = os.path.abspath(os.path.expanduser(_ALLOWED_ROOT))
+
+_ALLOWED_EDITORS = {
+    'system', 'darktable', 'lightroom', 'photoshop', 'capture_one',
+    'affinity', 'gimp', 'rawtherapee', 'luminar', 'dxo', 'on1',
+    'acdsee', 'paintshop', 'faststone', 'xnview', 'irfanview', 'custom',
+}
+
+_DEFAULT_EDITOR_EXTENSIONS = [
+    '.cr3', '.cr2', '.nef', '.arw', '.dng', '.raf', '.orf', '.rw2', '.sr2',
+    '.jpg', '.jpeg', '.png', '.tif', '.tiff'
+]
+_ALLOWED_EDITOR_EXTENSIONS: set[str] = set()
+_ALLOW_ANY_EDITOR_EXTENSION = os.environ.get('KESTREL_ALLOW_ANY_EXTENSION') == '1'
+
 
 def _normalize_extensions(exts):
     normalized = []
@@ -67,6 +92,13 @@ def _normalize_extensions(exts):
         seen.add(e)
         normalized.append(e)
     return normalized
+
+
+_ALLOWED_EDITOR_EXTENSIONS = set(
+    _normalize_extensions(
+        os.environ.get('KESTREL_ALLOWED_EXTENSIONS', ','.join(_DEFAULT_EDITOR_EXTENSIONS)).split(',')
+    )
+)
 
 
 _CULLING_COMPANION_EXTENSIONS = tuple(
@@ -117,6 +149,43 @@ class Api:
             self._cache_cleanup_roots.add(os.path.abspath(rp))
         except Exception:
             pass
+
+    def _resolve_editor_target(self, root_path: str, relative_path: str) -> tuple[str, str]:
+        """Resolve an editor target from root+relative with boundary-safe normalization."""
+        base_root = str(_ALLOWED_ROOT or root_path or '').strip()
+        rel = str(relative_path or '').strip()
+        if not base_root or not rel:
+            return '', ''
+
+        if (base_root.startswith('"') and base_root.endswith('"')) or (base_root.startswith("'") and base_root.endswith("'")):
+            base_root = base_root[1:-1]
+        if (rel.startswith('"') and rel.endswith('"')) or (rel.startswith("'") and rel.endswith("'")):
+            rel = rel[1:-1]
+
+        base_root = os.path.abspath(os.path.expanduser(base_root))
+        rel = rel.replace('\\', '/')
+        if os.path.isabs(rel):
+            return '', base_root
+
+        target = os.path.abspath(os.path.join(base_root, rel))
+        return target, base_root
+
+    def _is_within_root(self, path: str, root: str) -> bool:
+        if not path or not root:
+            return False
+        try:
+            path_real = os.path.realpath(path)
+            root_real = os.path.realpath(root)
+            common = os.path.commonpath([path_real, root_real])
+            return common == root_real
+        except Exception:
+            return False
+
+    def _editor_extension_allowed(self, path: str) -> bool:
+        if _ALLOW_ANY_EDITOR_EXTENSION:
+            return True
+        _, ext = os.path.splitext(path)
+        return ext.lower() in _ALLOWED_EDITOR_EXTENSIONS
 
     def get_legal_status(self) -> dict:
         """Check if the user has agreed to the terms and if install telemetry was sent."""
@@ -795,6 +864,37 @@ class Api:
             return {'success': True}
         except Exception as e:
             print(f'[API] open_folder({path!r}) -> Error: {e}', flush=True)
+            return {'success': False, 'error': str(e)}
+
+    def open_in_editor(self, root: str, relative: str, editor: str = 'system'):
+        """Open a photo in the configured editor via pywebview (desktop-only path)."""
+        try:
+            if _launch_editor is None:
+                return {'success': False, 'error': 'Editor launcher unavailable'}
+
+            target, resolved_root = self._resolve_editor_target(root, relative)
+            if not target:
+                return {'success': False, 'error': 'Invalid path'}
+            if not self._is_within_root(target, resolved_root):
+                return {'success': False, 'error': 'Path escapes allowed root'}
+            if not os.path.exists(target):
+                return {'success': False, 'error': 'File not found', 'path': target}
+            if not self._editor_extension_allowed(target):
+                return {
+                    'success': False,
+                    'error': 'Extension not allowed',
+                    'path': target,
+                    'allowed': sorted(_ALLOWED_EDITOR_EXTENSIONS),
+                }
+
+            editor_name = str(editor or 'system').strip().lower()
+            if editor_name not in _ALLOWED_EDITORS:
+                editor_name = 'system'
+
+            _launch_editor(target, editor_name)
+            return {'success': True, 'path': target}
+        except Exception as e:
+            print(f'[API] open_in_editor() -> Error: {e}', flush=True)
             return {'success': False, 'error': str(e)}
 
     def open_url(self, url: str):

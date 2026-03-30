@@ -4246,25 +4246,18 @@
 
       if (!origRel) { setStatus('No filename available for this row.'); return; }
       if (!rootToSend) { setStatus('Set Local Root in Settings to enable launching originals.'); showSettings(); return; }
-      const backendUrl = window.location.origin;
       const editor = getSetting('editor', 'system');
       try {
-        const res = await fetch(backendUrl.replace(/\/$/, '') + '/open', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            ...(window.__BRIDGE_TOKEN ? { 'X-Bridge-Token': window.__BRIDGE_TOKEN } : {})
-          },
-          body: JSON.stringify({ root: rootToSend, relative: origRel, editor })
-        });
-        if (!res.ok) throw new Error('HTTP ' + res.status);
-        const data = await res.json();
-        if (data && data.ok) {
+        if (!window.pywebview?.api?.open_in_editor) {
+          throw new Error('Desktop API unavailable: open_in_editor');
+        }
+        const data = await window.pywebview.api.open_in_editor(rootToSend, origRel, editor);
+        if (data && data.success) {
           setStatus('Opened in editor');
           showToast('Opened in ' + editor, 5000, () => showSettings());
         } else throw new Error(data && data.error || 'Launch failed');
       } catch (e) {
-        setStatus('Failed to open in editor. Check Settings and server.');
+        setStatus('Failed to open in editor. Check Settings and Local Root.');
       }
     }
 

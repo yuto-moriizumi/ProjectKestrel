@@ -3,14 +3,14 @@
 
 Features:
  - Serves the existing visualizer.html (and any static assets in the folder).
- - Exposes the /open endpoint (same contract as backend/editor_bridge.py) so the
-   web UI can open originals in the configured editor.
+ - Exposes legacy HTTP API endpoints for compatibility while the desktop
+    pywebview bridge remains the primary integration path.
  - Intended to be frozen into a single executable with PyInstaller.
 
 Usage (development):
     python visualizer/visualizer.py --port 8765 --root C:/Photos/Trip
 
-After starting it will open the default browser at http://127.0.0.1:<port>/ .
+After starting it will open the desktop UI (pywebview) at http://127.0.0.1:<port>/ .
 
 Build single-file EXE (example):
     pyinstaller --onefile --name kestrel_viz visualizer/visualizer.py
@@ -65,7 +65,9 @@ HOST = '127.0.0.1'
 # a unified token+origin security policy while the local HTTP bridge exists.
 SECURITY_POLICY_VERSION = '2026-03-30'
 BROWSER_ONLY_MODE_SUPPORTED = False
-API_AUTH_POLICY = 'token+origin-required-for-api-routes'
+API_AUTH_POLICY = 'desktop-api-preferred;token+origin-required-for-legacy-http-api'
+LEGACY_OPEN_ENDPOINT_ENABLED = os.environ.get('KESTREL_ENABLE_LEGACY_OPEN_ENDPOINT') == '1'
+LEGAL_SELF_HEAL_MIGRATION_KEY = 'legal_upgrade_self_heal_2026_03'
 
 # --- Security / behavior configuration (env override matches editor_bridge) ---
 ALLOWED_ROOT = os.environ.get('KESTREL_ALLOWED_ROOT')
@@ -74,7 +76,7 @@ if ALLOWED_ROOT:
 
 AUTH_TOKEN = os.environ.get('KESTREL_BRIDGE_TOKEN')
 if not AUTH_TOKEN:
-    # Generate an ephemeral token per run; injected into served page via /bridge_config.js
+    # Generate an ephemeral token per run for legacy HTTP API compatibility.
     AUTH_TOKEN = secrets.token_urlsafe(32)
 MAX_REQUEST_BYTES = int(os.environ.get('KESTREL_MAX_REQUEST_BYTES', '4096'))
 ALLOWED_EDITORS: Set[str] = {
@@ -195,6 +197,31 @@ def _mark_session_clean_exit() -> None:
         pass
 
 
+def _apply_legal_upgrade_self_heal(settings: dict, prev_version: str, current_version: str) -> bool:
+    """One-time migration for legacy installs that lost legal consent markers.
+
+    Returns True when the migration marker is updated in the settings payload.
+    """
+    if not isinstance(settings, dict):
+        return False
+    prev = str(prev_version or '').strip()
+    curr = str(current_version or '').strip()
+    if not prev or not curr or prev == curr:
+        return False
+    if settings.get(LEGAL_SELF_HEAL_MIGRATION_KEY, False):
+        return False
+
+    legal_agreed = str(settings.get('legal_agreed_version', '') or '').strip()
+    if not legal_agreed:
+        settings['legal_agreed_version'] = prev or curr
+        if 'installed_telemetry_sent' not in settings:
+            settings['installed_telemetry_sent'] = True
+        log('[legal] Applied one-time upgrade self-heal for missing consent markers:', prev, '->', curr)
+
+    settings[LEGAL_SELF_HEAL_MIGRATION_KEY] = True
+    return True
+
+
 def build_original_path(root: str, rel: str) -> str:
     if ALLOWED_ROOT:
         root = ALLOWED_ROOT
@@ -282,11 +309,10 @@ class Handler(SimpleHTTPRequestHandler):
         super().end_headers()
 
     def do_GET(self):  # type: ignore[override]
-        # Dynamic token/config injection script
+        # Legacy bridge config endpoint kept for compatibility (no token export).
         if self.path == '/bridge_config.js':
             body = (
-                f"// Generated at runtime\n"
-                f"window.__BRIDGE_TOKEN='{AUTH_TOKEN}';\n"
+                f"// bridge_config.js is deprecated in desktop-only mode\n"
                 f"window.__BRIDGE_ORIGIN=window.location.origin;\n"
             ).encode('utf-8')
             self.send_response(200)
@@ -364,7 +390,10 @@ class Handler(SimpleHTTPRequestHandler):
     def do_POST(self):  # type: ignore[override]
         parsed = urlparse(self.path)
         if parsed.path == '/open':
-            self.handle_open()
+            if LEGACY_OPEN_ENDPOINT_ENABLED:
+                self.handle_open()
+            else:
+                self._json(410, {'ok': False, 'error': 'HTTP /open is disabled; use pywebview open_in_editor API.'})
         elif parsed.path == '/settings':
             self.handle_settings()
         elif parsed.path == '/feedback':
@@ -616,7 +645,7 @@ class Handler(SimpleHTTPRequestHandler):
 
 
 def parse_args():
-    ap = argparse.ArgumentParser(description='Serve Project Kestrel visualizer with local /open bridge.')
+    ap = argparse.ArgumentParser(description='Serve Project Kestrel visualizer with local desktop bridge.')
     ap.add_argument('--port', type=int, default=8765, help='Port to listen on (default 8765)')
     ap.add_argument('--root', default='', help='Default root folder for RAW originals (client can override unless KESTREL_ALLOWED_ROOT set)')
     return ap.parse_args()
@@ -650,17 +679,22 @@ def main():
         os.chdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..') or '.')
     server = ThreadingHTTPServer((HOST, args.port), Handler)
     log(f'Serving visualizer at http://{HOST}:{args.port}/  (Press Ctrl+C to stop)')
-    log('Ephemeral bridge token (auto-injected):', AUTH_TOKEN[:8] + '…')
+    log('HTTP bridge token initialized for legacy endpoint compatibility.')
 
     # ── Settings init: ensure machine_id and version are persisted ──
     try:
         if _telemetry is not None:
             _init_settings = load_persisted_settings()
+            _prev_version = str(_init_settings.get('version', '') or '').strip()
+            _current_version = _telemetry._read_version()
             _telemetry.get_machine_id(_init_settings)
-            _init_settings['version'] = _telemetry._read_version()
+            _init_settings['version'] = _current_version
             _init_settings.setdefault('raw_preview_cache_enabled', True)
             _init_settings.setdefault('exposure_compensation_profile', 'normal')
             _init_settings.setdefault('auto_save_enabled', True)
+
+            _apply_legal_upgrade_self_heal(_init_settings, _prev_version, _current_version)
+
             save_persisted_settings(_init_settings)
     except Exception:
         pass  # failsafe
