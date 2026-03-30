@@ -19,6 +19,8 @@ Bugs
 --> Remove all "read_image_for_pipeline" logs
 --> remove telemetry debug calls 
 * Canon EOS R5 Mark II RAW Decode Issue --> Bumped Rawpy dependency from 0.23.1 to 0.26.1 [DONE]
+* Resolve dependabot dependency security vulnerability alerts [DONE]
+* Conduct comprehensive security review.
 
 
 Features under consideration

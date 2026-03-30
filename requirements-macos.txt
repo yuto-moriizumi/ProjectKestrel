@@ -1,5 +1,5 @@
 # Core ML/AI Dependencies
-torch==2.6.0
+torch==2.11.0
 torchvision==0.21.0
 tensorflow
 onnxruntime==1.23.2
@@ -22,7 +22,7 @@ PyQt6==6.10.2
 
 # Utilities
 PyExifTool==0.5.6
-requests==2.32.3
+requests==2.33.0
 pywebview==6.1
 
 # installer
@@ -30,4 +30,4 @@ pyinstaller==6.18.0
 
 # EXIF reading
 exifread
-Pillow
+pillow==12.1.1
