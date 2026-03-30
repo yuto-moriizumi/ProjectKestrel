@@ -12,7 +12,7 @@ certifi
 # Computer Vision
 opencv-python==4.11.0.86
 pillow==11.3.0
-rawpy==0.23.1
+rawpy==0.26.1
 
 # Data Processing
 pandas==2.2.2

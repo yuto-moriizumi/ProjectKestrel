@@ -18,6 +18,7 @@ Bugs
 * No clean crash log; all current print statements go to terminal output. Need a cleaner way to pipe these into a userprofile's kestrel logs folder. Also too many terminal outputs; some of these need to be cleared to the extent possible. [DONE]
 --> Remove all "read_image_for_pipeline" logs
 --> remove telemetry debug calls 
+* Canon EOS R5 Mark II RAW Decode Issue --> Bumped Rawpy dependency from 0.23.1 to 0.26.1 [DONE]
 
 
 Features under consideration
@@ -35,6 +36,7 @@ Test before release:
 * Quality classifier performance on revised pipeline
 * RAW+JPG co-movement fix in Culing Assistant + test restore capability persists after Kestrel re-opens.
 * Improvement to crash handling and error logging.
+* Test rawpy decode issue.
 
 
 
