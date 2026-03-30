@@ -30,7 +30,7 @@ Features under consideration
 * Add restore capability that persists after closing/reopening Culling Assistant/Kestrel [DONE]
 
 Test before release:
-* Fix to Mask-RCNN Region Proposal System
+* Fix to Mask-RCNN Region Proposal System [DONE]
 * Quality classifier performance on revised pipeline
 * RAW+JPG co-movement fix in Culing Assistant + test restore capability persists after Kestrel re-opens.
 

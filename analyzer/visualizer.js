@@ -3024,8 +3024,10 @@
             if (stateBefore.crops.length > 0) {
               const changed = promoteActiveCropToPrimary(row);
               if (changed) {
-                _refreshCurrentFilmstripCard();
-                renderScenes();
+                void (async () => {
+                  await _resortAndFocusSceneImage(row, true);
+                  await renderScenes();
+                })();
               } else {
                 selectFilmstripImage(currentImageIndex, _currentScene, true, true);
               }
@@ -3082,6 +3084,31 @@
       renderFilmstrip(_currentScene);
       // Re-select the current image to update previews and info bar
       selectFilmstripImage(currentImageIndex, _currentScene);
+    }
+
+    async function _resortAndFocusSceneImage(targetRow, overlayActiveCrop = true) {
+      if (!_currentScene || !targetRow) return;
+
+      // Rebuild the scene from authoritative rows so quality changes are
+      // reflected immediately in quality-sorted filmstrip order.
+      const refreshed = reloadScene(_currentScene.id) || _currentScene;
+      _currentScene = refreshed;
+
+      const targetKey = _cropStateKey(targetRow);
+      let nextIndex = refreshed.images.findIndex(r => _cropStateKey(r) === targetKey);
+      if (nextIndex < 0) {
+        nextIndex = refreshed.images.findIndex(
+          r => String(r.filename || '') === String(targetRow.filename || '')
+            && String(r.__rootPath || '') === String(targetRow.__rootPath || '')
+        );
+      }
+      if (nextIndex < 0) {
+        nextIndex = Math.max(0, Math.min(currentImageIndex, Math.max(0, refreshed.images.length - 1)));
+      }
+
+      currentImageIndex = nextIndex;
+      renderFilmstrip(refreshed);
+      await selectFilmstripImage(nextIndex, refreshed, false, overlayActiveCrop);
     }
 
     function applySceneName(sceneId, name) {
