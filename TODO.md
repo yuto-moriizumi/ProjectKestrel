@@ -8,14 +8,14 @@ Bugs
 * Frequent failures when running on images with many subjects; find a way to lower Mask-RCNN region proposal threshold to improve performance. [DONE]
 * Known issue where exposure compensation still tends to be slightly too dark, particularly for noisy images. Root cause unknown. [DONE]
 * Known issue where Kestrel quality algorithm may rank extremely blurry images slightly above other, fairly blurry, images.
-* Auto-save may save all folders rather than just the ones that have been modified.
+* Auto-save may save all folders rather than just the ones that have been modified. [DONE]
 * Bug where un-loading a folder that has recently been analyzed sometimes causes it to auto-check itself. Uncertain why. In this situation, hitting the next arrow to skip to the next scene sometimes goes to the next scene of a different folder, if it is loaded with a similar capture time. We need to make sure that the next scene is consistent with the way that the scenes are displayed in the main view. 
 * PIPELINE CHANGE New ML model is needed to correctly handle the exposure shift adjustements.
 * Delete cache files after folder unloaded or software closed. [DONE]
 * Fix bad UI problem when splitting a scene. [DONE]
 * Tweak exposure compensation algorithm to be slightly more aggressive in correcting exposure changes; making sure that highlights are not blown out while also making sure that shadows or highly underexposed birds are properly adjusted and lifted. Potentially exclude some of the boundary pixel layers during exposure compensation calculation as they my reflect mask-rcnn boundary inconsistencies. [DONE]
-* Restore Queue bugs - It doesn't seem to be working. The intention is if the program crashes mid-analysis, Kestrel can detect that something went wrong. It will then 1) say "I crashed. want me to send crash report?" 2) "clean crash log"
-* No clean crash log; all current print statements go to terminal output. Need a cleaner way to pipe these into a userprofile's kestrel logs folder. Also too many terminal outputs; some of these need to be cleared to the extent possible.
+* Restore Queue bugs - It doesn't seem to be working. The intention is if the program crashes mid-analysis, Kestrel can detect that something went wrong. It will then 1) say "I crashed. want me to send crash report?" 2) "clean crash log" [DONE]
+* No clean crash log; all current print statements go to terminal output. Need a cleaner way to pipe these into a userprofile's kestrel logs folder. Also too many terminal outputs; some of these need to be cleared to the extent possible. [DONE]
 --> Remove all "read_image_for_pipeline" logs
 --> remove telemetry debug calls 
 
@@ -28,11 +28,13 @@ Features under consideration
 * Investigate GPU support from recent pull request #14
 * Alter search "show only manually reviewed photos" to include those with manual culling decisions or species selections. [DONE]
 * Add restore capability that persists after closing/reopening Culling Assistant/Kestrel [DONE]
+* eBird integration: After integrating Clerk (log-in system), add ability to connect eBird account. Then add ability to attach a particular checklist to an outing. Add ability to hit "T" to enter tagging mode, and add capability to turn the text box into a text+combobox which fetches from the current checklist. Then, add ability to upload photos to eBird/Malaculay library from in-app.
 
 Test before release:
 * Fix to Mask-RCNN Region Proposal System [DONE]
 * Quality classifier performance on revised pipeline
 * RAW+JPG co-movement fix in Culing Assistant + test restore capability persists after Kestrel re-opens.
+* Improvement to crash handling and error logging.
 
 
 

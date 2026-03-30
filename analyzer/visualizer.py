@@ -658,6 +658,7 @@ def main():
             _init_settings['version'] = _telemetry._read_version()
             _init_settings.setdefault('raw_preview_cache_enabled', True)
             _init_settings.setdefault('exposure_compensation_profile', 'normal')
+            _init_settings.setdefault('auto_save_enabled', True)
             save_persisted_settings(_init_settings)
     except Exception:
         pass  # failsafe

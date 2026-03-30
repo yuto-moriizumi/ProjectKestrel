@@ -12,9 +12,65 @@
     let header = [];               // CSV header fields
     let scenes = [];               // Aggregated scene objects
     let dirty = false;             // Track unsaved edits
+    let _dirtyRoots = new Set();   // In desktop mode, tracks which folder roots have unsaved edits
+    let _dirtyRootsUnknown = false; // True when an edit can't be scoped to a specific root
     // Notify Python backend whenever dirty state changes (for close-prompt)
     function _notifyDirty(val) {
       try { if (window.pywebview?.api?.notify_dirty) window.pywebview.api.notify_dirty(!!val); } catch (_) {}
+    }
+    function _normalizeRootPath(v) {
+      return String(v || '').trim();
+    }
+    function _addDirtyRoot(rootCandidate) {
+      const rp = _normalizeRootPath(rootCandidate);
+      if (!rp) return false;
+      _dirtyRoots.add(rp);
+      return true;
+    }
+    function _markDirtyRoots(rootHint) {
+      let marked = false;
+      const collect = (value) => {
+        if (!value) return;
+        if (typeof value === 'string') {
+          marked = _addDirtyRoot(value) || marked;
+          return;
+        }
+        if (Array.isArray(value)) {
+          for (const entry of value) collect(entry);
+          return;
+        }
+        if (value instanceof Set) {
+          for (const entry of value) collect(entry);
+          return;
+        }
+        if (typeof value !== 'object') return;
+        if (Object.prototype.hasOwnProperty.call(value, '__rootPath')) {
+          marked = _addDirtyRoot(value.__rootPath) || marked;
+        }
+        if (Object.prototype.hasOwnProperty.call(value, 'rootPath')) {
+          marked = _addDirtyRoot(value.rootPath) || marked;
+        }
+        if (value.representative && typeof value.representative === 'object') {
+          marked = _addDirtyRoot(value.representative.__rootPath) || marked;
+        }
+        if (Array.isArray(value.images)) {
+          for (const img of value.images) collect(img);
+        }
+      };
+      collect(rootHint);
+      return marked;
+    }
+    function _clearDirtyRoots() {
+      _dirtyRoots.clear();
+      _dirtyRootsUnknown = false;
+    }
+    function _setDirtyUi(isDirty) {
+      dirty = !!isDirty;
+      _notifyDirty(dirty);
+      const saveBtn = document.getElementById('saveCsv');
+      if (saveBtn) saveBtn.disabled = !dirty;
+      const revertBtn = document.getElementById('revertCsv');
+      if (revertBtn) revertBtn.disabled = !dirty;
     }
     let _cleanSnapshot = null;      // Snapshot of rows+header at last clean state (load or save)
     let selectedSceneIds = new Set(); // Multi-select: selected scene IDs ("slot:count")
@@ -938,7 +994,7 @@
       _invalidateRowCropCache(row);
       setRowActiveCropIndex(row, nextPrimary, crops);
 
-      if (changed) markDirty();
+      if (changed) markDirty(row);
       return changed;
     }
 
@@ -1224,7 +1280,7 @@
         row.rating = vs;
         row.rating_origin = origin;
       }
-      markDirty();
+      markDirty(row);
       if (typeof window.refreshSceneFilter === 'function') window.refreshSceneFilter();
     }
     function createStarBar(row) {
@@ -1729,9 +1785,9 @@
           r.scene_count = targetCount; changed++;
         }
       }
+      const rpForMerge = rows.find(r => (r.__folderSlot ?? 0) === slot)?.__rootPath || rootPath || '';
       // Update scenedata: move filenames from non-target scenes into target scene
       if (hasPywebviewApi) {
-        const rpForMerge = rows.find(r => (r.__folderSlot ?? 0) === slot)?.__rootPath || rootPath || '';
         if (rpForMerge) {
           const sd = _initScenedata(rpForMerge);
           const allMovedFiles = new Set();
@@ -1750,9 +1806,7 @@
         }
       }
       if (changed) {
-        dirty = true; _notifyDirty(true);
-        el('#saveCsv').disabled = false;
-        el('#revertCsv').disabled = false;
+        markDirty(rpForMerge);
         setStatus(`Merged ${ids.length} scenes into #${targetCount}. ${changed} rows updated.`);
       }
       selectedSceneIds.clear();
@@ -2038,7 +2092,7 @@
       ensureRatingColumns();
       row.culled = status || ''; // 'accept', 'reject', or ''
       row.culled_origin = status ? 'manual' : '';
-      markDirty();
+      markDirty(row);
     }
 
     async function _blobUrlToBlob(url) {
@@ -2504,7 +2558,7 @@
       sceneEntry.user_tags.species = draft.species.slice().sort();
       sceneEntry.user_tags.families = draft.families.slice().sort();
       sceneEntry.user_tags.finalized = true;
-      markDirty();
+      markDirty(sceneRows);
       return true;
     }
 
@@ -3135,7 +3189,7 @@
         }
       }
       if (rowChanged || sdChanged) {
-        markDirty();
+        markDirty(rp || sceneRows);
         const updatedScene = reloadScene(sceneId);
         if (updatedScene) renderSceneMetaChips(updatedScene, _sceneEditMode);
         renderScenes();
@@ -3143,7 +3197,11 @@
     }
 
     // --- Species & Family editing helpers ---
-    function markDirty() {
+    function markDirty(rootHint = null) {
+      if (hasPywebviewApi) {
+        const scoped = _markDirtyRoots(rootHint);
+        if (!scoped) _dirtyRootsUnknown = true;
+      }
       attemptAutoSave();
     }
 
@@ -3492,7 +3550,7 @@
             user_tags: { species: [], families: [], finalized: false }
           };
         }
-        markDirty();
+        markDirty(rpForSplit || sceneRowsBefore);
         _splitMode = false;
         _splitSelected.clear();
         _splitLastSelectedIndex = -1;
@@ -3524,18 +3582,20 @@
     // Snapshot helpers for revert
     function takeSnapshot() {
       _cleanSnapshot = { rows: rows.map(r => ({ ...r })), header: header.slice(), scenedata: JSON.parse(JSON.stringify(_scenedata)) };
+      _clearDirtyRoots();
       const btn = el('#revertCsv');
       if (btn) btn.disabled = true;
     }
     function applySnapshot() {
       if (!_cleanSnapshot) return;
+      clearTimeout(_autoSaveTimer);
+      _autoSaveTimer = null;
       rows = _cleanSnapshot.rows.map(r => ({ ...r }));
       header = _cleanSnapshot.header.slice();
       if (_cleanSnapshot.scenedata !== undefined) _scenedata = JSON.parse(JSON.stringify(_cleanSnapshot.scenedata));
       _sceneActiveCropIndexByImage.clear();
-      dirty = false; _notifyDirty(false);
-      el('#saveCsv').disabled = true;
-      el('#revertCsv').disabled = true;
+      _clearDirtyRoots();
+      _setDirtyUi(false);
       blobUrlCache.clear();
       renderScenes();
       setStatus('Reverted to last saved state.');
@@ -3552,7 +3612,8 @@
       _sceneActiveCropIndexByImage.clear();
       ensureSceneNameColumn();
       ensureRatingColumns();
-      dirty = false; _notifyDirty(false); el('#saveCsv').disabled = true;
+      _clearDirtyRoots();
+      _setDirtyUi(false);
       takeSnapshot();
       await renderScenes();
     }
@@ -3618,6 +3679,8 @@
     }
 
     async function saveCsv() {
+      clearTimeout(_autoSaveTimer);
+      _autoSaveTimer = null;
       ensureSceneNameColumn();
       ensureRatingColumns();
       const allCols = header.slice();
@@ -3638,7 +3701,8 @@
         const writable = await csvFileHandle.createWritable();
         await writable.write(content);
         await writable.close();
-        dirty = false; _notifyDirty(false); el('#saveCsv').disabled = true;
+        _clearDirtyRoots();
+        _setDirtyUi(false);
         takeSnapshot();
         setStatus('Saved changes to kestrel_database.csv');
         return;
@@ -3648,14 +3712,33 @@
       if (window.pywebview?.api) {
         const groups = new Map();
         for (const r of rows) {
-          const rp = r.__rootPath || '';
+          const rp = _normalizeRootPath(r.__rootPath || rootPath || '');
+          if (!rp) continue;
           if (!groups.has(rp)) groups.set(rp, []);
           groups.get(rp).push(r);
         }
+        const allRoots = Array.from(groups.keys());
+        let rootsToSave = allRoots;
+        if (_dirtyRootsUnknown) {
+          rootsToSave = allRoots;
+        } else if (_dirtyRoots.size > 0) {
+          rootsToSave = allRoots.filter(rp => _dirtyRoots.has(rp));
+          if (!rootsToSave.length && dirty) rootsToSave = allRoots;
+        } else if (dirty) {
+          rootsToSave = allRoots;
+        } else {
+          rootsToSave = [];
+        }
+        if (!rootsToSave.length) {
+          setStatus(dirty ? 'No folder changes to save.' : 'No unsaved changes.');
+          return;
+        }
+
         let saved = 0, failed = 0;
+        const failedRoots = new Set();
         const exportCols = allCols.filter(c => !String(c).startsWith('__'));
-        for (const [rp, groupRows] of groups) {
-          if (!rp) { failed++; continue; }
+        for (const rp of rootsToSave) {
+          const groupRows = groups.get(rp) || [];
           try {
             // Persist cull/rating columns to CSV so culling assistant and reloads see authoritative state.
             if (typeof window.pywebview.api.write_kestrel_csv === 'function') {
@@ -3667,17 +3750,25 @@
             const sd = _normalizeScenedataForSave(rp, groupRows);
             const res = await window.pywebview.api.write_kestrel_scenedata(rp, sd);
             if (res.success) saved++;
-            else { failed++; console.warn('[save scenedata] Failed for', rp, res.error); }
+            else {
+              failed++;
+              failedRoots.add(rp);
+              console.warn('[save scenedata] Failed for', rp, res.error);
+            }
           } catch (e) {
             failed++;
+            failedRoots.add(rp);
             console.warn('[save pywebview] Error for', rp, e);
           }
         }
         if (failed > 0) {
-          dirty = true; _notifyDirty(true); el('#saveCsv').disabled = false;
+          _dirtyRoots = failedRoots;
+          _dirtyRootsUnknown = false;
+          _setDirtyUi(true);
           setStatus(`Saved ${saved} folder(s), ${failed} failed`);
         } else {
-          dirty = false; _notifyDirty(false); el('#saveCsv').disabled = true;
+          _clearDirtyRoots();
+          _setDirtyUi(false);
           takeSnapshot();
           setStatus(`Saved changes to ${saved} folder(s)`);
         }
@@ -3758,18 +3849,19 @@
     
     // Auto-save logic: debounced save when auto-save is enabled
     async function attemptAutoSave() {
-      dirty = true;
-      _notifyDirty(true);
-      el('#saveCsv').disabled = false;
-      el('#revertCsv').disabled = false;
+      _setDirtyUi(true);
       
       if (!_autoSaveEnabled) {
+        clearTimeout(_autoSaveTimer);
+        _autoSaveTimer = null;
         return;  // Save/Revert workflow; user will click Save button
       }
       
       // Debounce to avoid saving on every keystroke/change (save after 2 seconds of inactivity)
       clearTimeout(_autoSaveTimer);
       _autoSaveTimer = setTimeout(async () => {
+        _autoSaveTimer = null;
+        if (!_autoSaveEnabled || !dirty) return;
         try {
           await saveCsv();
         } catch (e) {
@@ -3788,6 +3880,10 @@
         if (data && data.settings && typeof data.settings === 'object') {
           saveSettings(data.settings);
           _autoSaveEnabled = data.settings.auto_save_enabled !== false;
+          if (!_autoSaveEnabled) {
+            clearTimeout(_autoSaveTimer);
+            _autoSaveTimer = null;
+          }
           _updateSaveRevertVisibility();
         }
       } catch (_) { }
@@ -3910,6 +4006,10 @@
         raw_exposure_correction_disabled: document.getElementById('rawExposureCorrectionDisabled').checked,
       };
       _autoSaveEnabled = autoSaveEnabled;
+      if (!_autoSaveEnabled) {
+        clearTimeout(_autoSaveTimer);
+        _autoSaveTimer = null;
+      }
       _updateSaveRevertVisibility();
       // Persist settings to localStorage immediately
       saveSettings(settings);
@@ -6454,7 +6554,8 @@
       rootDirHandle = null;
       ensureSceneNameColumn();
       ensureRatingColumns();
-      dirty = false; _notifyDirty(false);
+      _clearDirtyRoots();
+      _setDirtyUi(false);
       takeSnapshot();
       const mergeBtn = document.getElementById('openMerge');
       if (mergeBtn) mergeBtn.disabled = true;
@@ -6515,6 +6616,9 @@
         rootPath = loadedRoot;
         rootDirHandle = null; // Clear handle since we're using Python API
         rootIsKestrel = false;
+        _clearDirtyRoots();
+        _setDirtyUi(false);
+        takeSnapshot();
 
         // Now render with rootPath set
         await renderScenes();
@@ -6664,6 +6768,9 @@
             _sceneActiveCropIndexByImage.clear();
             ensureSceneNameColumn();
             ensureRatingColumns();
+            _clearDirtyRoots();
+            _setDirtyUi(false);
+            takeSnapshot();
             await renderScenes();
             setStatus('CSV loaded (limited features - no folder access)');
             alert('CSV loaded successfully.\n\nNote: Image previews and opening files in editors will not work without folder access.\n\nFor full functionality, use the desktop app or a Chromium-based browser (Chrome, Edge, Brave).');
@@ -6698,6 +6805,10 @@
     // Apply initial auto-save visibility from cached localStorage settings
     (function initAutoSaveVisibility() {
       _autoSaveEnabled = getSetting('auto_save_enabled', true) !== false;
+      if (!_autoSaveEnabled) {
+        clearTimeout(_autoSaveTimer);
+        _autoSaveTimer = null;
+      }
       _updateSaveRevertVisibility();
     })();
 
@@ -6880,9 +6991,10 @@
           if (ids.includes(idStr) && idStr !== targetId) { r.scene_count = targetId; changed++; }
         }
         // Update scenedata: move filenames from non-target scenes into target scene
+        let rpForMerge = '';
         if (hasPywebviewApi && changed > 0) {
           const rowSample = rows.find(r => ids.includes(String(r.scene_count)));
-          const rpForMerge = rowSample?.__rootPath || rootPath || '';
+          rpForMerge = rowSample?.__rootPath || rootPath || '';
           if (rpForMerge) {
             const sd = _initScenedata(rpForMerge);
             const allMovedFiles = new Set();
@@ -6900,7 +7012,7 @@
             }
           }
         }
-        if (changed) { dirty = true; _notifyDirty(true); document.getElementById('saveCsv').disabled = false; setStatus(`Merged scenes into ${targetId}. ${changed} rows updated.`); }
+        if (changed) { markDirty(rpForMerge); setStatus(`Merged scenes into ${targetId}. ${changed} rows updated.`); }
         renderScenes();
         dlg.close();
       };
@@ -7317,7 +7429,7 @@
         }
       }
       if (changed > 0) {
-        markDirty();
+        markDirty(rootPath);
         renderScenes();
         if (currentSceneId != null && _currentScene) {
           const refreshed = reloadScene(currentSceneId);
