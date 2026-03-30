@@ -17,6 +17,8 @@ BASE_COLUMNS = [
     "quality",
     "export_path",
     "crop_path",
+    "crops_json",
+    "primary_crop_index",
     "scene_count",
     "feature_similarity",
     "feature_confidence",
@@ -322,6 +324,10 @@ def ensure_columns(database: pd.DataFrame) -> pd.DataFrame:
         database["exposure_correction"] = 0.0
     if "detection_scores" not in database.columns:
         database["detection_scores"] = [[] for _ in range(len(database))]
+    if "crops_json" not in database.columns:
+        database["crops_json"] = "[]"
+    if "primary_crop_index" not in database.columns:
+        database["primary_crop_index"] = 0
     if "capture_time" not in database.columns:
         database["capture_time"] = ""
     return database

@@ -734,13 +734,231 @@
       return result;
     }
 
+    const _sceneActiveCropIndexByImage = new Map();
+
+    function _cropStateKey(row) {
+      return `${row?.__rootPath || rootPath || ''}|${row?.filename || ''}`;
+    }
+
+    function _numberOr(value, fallback = 0) {
+      const n = parseFloat(value);
+      return Number.isFinite(n) ? n : fallback;
+    }
+
+    function _intOr(value, fallback = 0) {
+      const n = parseInt(value, 10);
+      return Number.isFinite(n) ? n : fallback;
+    }
+
+    function _clamp01(value, fallback) {
+      const n = parseFloat(value);
+      if (!Number.isFinite(n)) return fallback;
+      return Math.max(0, Math.min(1, n));
+    }
+
+    function _fullFrameBbox() {
+      return {
+        x_min_norm: 0,
+        x_max_norm: 1,
+        y_min_norm: 0,
+        y_max_norm: 1,
+        x_center_norm: 0.5,
+        y_center_norm: 0.5,
+      };
+    }
+
+    function _normalizeCropBbox(rawBbox) {
+      const b = rawBbox && typeof rawBbox === 'object' ? rawBbox : {};
+      const norm = {
+        x_min_norm: _clamp01(b.x_min_norm, 0),
+        x_max_norm: _clamp01(b.x_max_norm, 1),
+        y_min_norm: _clamp01(b.y_min_norm, 0),
+        y_max_norm: _clamp01(b.y_max_norm, 1),
+        x_center_norm: _clamp01(b.x_center_norm, 0.5),
+        y_center_norm: _clamp01(b.y_center_norm, 0.5),
+      };
+      if (norm.x_max_norm <= norm.x_min_norm) norm.x_max_norm = Math.min(1, norm.x_min_norm + 0.01);
+      if (norm.y_max_norm <= norm.y_min_norm) norm.y_max_norm = Math.min(1, norm.y_min_norm + 0.01);
+      norm.x_center_norm = Math.max(norm.x_min_norm, Math.min(norm.x_max_norm, norm.x_center_norm));
+      norm.y_center_norm = Math.max(norm.y_min_norm, Math.min(norm.y_max_norm, norm.y_center_norm));
+      return norm;
+    }
+
+    function _invalidateRowCropCache(row) {
+      if (!row) return;
+      delete row.__cropRecordsCache;
+    }
+
+    function _serializeCropRecords(crops) {
+      return (Array.isArray(crops) ? crops : []).map((crop, idx) => ({
+        crop_index: _intOr(crop?.crop_index, idx),
+        crop_path: String(crop?.crop_path || ''),
+        detection_index: _intOr(crop?.detection_index, -1),
+        detection_confidence: _numberOr(crop?.detection_confidence, 0),
+        species: String(crop?.species || 'Unknown'),
+        species_confidence: _numberOr(crop?.species_confidence, 0),
+        family: String(crop?.family || 'Unknown'),
+        family_confidence: _numberOr(crop?.family_confidence, 0),
+        quality: _numberOr(crop?.quality, -1),
+        rating: Math.max(0, Math.min(5, _intOr(crop?.rating, 0))),
+        exposure_correction: _numberOr(crop?.exposure_correction, 0),
+        bbox: _normalizeCropBbox(crop?.bbox),
+      }));
+    }
+
+    function getRowCropRecords(row) {
+      if (!row) return [];
+      if (row.__cropRecordsCache) return row.__cropRecordsCache;
+
+      let parsed = [];
+      const raw = String(row.crops_json || '').trim();
+      if (raw) {
+        try {
+          const maybeArray = JSON.parse(raw);
+          if (Array.isArray(maybeArray)) parsed = maybeArray;
+        } catch (_) {
+          parsed = [];
+        }
+      }
+
+      const normalized = [];
+      for (let i = 0; i < parsed.length; i++) {
+        const src = parsed[i];
+        if (!src || typeof src !== 'object') continue;
+        const fallbackPath = i === 0 ? String(row.crop_path || '') : '';
+        const cropPath = String(src.crop_path || fallbackPath || '').trim();
+        if (!cropPath && i > 0) continue;
+        normalized.push({
+          crop_index: _intOr(src.crop_index, i),
+          crop_path: cropPath,
+          detection_index: _intOr(src.detection_index, -1),
+          detection_confidence: _numberOr(src.detection_confidence, 0),
+          species: String(src.species || row.species || 'Unknown'),
+          species_confidence: _numberOr(src.species_confidence, _numberOr(row.species_confidence, 0)),
+          family: String(src.family || row.family || 'Unknown'),
+          family_confidence: _numberOr(src.family_confidence, _numberOr(row.family_confidence, 0)),
+          quality: _numberOr(src.quality, _numberOr(row.quality, -1)),
+          rating: Math.max(0, Math.min(5, _intOr(src.rating, 0))),
+          exposure_correction: _numberOr(src.exposure_correction, _numberOr(row.exposure_correction, 0)),
+          bbox: _normalizeCropBbox(src.bbox),
+        });
+      }
+
+      if (!normalized.length && row.crop_path) {
+        normalized.push({
+          crop_index: 0,
+          crop_path: String(row.crop_path || ''),
+          detection_index: -1,
+          detection_confidence: 0,
+          species: String(row.species || 'Unknown'),
+          species_confidence: _numberOr(row.species_confidence, 0),
+          family: String(row.family || 'Unknown'),
+          family_confidence: _numberOr(row.family_confidence, 0),
+          quality: _numberOr(row.quality, -1),
+          rating: Math.max(0, Math.min(5, _intOr(row.normalized_rating, 0))),
+          exposure_correction: _numberOr(row.exposure_correction, 0),
+          bbox: _fullFrameBbox(),
+        });
+      }
+
+      row.__cropRecordsCache = normalized;
+      return normalized;
+    }
+
+    function getRowPrimaryCropIndex(row, crops = null) {
+      const list = Array.isArray(crops) ? crops : getRowCropRecords(row);
+      if (!list.length) return 0;
+      const explicit = _intOr(row?.primary_crop_index, -1);
+      if (explicit >= 0 && explicit < list.length) return explicit;
+      const path = String(row?.crop_path || '').trim();
+      if (path) {
+        const idx = list.findIndex(c => String(c.crop_path || '') === path);
+        if (idx >= 0) return idx;
+      }
+      return 0;
+    }
+
+    function getRowActiveCropIndex(row, crops = null) {
+      const list = Array.isArray(crops) ? crops : getRowCropRecords(row);
+      if (!list.length) return 0;
+      const key = _cropStateKey(row);
+      const stored = _sceneActiveCropIndexByImage.get(key);
+      if (Number.isFinite(stored) && stored >= 0 && stored < list.length) return stored;
+      const primary = getRowPrimaryCropIndex(row, list);
+      _sceneActiveCropIndexByImage.set(key, primary);
+      return primary;
+    }
+
+    function setRowActiveCropIndex(row, nextIndex, crops = null) {
+      const list = Array.isArray(crops) ? crops : getRowCropRecords(row);
+      if (!list.length) return 0;
+      const clamped = Math.max(0, Math.min(list.length - 1, _intOr(nextIndex, 0)));
+      _sceneActiveCropIndexByImage.set(_cropStateKey(row), clamped);
+      return clamped;
+    }
+
+    function getRowActiveCropState(row) {
+      const crops = getRowCropRecords(row);
+      const activeIndex = getRowActiveCropIndex(row, crops);
+      return {
+        crops,
+        activeIndex,
+        activeCrop: crops[activeIndex] || null,
+        primaryIndex: getRowPrimaryCropIndex(row, crops),
+      };
+    }
+
+    function promoteActiveCropToPrimary(row) {
+      const crops = getRowCropRecords(row);
+      if (!crops.length) return false;
+      const nextPrimary = getRowActiveCropIndex(row, crops);
+      const prevPrimary = getRowPrimaryCropIndex(row, crops);
+      const crop = crops[nextPrimary];
+      if (!crop) return false;
+
+      const changed = prevPrimary !== nextPrimary || String(row.crop_path || '') !== String(crop.crop_path || '');
+      row.primary_crop_index = String(nextPrimary);
+      row.crop_path = crop.crop_path || row.crop_path || '';
+      row.species = crop.species || row.species || 'Unknown';
+      row.species_confidence = _numberOr(crop.species_confidence, _numberOr(row.species_confidence, 0));
+      row.family = crop.family || row.family || 'Unknown';
+      row.family_confidence = _numberOr(crop.family_confidence, _numberOr(row.family_confidence, 0));
+      row.quality = _numberOr(crop.quality, _numberOr(row.quality, -1));
+      row.exposure_correction = _numberOr(crop.exposure_correction, _numberOr(row.exposure_correction, 0));
+
+      const origin = String(getOrigin(row) || '').toLowerCase();
+      if (origin !== 'manual') {
+        const autoRating = Math.max(0, Math.min(5, _intOr(crop.rating, 0)));
+        row.normalized_rating = String(autoRating);
+        row.__normalized_rating = autoRating;
+        row.rating_origin = 'auto';
+      }
+
+      row.crops_json = JSON.stringify(_serializeCropRecords(crops));
+      _invalidateRowCropCache(row);
+      setRowActiveCropIndex(row, nextPrimary, crops);
+
+      if (changed) markDirty();
+      return changed;
+    }
+
     function ensureSceneNameColumn() {
       if (!header.includes('scene_name')) { header.push('scene_name'); }
       for (const r of rows) if (!('scene_name' in r)) r.scene_name = '';
     }
 
+    function ensureCropColumns() {
+      if (!header.includes('crops_json')) header.push('crops_json');
+      if (!header.includes('primary_crop_index')) header.push('primary_crop_index');
+      for (const r of rows) {
+        if (!('crops_json' in r)) r.crops_json = '';
+        if (!('primary_crop_index' in r) || r.primary_crop_index === '') r.primary_crop_index = '0';
+      }
+    }
+
     // Ensure rating columns exist and default values are set
     function ensureRatingColumns() {
+      ensureCropColumns();
       if (!header.includes('rating')) header.push('rating');
       if (!header.includes('rating_origin')) header.push('rating_origin');
       if (!header.includes('normalized_rating')) header.push('normalized_rating');
@@ -1868,10 +2086,81 @@
 
     function _clearScenePreviewBox(box) {
       if (!box) return;
+      try {
+        if (box.__sceneCropOverlayTimer) {
+          clearTimeout(box.__sceneCropOverlayTimer);
+          box.__sceneCropOverlayTimer = null;
+        }
+      } catch (_) {}
       for (const child of Array.from(box.children)) {
         if (child.classList && child.classList.contains('scene-preview-copy-btn')) continue;
         child.remove();
       }
+    }
+
+    function _showSceneCropOverlay(row, activeIndex = 0, durationMs = 1000) {
+      const box = el('#previewBox');
+      if (!box || !row) return;
+      const img = box.querySelector('img');
+      if (!img) return;
+
+      const cropState = getRowActiveCropState(row);
+      if (!cropState.crops.length) return;
+
+      const boxRect = box.getBoundingClientRect();
+      const imgRect = img.getBoundingClientRect();
+      if (imgRect.width <= 0 || imgRect.height <= 0 || boxRect.width <= 0 || boxRect.height <= 0) return;
+
+      try {
+        if (box.__sceneCropOverlayTimer) {
+          clearTimeout(box.__sceneCropOverlayTimer);
+          box.__sceneCropOverlayTimer = null;
+        }
+      } catch (_) {}
+
+      box.querySelectorAll('.scene-crop-overlay-layer').forEach(n => n.remove());
+
+      const layer = document.createElement('div');
+      layer.className = 'scene-crop-overlay-layer';
+
+      const originX = imgRect.left - boxRect.left;
+      const originY = imgRect.top - boxRect.top;
+      const drawW = imgRect.width;
+      const drawH = imgRect.height;
+
+      cropState.crops.forEach((crop, idx) => {
+        const bbox = crop?.bbox || _fullFrameBbox();
+        const x0 = Math.max(0, Math.min(1, _numberOr(bbox.x_min_norm, 0)));
+        const x1 = Math.max(0, Math.min(1, _numberOr(bbox.x_max_norm, 1)));
+        const y0 = Math.max(0, Math.min(1, _numberOr(bbox.y_min_norm, 0)));
+        const y1 = Math.max(0, Math.min(1, _numberOr(bbox.y_max_norm, 1)));
+        const left = originX + drawW * Math.min(x0, x1);
+        const top = originY + drawH * Math.min(y0, y1);
+        const width = Math.max(2, drawW * Math.abs(x1 - x0));
+        const height = Math.max(2, drawH * Math.abs(y1 - y0));
+
+        const boxEl = document.createElement('div');
+        boxEl.className = `scene-crop-overlay-box ${idx === activeIndex ? 'active' : 'inactive'}`;
+        boxEl.style.left = `${left}px`;
+        boxEl.style.top = `${top}px`;
+        boxEl.style.width = `${width}px`;
+        boxEl.style.height = `${height}px`;
+
+        const label = document.createElement('div');
+        label.className = 'scene-crop-overlay-label';
+        label.textContent = `#${idx + 1}`;
+        boxEl.appendChild(label);
+        layer.appendChild(boxEl);
+      });
+
+      box.appendChild(layer);
+      requestAnimationFrame(() => layer.classList.add('visible'));
+      box.__sceneCropOverlayTimer = setTimeout(() => {
+        layer.classList.remove('visible');
+        setTimeout(() => {
+          if (layer.parentNode) layer.parentNode.removeChild(layer);
+        }, 140);
+      }, Math.max(250, durationMs || 1000));
     }
 
     async function copyRowImageToClipboard(row, relPathOverride, copyLabel = 'image') {
@@ -2022,12 +2311,20 @@
       grid.scrollTo({ left: targetScrollLeft, behavior: 'smooth' });
     }
 
-    async function selectFilmstripImage(idx, scene, isHover = false) {
+    async function selectFilmstripImage(idx, scene, isHover = false, overlayActiveCrop = false) {
       if (!scene || !scene.images || idx < 0 || idx >= scene.images.length) return;
       if (!isHover) {
         currentImageIndex = idx;
       }
       const r = scene.images[idx];
+      const cropState = getRowActiveCropState(r);
+      const activeCrop = cropState.activeCrop;
+      const activeCropPath = activeCrop?.crop_path || r.crop_path;
+      const activeSpecies = activeCrop?.species || r.species || 'Unknown';
+      const activeSpeciesConf = activeCrop?.species_confidence ?? r.species_confidence;
+      const activeFamily = activeCrop?.family || r.family || 'Unknown';
+      const activeFamilyConf = activeCrop?.family_confidence ?? r.family_confidence;
+      const activeQuality = activeCrop?.quality ?? r.quality;
 
       // Update filmstrip card active state and center if not just hovering
       const grid = el('#imageGrid');
@@ -2059,7 +2356,7 @@
       const cropBox = el('#previewCropBox');
       if (cropBox) {
         _clearScenePreviewBox(cropBox);
-        const curl = await getBlobUrlForPath(r.crop_path, r.__rootPath);
+        const curl = await getBlobUrlForPath(activeCropPath, r.__rootPath);
         if (curl) {
           const cimg = document.createElement('img');
           cimg.src = curl;
@@ -2093,7 +2390,7 @@
 
       const copyCropBtn = el('#sceneCopyCropBtn');
       if (copyCropBtn) {
-        copyCropBtn.disabled = !r.crop_path;
+        copyCropBtn.disabled = !activeCropPath;
         copyCropBtn.onmousedown = (ev) => {
           ev.stopPropagation();
           ev.preventDefault();
@@ -2105,7 +2402,7 @@
         copyCropBtn.onclick = async (ev) => {
           ev.stopPropagation();
           ev.preventDefault();
-          await copyRowImageToClipboard(r, r.crop_path, 'bird crop');
+          await copyRowImageToClipboard(r, activeCropPath, 'bird crop');
         };
       }
 
@@ -2125,7 +2422,7 @@
       if (fnEl) { fnEl.textContent = r.filename || '—'; fnEl.title = r.filename || ''; }
 
       const qEl = el('#sceneInfoQuality');
-      if (qEl) qEl.textContent = `Quality: ${fmt3(r.quality)}`;
+      if (qEl) qEl.textContent = `Quality: ${fmt3(activeQuality)}`;
 
       const cullToggle = el('#sceneCullToggle');
       if (cullToggle) {
@@ -2149,11 +2446,14 @@
 
       const metaEl = el('#sceneInfoMeta');
       if (metaEl) {
-        const sp = decodeEntities(r.species || 'Unknown');
-        const spConf = fmt3(r.species_confidence);
-        const fam = decodeEntities(r.family || 'Unknown');
-        const famConf = fmt3(r.family_confidence);
-        metaEl.textContent = `${sp} (${spConf}) | ${fam} (${famConf}) · Image ${idx + 1} of ${scene.images.length}`;
+        const sp = decodeEntities(activeSpecies);
+        const spConf = fmt3(activeSpeciesConf);
+        const fam = decodeEntities(activeFamily);
+        const famConf = fmt3(activeFamilyConf);
+        const cropLabel = cropState.crops.length > 0
+          ? ` · Crop ${cropState.activeIndex + 1}/${cropState.crops.length}`
+          : '';
+        metaEl.textContent = `${sp} (${spConf}) | ${fam} (${famConf}) · Image ${idx + 1} of ${scene.images.length}${cropLabel}`;
       }
 
       // Render star bar in info bar
@@ -2161,6 +2461,10 @@
       if (starsEl) {
         starsEl.innerHTML = '';
         starsEl.appendChild(createStarBar(r));
+      }
+
+      if (overlayActiveCrop) {
+        _showSceneCropOverlay(r, cropState.activeIndex, 1000);
       }
     }
 
@@ -2569,6 +2873,16 @@
         };
       }
 
+      const cropImgBox = el('#previewCropBox');
+      if (cropImgBox) {
+        cropImgBox.onmouseenter = () => {
+          const r = scene.images[currentImageIndex];
+          if (!r) return;
+          const cropState = getRowActiveCropState(r);
+          _showSceneCropOverlay(r, cropState.activeIndex, 1000);
+        };
+      }
+
       // ── Close ──
       el('#closeDlg').onclick = () => {
         if (_splitMode) { exitSplitMode(); }
@@ -2685,6 +2999,37 @@
                 const prevScene = scenes[prevIdx];
                 navigateToScene(-1, prevScene.images.length - 1);
               }
+            }
+          }
+          break;
+        case 'ArrowUp':
+        case 'ArrowDown':
+          e.preventDefault();
+          if (images[currentImageIndex]) {
+            const row = images[currentImageIndex];
+            const cropState = getRowActiveCropState(row);
+            if (cropState.crops.length > 1) {
+              const step = e.key === 'ArrowDown' ? 1 : -1;
+              const next = (cropState.activeIndex + step + cropState.crops.length) % cropState.crops.length;
+              setRowActiveCropIndex(row, next, cropState.crops);
+              selectFilmstripImage(currentImageIndex, _currentScene, true, true);
+            }
+          }
+          break;
+        case 'Enter':
+          e.preventDefault();
+          if (images[currentImageIndex]) {
+            const row = images[currentImageIndex];
+            const stateBefore = getRowActiveCropState(row);
+            if (stateBefore.crops.length > 0) {
+              const changed = promoteActiveCropToPrimary(row);
+              if (changed) {
+                _refreshCurrentFilmstripCard();
+                renderScenes();
+              } else {
+                selectFilmstripImage(currentImageIndex, _currentScene, true, true);
+              }
+              showToast(`Primary crop set to ${stateBefore.activeIndex + 1}/${stateBefore.crops.length}`, 1800);
             }
           }
           break;
@@ -3160,6 +3505,7 @@
       rows = _cleanSnapshot.rows.map(r => ({ ...r }));
       header = _cleanSnapshot.header.slice();
       if (_cleanSnapshot.scenedata !== undefined) _scenedata = JSON.parse(JSON.stringify(_cleanSnapshot.scenedata));
+      _sceneActiveCropIndexByImage.clear();
       dirty = false; _notifyDirty(false);
       el('#saveCsv').disabled = true;
       el('#revertCsv').disabled = true;
@@ -3176,6 +3522,7 @@
       const parsed = Papa.parse(text, { header: true, skipEmptyLines: true });
       header = parsed.meta.fields || [];
       rows = (parsed.data || []).map(r => ({ ...r, scene_count: r.scene_count }));
+      _sceneActiveCropIndexByImage.clear();
       ensureSceneNameColumn();
       ensureRatingColumns();
       dirty = false; _notifyDirty(false); el('#saveCsv').disabled = true;
@@ -5907,6 +6254,7 @@
       if (!paths || paths.length === 0) return;
       const myVer = ++_loadFoldersVersion;
       blobUrlCache.clear();
+      _sceneActiveCropIndexByImage.clear();
       rows = [];
       header = [];
       let loadedCount = 0;
@@ -5994,6 +6342,7 @@
         header = parsed.meta.fields || [];
         const loadedRoot = result.root || folderPath;
         rows = (parsed.data || []).map(r => ({ ...r, __rootPath: loadedRoot, __folderSlot: 0 }));
+        _sceneActiveCropIndexByImage.clear();
         
         // Load scenedata for this folder
         if (hasPywebviewApi && window.pywebview?.api?.read_kestrel_scenedata) {
@@ -6170,6 +6519,7 @@
             const parsed = Papa.parse(text, { header: true, skipEmptyLines: true });
             header = parsed.meta.fields || [];
             rows = parsed.data || [];
+            _sceneActiveCropIndexByImage.clear();
             ensureSceneNameColumn();
             ensureRatingColumns();
             await renderScenes();

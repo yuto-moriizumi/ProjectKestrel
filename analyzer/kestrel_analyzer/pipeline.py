@@ -514,6 +514,8 @@ class AnalysisPipeline:
                     "quality": -1.0,
                     "export_path": "N/A",
                     "crop_path": "N/A",
+                    "crops_json": "[]",
+                    "primary_crop_index": 0,
                     "scene_count": scene_count,
                     "feature_similarity": -1.0,
                     "feature_confidence": -1.0,
@@ -650,7 +652,7 @@ class AnalysisPipeline:
                         if status_cb:
                             status_cb(f"No detections in {raw_file}")
                         stage_ctx["stage"] = "write_crop"
-                        crop_path = os.path.join(crop_dir, f"{os.path.splitext(raw_file)[0]}_crop.jpg")
+                        crop_path = os.path.join(crop_dir, f"{os.path.splitext(raw_file)[0]}_crop_0.jpg")
                         cv2.imwrite(
                             crop_path,
                             cv2.cvtColor(img_small, cv2.COLOR_RGB2BGR),
@@ -658,7 +660,41 @@ class AnalysisPipeline:
                         )
                         # Store relative path for cross-platform compatibility
                         crop_path_rel = os.path.relpath(crop_path, folder)
-                        entry.update({"crop_path": crop_path_rel})
+                        h, w = img.shape[:2]
+                        fallback_crop = {
+                            "crop_index": 0,
+                            "crop_path": crop_path_rel,
+                            "detection_index": -1,
+                            "detection_confidence": 0.0,
+                            "species": "Unknown",
+                            "species_confidence": 0.0,
+                            "family": "Unknown",
+                            "family_confidence": 0.0,
+                            "quality": -1.0,
+                            "rating": 0,
+                            "exposure_correction": 0.0,
+                            "bbox": {
+                                "x_min": 0,
+                                "x_max": int(w),
+                                "y_min": 0,
+                                "y_max": int(h),
+                                "width": int(w),
+                                "height": int(h),
+                                "x_min_norm": 0.0,
+                                "x_max_norm": 1.0,
+                                "y_min_norm": 0.0,
+                                "y_max_norm": 1.0,
+                                "x_center_norm": 0.5,
+                                "y_center_norm": 0.5,
+                            },
+                        }
+                        entry.update(
+                            {
+                                "crop_path": crop_path_rel,
+                                "crops_json": json.dumps([fallback_crop]),
+                                "primary_crop_index": 0,
+                            }
+                        )
                         stage_ctx["stage"] = "save_database"
                         database = pd.concat([database, pd.DataFrame([entry])], ignore_index=True)
                         save_database(database, db_path)
@@ -696,11 +732,14 @@ class AnalysisPipeline:
                             raw_obj=raw_obj,
                         )
                         img_src = self._apply_exposure_correction(img, stops, raw_obj)
+                        crop_bbox = self.mask_rcnn.get_square_crop_box(masks[primary_mask_i])
                         quality_crop, quality_mask = self.mask_rcnn.get_square_crop(
                             masks[primary_mask_i], img_src, resize=True
                         )
                         quality_score = self.quality_clf.classify(quality_crop, quality_mask)
                         return {
+                            "index": int(primary_mask_i),
+                            "confidence": float(pred_score[primary_mask_i]),
                             "species": pred_class[primary_mask_i],
                             "species_confidence": float(pred_score[primary_mask_i]),
                             "family": "N/A",
@@ -709,6 +748,7 @@ class AnalysisPipeline:
                             "rating": quality_to_rating(quality_score, rating_thresholds),
                             "quality_crop": quality_crop,
                             "exposure_correction": round(stops, 4),
+                            "crop_bbox": crop_bbox,
                         }
 
                     def process_bird_items(indices):
@@ -727,6 +767,7 @@ class AnalysisPipeline:
                             )
                             img_src = self._apply_exposure_correction(img, stops, raw_obj)
                             species_crop = self.mask_rcnn.get_species_crop(pred_boxes[i], img_src)
+                            crop_bbox = self.mask_rcnn.get_square_crop_box(masks[i])
                             quality_crop, quality_mask = self.mask_rcnn.get_square_crop(masks[i], img_src, resize=True)
                             items.append(
                                 {
@@ -736,6 +777,7 @@ class AnalysisPipeline:
                                     "quality_crop": quality_crop,
                                     "quality_mask": quality_mask,
                                     "stops": stops,
+                                    "crop_bbox": crop_bbox,
                                 }
                             )
                         if crops_cb:
@@ -806,10 +848,16 @@ class AnalysisPipeline:
                             )
                         return items
 
+                    crop_items_for_write = []
+                    primary_crop_index = 0
+                    img_h, img_w = img.shape[:2]
+
                     if bird_indices:
                         bird_items = process_bird_items(bird_indices)
                         bird_data = [
                             {
+                                "index": i["index"],
+                                "confidence": i["confidence"],
                                 "species": i["species"],
                                 "species_confidence": i["species_confidence"],
                                 "family": i["family"],
@@ -818,10 +866,12 @@ class AnalysisPipeline:
                                 "rating": i["rating"],
                                 "quality_crop": i["quality_crop"],
                                 "exposure_correction": i.get("exposure_correction", 0.0),
+                                "crop_bbox": i.get("crop_bbox"),
                             }
                             for i in bird_items
                         ]
-                        primary_bird = max(bird_data, key=lambda x: x["quality"])
+                        primary_crop_index = int(np.argmax([b["quality"] for b in bird_data]))
+                        primary_bird = bird_data[primary_crop_index]
                         entry.update(
                             {
                                 "species": primary_bird["species"],
@@ -844,7 +894,7 @@ class AnalysisPipeline:
                                 "secondary_family_scores": json.dumps(all_family_conf),
                             }
                         )
-                        crop_img = primary_bird["quality_crop"]
+                        crop_items_for_write = bird_data
                     else:
                         if wildlife_indices:
                             primary_index = wildlife_indices[np.argmax([pred_score[i] for i in wildlife_indices])]
@@ -888,7 +938,8 @@ class AnalysisPipeline:
                                     "exposure_correction": result["exposure_correction"],
                                 }
                             )
-                            crop_img = result["quality_crop"]
+                            crop_items_for_write = [result]
+                            primary_crop_index = 0
                         else:
                             if crops_cb:
                                 crops_cb({"filename": raw_file, "crops": [], "confidences": []})
@@ -896,18 +947,112 @@ class AnalysisPipeline:
                                 quality_cb({"filename": raw_file, "results": []})
                             if species_cb:
                                 species_cb({"filename": raw_file, "results": []})
-                            crop_img = img_small
+                            crop_items_for_write = [
+                                {
+                                    "index": -1,
+                                    "confidence": 0.0,
+                                    "species": entry.get("species", "Unknown"),
+                                    "species_confidence": entry.get("species_confidence", 0.0),
+                                    "family": entry.get("family", "Unknown"),
+                                    "family_confidence": entry.get("family_confidence", 0.0),
+                                    "quality": entry.get("quality", -1.0),
+                                    "rating": 0,
+                                    "quality_crop": img_small,
+                                    "exposure_correction": entry.get("exposure_correction", 0.0),
+                                    "crop_bbox": {
+                                        "x_min": 0,
+                                        "x_max": int(img_w),
+                                        "y_min": 0,
+                                        "y_max": int(img_h),
+                                        "width": int(img_w),
+                                        "height": int(img_h),
+                                        "x_min_norm": 0.0,
+                                        "x_max_norm": 1.0,
+                                        "y_min_norm": 0.0,
+                                        "y_max_norm": 1.0,
+                                        "x_center_norm": 0.5,
+                                        "y_center_norm": 0.5,
+                                    },
+                                }
+                            ]
+                            primary_crop_index = 0
 
                     stage_ctx["stage"] = "write_crop"
-                    crop_path = os.path.join(crop_dir, f"{os.path.splitext(raw_file)[0]}_crop.jpg")
-                    cv2.imwrite(
-                        crop_path,
-                        cv2.cvtColor(crop_img, cv2.COLOR_RGB2BGR),
-                        [cv2.IMWRITE_JPEG_QUALITY, 85],
+                    serialized_crops = []
+                    base_name = os.path.splitext(raw_file)[0]
+                    for crop_idx, crop_item in enumerate(crop_items_for_write):
+                        crop_img = crop_item.get("quality_crop")
+                        if crop_img is None:
+                            continue
+                        crop_path = os.path.join(crop_dir, f"{base_name}_crop_{crop_idx}.jpg")
+                        cv2.imwrite(
+                            crop_path,
+                            cv2.cvtColor(crop_img, cv2.COLOR_RGB2BGR),
+                            [cv2.IMWRITE_JPEG_QUALITY, 85],
+                        )
+                        crop_path_rel = os.path.relpath(crop_path, folder)
+                        bbox = crop_item.get("crop_bbox") or {
+                            "x_min": 0,
+                            "x_max": int(img_w),
+                            "y_min": 0,
+                            "y_max": int(img_h),
+                            "width": int(img_w),
+                            "height": int(img_h),
+                            "x_min_norm": 0.0,
+                            "x_max_norm": 1.0,
+                            "y_min_norm": 0.0,
+                            "y_max_norm": 1.0,
+                            "x_center_norm": 0.5,
+                            "y_center_norm": 0.5,
+                        }
+                        serialized_crops.append(
+                            {
+                                "crop_index": int(crop_idx),
+                                "crop_path": crop_path_rel,
+                                "detection_index": int(crop_item.get("index", -1)),
+                                "detection_confidence": float(crop_item.get("confidence", 0.0)),
+                                "species": str(crop_item.get("species", "Unknown") or "Unknown"),
+                                "species_confidence": float(crop_item.get("species_confidence", 0.0)),
+                                "family": str(crop_item.get("family", "Unknown") or "Unknown"),
+                                "family_confidence": float(crop_item.get("family_confidence", 0.0)),
+                                "quality": float(crop_item.get("quality", -1.0)),
+                                "rating": int(crop_item.get("rating", 0)),
+                                "exposure_correction": float(crop_item.get("exposure_correction", 0.0)),
+                                "bbox": {
+                                    "x_min": int(bbox.get("x_min", 0)),
+                                    "x_max": int(bbox.get("x_max", img_w)),
+                                    "y_min": int(bbox.get("y_min", 0)),
+                                    "y_max": int(bbox.get("y_max", img_h)),
+                                    "width": int(bbox.get("width", img_w)),
+                                    "height": int(bbox.get("height", img_h)),
+                                    "x_min_norm": float(bbox.get("x_min_norm", 0.0)),
+                                    "x_max_norm": float(bbox.get("x_max_norm", 1.0)),
+                                    "y_min_norm": float(bbox.get("y_min_norm", 0.0)),
+                                    "y_max_norm": float(bbox.get("y_max_norm", 1.0)),
+                                    "x_center_norm": float(bbox.get("x_center_norm", 0.5)),
+                                    "y_center_norm": float(bbox.get("y_center_norm", 0.5)),
+                                },
+                            }
+                        )
+
+                    if not serialized_crops:
+                        raise RuntimeError("No crop records generated for image")
+
+                    primary_crop_index = int(np.clip(primary_crop_index, 0, len(serialized_crops) - 1))
+                    primary_crop = serialized_crops[primary_crop_index]
+                    entry.update(
+                        {
+                            "species": primary_crop["species"],
+                            "species_confidence": primary_crop["species_confidence"],
+                            "family": primary_crop["family"],
+                            "family_confidence": primary_crop["family_confidence"],
+                            "quality": primary_crop["quality"],
+                            "exposure_correction": primary_crop["exposure_correction"],
+                            "crop_path": primary_crop["crop_path"],
+                            "crops_json": json.dumps(serialized_crops),
+                            "primary_crop_index": primary_crop_index,
+                        }
                     )
-                    # Store relative path for cross-platform compatibility
-                    crop_path_rel = os.path.relpath(crop_path, folder)
-                    entry.update({"crop_path": crop_path_rel})
 
                     stage_ctx["stage"] = "save_database"
                     database = pd.concat([database, pd.DataFrame([entry])], ignore_index=True)

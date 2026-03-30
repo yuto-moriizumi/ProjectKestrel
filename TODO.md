@@ -23,7 +23,7 @@ Bugs
 Features under consideration
 * Add a "Quick Export" system or copy thumbnail system. [DONE]
 * Implement "Suggested" system to manually reclassify species quickly based on majority confidence-weighted vote of all scene components. [DONE]
-* Multi-subject mode is not handled super consistently. Consider reworking pipeline to store crop exports of all detected subjects for improved analysis.
+* Multi-subject mode is not handled super consistently. Consider reworking pipeline to store crop exports of all detected subjects for improved analysis. [DONE]
 * Implement "Analyze JPGs instead of RAWs" with clear warning that analysis on RAWs is strongly preferred since JPG compression artifacts can dramatically alter quality scores.
 * Investigate GPU support from recent pull request #14
 * Alter search "show only manually reviewed photos" to include those with manual culling decisions or species selections. [DONE]

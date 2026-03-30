@@ -176,13 +176,52 @@ class MaskRCNNWrapper:
         )
 
     def get_square_crop(self, mask, img, resize=True):
-        x_min, x_max, y_min, y_max = self._get_bounding_box(mask)
+        bbox = self.get_square_crop_box(mask)
+        x_min = bbox["x_min"]
+        x_max = bbox["x_max"]
+        y_min = bbox["y_min"]
+        y_max = bbox["y_max"]
         crop = img[y_min:y_max, x_min:x_max]
         mask_crop = mask[y_min:y_max, x_min:x_max]
         if resize:
             crop = cv2.resize(crop, (1024, 1024))
             mask_crop = cv2.resize(mask_crop.astype(np.uint8), (1024, 1024))
         return crop, mask_crop
+
+    def get_square_crop_box(self, mask):
+        """Return square-crop geometry used by get_square_crop.
+
+        Coordinates are returned in both pixel and normalized [0, 1] forms so
+        callers can persist geometry and render overlays consistently.
+        """
+        x_min, x_max, y_min, y_max = self._get_bounding_box(mask)
+        h, w = mask.shape[:2]
+        x_min = max(0, min(int(x_min), max(0, w - 1)))
+        y_min = max(0, min(int(y_min), max(0, h - 1)))
+        x_max = max(x_min + 1, min(int(x_max), w))
+        y_max = max(y_min + 1, min(int(y_max), h))
+
+        width = x_max - x_min
+        height = y_max - y_min
+        w_denom = float(max(1, w))
+        h_denom = float(max(1, h))
+        x_center = x_min + (width / 2.0)
+        y_center = y_min + (height / 2.0)
+
+        return {
+            "x_min": int(x_min),
+            "x_max": int(x_max),
+            "y_min": int(y_min),
+            "y_max": int(y_max),
+            "width": int(width),
+            "height": int(height),
+            "x_min_norm": float(x_min / w_denom),
+            "x_max_norm": float(x_max / w_denom),
+            "y_min_norm": float(y_min / h_denom),
+            "y_max_norm": float(y_max / h_denom),
+            "x_center_norm": float(x_center / w_denom),
+            "y_center_norm": float(y_center / h_denom),
+        }
 
     @staticmethod
     def get_species_crop(box, img):
