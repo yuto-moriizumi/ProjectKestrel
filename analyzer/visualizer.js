@@ -3463,6 +3463,12 @@
       // Mask threshold
       const maskThEl = document.getElementById('maskThreshold');
       if (maskThEl) maskThEl.value = getSetting('mask_threshold', 0.5);
+      // Exposure compensation profile
+      const expProfileEl = document.getElementById('exposureCompensationProfile');
+      if (expProfileEl) {
+        const savedExpProfile = String(getSetting('exposure_compensation_profile', 'normal') || 'normal').toLowerCase();
+        expProfileEl.value = ['lenient', 'normal', 'aggressive'].includes(savedExpProfile) ? savedExpProfile : 'normal';
+      }
       // RAW preview cache
       const rawCacheCb = document.getElementById('rawPreviewCacheEnabled');
       if (rawCacheCb) rawCacheCb.checked = getSetting('raw_preview_cache_enabled', true);
@@ -3505,6 +3511,11 @@
       const sceneTimeThreshold = sttEl2 ? Math.max(0, parseFloat(sttEl2.value) || 1.0) : 1.0;
       const maskThEl2 = document.getElementById('maskThreshold');
       const maskThreshold = maskThEl2 ? Math.max(0.5, Math.min(0.95, parseFloat(maskThEl2.value) || 0.5)) : 0.5;
+      const expProfileEl2 = document.getElementById('exposureCompensationProfile');
+      const exposureCompensationProfile = (expProfileEl2 ? String(expProfileEl2.value || 'normal') : 'normal').toLowerCase();
+      const exposureCompensationProfileSafe = ['lenient', 'normal', 'aggressive'].includes(exposureCompensationProfile)
+        ? exposureCompensationProfile
+        : 'normal';
       const rawCacheCb2 = document.getElementById('rawPreviewCacheEnabled');
       const rawPreviewCacheEnabled = rawCacheCb2 ? rawCacheCb2.checked : true;
       const autoSaveCb = document.getElementById('settingsAutoSave');
@@ -3519,6 +3530,7 @@
         detection_threshold: detectionThreshold,
         scene_time_threshold: sceneTimeThreshold,
         mask_threshold: maskThreshold,
+        exposure_compensation_profile: exposureCompensationProfileSafe,
         raw_preview_cache_enabled: rawPreviewCacheEnabled,
         auto_save_enabled: autoSaveEnabled,
         raw_exposure_correction_disabled: document.getElementById('rawExposureCorrectionDisabled').checked,

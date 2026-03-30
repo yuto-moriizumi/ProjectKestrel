@@ -91,7 +91,7 @@ class AnalysisPipeline:
         return overlay
 
     @staticmethod
-    def _compute_exposure_stops(img: np.ndarray, mask: np.ndarray) -> float:
+    def _compute_exposure_stops(img: np.ndarray, mask: np.ndarray, profile: str = "normal") -> float:
         """Estimate exposure correction in stops for the masked subject region.
 
         This is histogram-aware (percentile based), not mean-only. It balances
@@ -99,22 +99,68 @@ class AnalysisPipeline:
         1) center subject mid-tones toward a neutral target, and
         2) protect highlight/shadow detail in mixed-contrast scenes.
 
-        Returns a value in [-1.75, +2.5] where positive lifts exposure and
+        Profile can be "lenient", "normal", or "aggressive".
+
+        Returns a value in [-1.75, +3.0] where positive lifts exposure and
         negative pulls it down.
         """
-        EPS = 1e-3        
-        #TARGET_MID = 0.42
-        #TARGET_HI_P90 = 0.90
-        #TARGET_HI_P98 = 0.975
-        TARGET_MID = 0.48
-        TARGET_HI_P90 = 0.92
-        TARGET_HI_P98 = 0.985
-        TARGET_HI_P95_HOT = 0.88
-        SHADOW_FLOOR_P10 = 0.06
+        EPS = 1e-3
+        profile_name = str(profile or "normal").strip().lower()
+        if profile_name not in {"lenient", "normal", "aggressive"}:
+            profile_name = "normal"
+
+        profile_cfg = {
+            "lenient": {
+                "TARGET_MID": 0.49,
+                "TARGET_HI_P90": 0.91,
+                "TARGET_HI_P98": 0.982,
+                "TARGET_HI_P95_HOT": 0.865,
+                "SHADOW_FLOOR_P10": 0.065,
+                "SHADOW_LIFT_TRIGGER_P10": 0.11,
+                "SHADOW_LIFT_MAX": 0.16,
+                "HOT_CLIP_RATIO": 0.012,
+                "MAX_BRIGHTEN": 2.25,
+                "MAX_ERODE_ITERS": 1,
+            },
+            "normal": {
+                "TARGET_MID": 0.505,
+                "TARGET_HI_P90": 0.915,
+                "TARGET_HI_P98": 0.983,
+                "TARGET_HI_P95_HOT": 0.87,
+                "SHADOW_FLOOR_P10": 0.065,
+                "SHADOW_LIFT_TRIGGER_P10": 0.13,
+                "SHADOW_LIFT_MAX": 0.3,
+                "HOT_CLIP_RATIO": 0.015,
+                "MAX_BRIGHTEN": 2.75,
+                "MAX_ERODE_ITERS": 3,
+            },
+            "aggressive": {
+                "TARGET_MID": 0.525,
+                "TARGET_HI_P90": 0.92,
+                "TARGET_HI_P98": 0.985,
+                "TARGET_HI_P95_HOT": 0.875,
+                "SHADOW_FLOOR_P10": 0.07,
+                "SHADOW_LIFT_TRIGGER_P10": 0.15,
+                "SHADOW_LIFT_MAX": 0.46,
+                "HOT_CLIP_RATIO": 0.018,
+                "MAX_BRIGHTEN": 3.0,
+                "MAX_ERODE_ITERS": 5,
+            },
+        }[profile_name]
+
+        TARGET_MID = profile_cfg["TARGET_MID"]
+        TARGET_HI_P90 = profile_cfg["TARGET_HI_P90"]
+        TARGET_HI_P98 = profile_cfg["TARGET_HI_P98"]
+        TARGET_HI_P95_HOT = profile_cfg["TARGET_HI_P95_HOT"]
+        SHADOW_FLOOR_P10 = profile_cfg["SHADOW_FLOOR_P10"]
+        SHADOW_LIFT_TRIGGER_P10 = profile_cfg["SHADOW_LIFT_TRIGGER_P10"]
+        SHADOW_LIFT_MAX = profile_cfg["SHADOW_LIFT_MAX"]
+        HOT_CLIP_RATIO = profile_cfg["HOT_CLIP_RATIO"]
+        MAX_BRIGHTEN = profile_cfg["MAX_BRIGHTEN"]
+        MAX_ERODE_ITERS = int(profile_cfg["MAX_ERODE_ITERS"])
+
         CLIP_THRESH = 0.985
-        HOT_CLIP_RATIO = 0.02
         MAX_DARKEN = -1.75
-        MAX_BRIGHTEN = 2.5
         try:
             img_f = img.astype(np.float32) / 255.0
             mask_bool = mask.astype(bool) if mask is not None else None
@@ -124,6 +170,24 @@ class AnalysisPipeline:
                 and img_f.ndim == 3
                 and img_f.shape[:2] == mask_bool.shape
             ):
+                # Exclude edge pixels from the exposure histogram because mask
+                # boundaries often contain mixed foreground/background values.
+                mask_u8 = mask_bool.astype(np.uint8)
+                area = int(np.count_nonzero(mask_u8))
+                if area >= 256:
+                    erode_iters = 1
+                    if area >= 2000:
+                        erode_iters += 1
+                    if area >= 6000:
+                        erode_iters += 1
+                    if area >= 12000:
+                        erode_iters += 1
+                    if area >= 22000:
+                        erode_iters += 1
+                    erode_iters = min(erode_iters, MAX_ERODE_ITERS)
+                    eroded = cv2.erode(mask_u8, np.ones((3, 3), dtype=np.uint8), iterations=erode_iters).astype(bool)
+                    if eroded.any():
+                        mask_bool = eroded
                 pixels = img_f[mask_bool]
             else:
                 pixels = img_f.reshape(-1, 3)
@@ -132,11 +196,25 @@ class AnalysisPipeline:
             lum = lum[np.isfinite(lum)]
             if lum.size == 0:
                 return 0.0
-            p10, p50, p90, p95, p98 = np.percentile(lum, [10, 50, 90, 95, 98])
+            p10, p35, p50, p90, p95, p98 = np.percentile(lum, [10, 35, 50, 90, 95, 98])
             clip_ratio = float(np.mean(lum >= CLIP_THRESH))
 
-            # Midtone intent (robust against small bright outliers).
-            mid_stop = float(np.log2(TARGET_MID / max(float(p50), EPS)))
+            # Midtone intent uses a lower-percentile anchor so underexposed
+            # subjects are lifted a little more aggressively.
+            mid_anchor = 0.7 * float(p50) + 0.3 * float(p35)
+            mid_stop = float(np.log2(TARGET_MID / max(mid_anchor, EPS)))
+
+            # Add a bounded shadow lift for very dark subjects.
+            if p50 < TARGET_MID:
+                darkness = float(
+                    np.clip(
+                        (SHADOW_LIFT_TRIGGER_P10 - float(p10))
+                        / max(SHADOW_LIFT_TRIGGER_P10, EPS),
+                        0.0,
+                        1.0,
+                    )
+                )
+                mid_stop += darkness * SHADOW_LIFT_MAX
 
             # Highlight ceilings prevent over-bright outputs.
             hi90_stop = float(np.log2(TARGET_HI_P90 / max(float(p90), EPS)))
@@ -188,7 +266,14 @@ class AnalysisPipeline:
                 linear_scale = float(np.clip(2.0 ** stops, 0.25, 8.0))
                 # Preserve highlights when brightening to avoid blowing out
                 # any remaining highlight detail.
-                preserve = 0.8 if stops > 0 else 0.0
+                if stops > 1.0:
+                    preserve = 0.95
+                elif stops > 0.4:
+                    preserve = 0.9
+                elif stops > 0.0:
+                    preserve = 0.85
+                else:
+                    preserve = 0.0
                 return raw_obj.postprocess(
                     exp_shift=linear_scale,
                     exp_preserve_highlights=preserve,
@@ -252,11 +337,15 @@ class AnalysisPipeline:
         error_cb = callbacks.get("on_error")
 
         rating_thresholds = None
+        exposure_profile = "normal"
         if callable(load_persisted_settings):
             try:
                 sett = load_persisted_settings() or {}
                 profile = sett.get('rating_profile', 'balanced')
                 rating_thresholds = get_profile_thresholds(profile)
+                raw_exp_profile = str(sett.get('exposure_compensation_profile', 'normal') or 'normal').strip().lower()
+                if raw_exp_profile in {'lenient', 'normal', 'aggressive'}:
+                    exposure_profile = raw_exp_profile
             except Exception:
                 rating_thresholds = None
 
@@ -563,7 +652,7 @@ class AnalysisPipeline:
 
                     def process_nonbird(primary_mask_i):
                         stage_ctx["stage"] = "process_nonbird"
-                        stops = self._compute_exposure_stops(img, masks[primary_mask_i])
+                        stops = self._compute_exposure_stops(img, masks[primary_mask_i], exposure_profile)
                         img_src = self._apply_exposure_correction(img, stops, raw_obj)
                         quality_crop, quality_mask = self.mask_rcnn.get_square_crop(
                             masks[primary_mask_i], img_src, resize=True
@@ -586,7 +675,7 @@ class AnalysisPipeline:
                         for i in indices:
                             # Process per-crop results. Pause is checked at the
                             # top of the image loop so we avoid pausing mid-image.
-                            stops = self._compute_exposure_stops(img, masks[i])
+                            stops = self._compute_exposure_stops(img, masks[i], exposure_profile)
                             img_src = self._apply_exposure_correction(img, stops, raw_obj)
                             species_crop = self.mask_rcnn.get_species_crop(pred_boxes[i], img_src)
                             quality_crop, quality_mask = self.mask_rcnn.get_square_crop(masks[i], img_src, resize=True)

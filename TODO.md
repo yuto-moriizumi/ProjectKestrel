@@ -13,6 +13,7 @@ Bugs
 * PIPELINE CHANGE New ML model is needed to correctly handle the exposure shift adjustements.
 * Delete cache files after folder unloaded or software closed. [DONE]
 * Fix bad UI problem when splitting a scene. [DONE]
+* Tweak exposure compensation algorithm to be slightly more aggressive in correcting exposure changes; making sure that highlights are not blown out while also making sure that shadows or highly underexposed birds are properly adjusted and lifted. Potentially exclude some of the boundary pixel layers during exposure compensation calculation as they my reflect mask-rcnn boundary inconsistencies. [DONE]
 
 Features under consideration
 * Add a "Quick Export" system or copy thumbnail system. [DONE]
@@ -20,7 +21,7 @@ Features under consideration
 * Multi-subject mode is not handled super consistently. Consider reworking pipeline to store crop exports of all detected subjects for improved analysis.
 * Implement "Analyze JPGs instead of RAWs" with clear warning that analysis on RAWs is strongly preferred since JPG compression artifacts can dramatically alter quality scores.
 * Investigate GPU support from recent pull request #14
-* Alter search "show only manually reviewed photos" to include those with manual culling decisions or species selections.
+* Alter search "show only manually reviewed photos" to include those with manual culling decisions or species selections. [DONE]
 * Add restore capability that persists after closing/reopening Culling Assistant/Kestrel [DONE]
 
 Test before release:

@@ -449,6 +449,16 @@
         segmentation (0.50–0.95). Higher values produce tighter masks around birds, lower values are more
         inclusive. Requires re-analysis to take effect.</div>
 
+      <div class="row">
+        <label for="exposureCompensationProfile">Exposure Compensation Profile</label>
+        <select id="exposureCompensationProfile">
+          <option value="lenient">Lenient &mdash; minimal compensation and conservative mask erosion</option>
+          <option value="normal" selected>Normal &mdash; balanced lift/recovery for most workflows</option>
+          <option value="aggressive">Aggressive &mdash; stronger shadow lift and deeper mask erosion</option>
+        </select>
+      </div>
+      <div class="muted" style="font-size:12px;margin-top:-6px;margin-bottom:8px">Controls how strongly Kestrel adjusts exposure during analysis. Aggressive can better lift dark subjects while still using highlight safeguards. Requires re-analysis to take effect.</div>
+
       <h4 style="margin:12px 0 8px;padding-top:8px;border-top:1px solid #1d2230;color:#a0a8b8;font-size:13px;text-transform:uppercase;letter-spacing:0.5px">Data &amp; Preview</h4>
 
       <div class="row">
