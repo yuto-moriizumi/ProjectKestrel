@@ -8,7 +8,7 @@ Features:
  - Intended to be frozen into a single executable with PyInstaller.
 
 Usage (development):
-    python visualizer/visualizer.py --port 8765 --root C:\Photos\Trip
+    python visualizer/visualizer.py --port 8765 --root C:/Photos/Trip
 
 After starting it will open the default browser at http://127.0.0.1:<port>/ .
 
@@ -16,7 +16,7 @@ Build single-file EXE (example):
     pyinstaller --onefile --name kestrel_viz visualizer/visualizer.py
 
 Optionally set env vars (same as editor_bridge):
-  KESTREL_ALLOWED_ROOT=C:\Photos\Trip  (restrict paths)
+    KESTREL_ALLOWED_ROOT=C:/Photos/Trip  (restrict paths)
   KESTREL_BRIDGE_TOKEN=secret              (require auth header)
   KESTREL_ALLOWED_EXTENSIONS=.cr3,.jpg,... (override allowed list)
   KESTREL_ALLOW_ANY_EXTENSION=1            (disable extension filtering)
@@ -36,7 +36,6 @@ import argparse
 import json
 import os
 import sys
-import webbrowser
 
 import secrets
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -61,6 +60,12 @@ except ImportError:
         _telemetry = None  # type: ignore[assignment]
 
 HOST = '127.0.0.1'
+
+# Phase 0 policy lock: desktop pywebview mode is required and API routes use
+# a unified token+origin security policy while the local HTTP bridge exists.
+SECURITY_POLICY_VERSION = '2026-03-30'
+BROWSER_ONLY_MODE_SUPPORTED = False
+API_AUTH_POLICY = 'token+origin-required-for-api-routes'
 
 # --- Security / behavior configuration (env override matches editor_bridge) ---
 ALLOWED_ROOT = os.environ.get('KESTREL_ALLOWED_ROOT')
@@ -291,9 +296,13 @@ class Handler(SimpleHTTPRequestHandler):
             self.wfile.write(body)
             return
         if self.path == '/settings':
+            if not self._check_auth():
+                return
             self._json(200, {'ok': True, 'settings': load_persisted_settings()})
             return
         if self.path == '/queue/status':
+            if not self._check_auth():
+                return
             self._json(200, _queue_manager.get_status())
             return
         if self.path == '/recovery/status':
@@ -394,15 +403,8 @@ class Handler(SimpleHTTPRequestHandler):
         self.wfile.write(body)
 
     def handle_open(self):
-        if AUTH_TOKEN:
-            token = self.headers.get('X-Bridge-Token') or ''
-            if token != AUTH_TOKEN:
-                self._json(401, {'ok': False, 'error': 'Unauthorized'}); return
-        # Basic origin check (best-effort; Origin may be absent for some requests)
-        origin = self.headers.get('Origin')
-        expected_origin = f'http://{HOST}:{self.server.server_port}'  # type: ignore[attr-defined]
-        if origin and origin != expected_origin:
-            self._json(403, {'ok': False, 'error': 'Origin mismatch'}); return
+        if not self._check_auth():
+            return
         try:
             payload = self._read_json()
         except Exception as e:
@@ -439,11 +441,8 @@ class Handler(SimpleHTTPRequestHandler):
             self._json(500, {'ok': False, 'error': str(e)})
 
     def handle_shutdown(self):
-        # Require token (always) to prevent CSRF/drive-by shutdown
-        if AUTH_TOKEN:
-            token = self.headers.get('X-Bridge-Token') or ''
-            if token != AUTH_TOKEN:
-                self._json(401, {'ok': False, 'error': 'Unauthorized'}); return
+        if not self._check_auth():
+            return
         log('Received shutdown request from client; scheduling server shutdown.')
         # Respond first, then shutdown asynchronously so reply is delivered
         self._json(200, {'ok': True, 'message': 'Shutting down'})
@@ -457,14 +456,8 @@ class Handler(SimpleHTTPRequestHandler):
         threading.Thread(target=_shutdown, daemon=True).start()
 
     def handle_settings(self):
-        if AUTH_TOKEN:
-            token = self.headers.get('X-Bridge-Token') or ''
-            if token != AUTH_TOKEN:
-                self._json(401, {'ok': False, 'error': 'Unauthorized'}); return
-        origin = self.headers.get('Origin')
-        expected_origin = f'http://{HOST}:{self.server.server_port}'  # type: ignore[attr-defined]
-        if origin and origin != expected_origin:
-            self._json(403, {'ok': False, 'error': 'Origin mismatch'}); return
+        if not self._check_auth():
+            return
         try:
             payload = self._read_json()
             settings = payload.get('settings') if isinstance(payload, dict) else None
@@ -475,14 +468,25 @@ class Handler(SimpleHTTPRequestHandler):
         except Exception as e:
             self._json(400, {'ok': False, 'error': str(e)})
 
+    def _check_origin(self) -> bool:
+        origin = self.headers.get('Origin')
+        expected_origin = f'http://{HOST}:{self.server.server_port}'  # type: ignore[attr-defined]
+        # Best-effort origin check: browsers send Origin on CORS/XHR/fetch.
+        # We allow missing Origin for compatibility with some local clients.
+        if origin and origin != expected_origin:
+            self._json(403, {'ok': False, 'error': 'Origin mismatch'})
+            return False
+        return True
+
     def _check_auth(self) -> bool:
-        """Return True if authenticated (or no token required). Sends 401 and returns False on failure."""
+        """Return True if token and origin checks pass for API routes."""
         if AUTH_TOKEN:
             token = self.headers.get('X-Bridge-Token') or ''
             if token != AUTH_TOKEN:
                 self._json(401, {'ok': False, 'error': 'Unauthorized'})
                 return False
-        return True
+        return self._check_origin()
+
     def handle_feedback(self):
         """Accept feedback/bug report submissions (browser-mode fallback)."""
         if not self._check_auth():
@@ -614,9 +618,6 @@ class Handler(SimpleHTTPRequestHandler):
 def parse_args():
     ap = argparse.ArgumentParser(description='Serve Project Kestrel visualizer with local /open bridge.')
     ap.add_argument('--port', type=int, default=8765, help='Port to listen on (default 8765)')
-    ap.add_argument('--no-browser', action='store_true', help='Do not auto-open a browser window')
-    ap.add_argument('--windowed', action='store_true', help='Open in a desktop window (requires pywebview) [default]')
-    ap.add_argument('--no-windowed', action='store_true', help='Disable windowed mode and use the system browser')
     ap.add_argument('--root', default='', help='Default root folder for RAW originals (client can override unless KESTREL_ALLOWED_ROOT set)')
     return ap.parse_args()
 
@@ -626,6 +627,7 @@ def main():
     runtime_log_path = _enable_runtime_log_capture()
     if runtime_log_path:
         log('Runtime log capture enabled:', runtime_log_path)
+    log('Security policy:', SECURITY_POLICY_VERSION, API_AUTH_POLICY, 'browser_mode_supported=', BROWSER_ONLY_MODE_SUPPORTED)
     _mark_session_start()
 
     # When visualizer.py is run from inside analyzer/ (merged layout) set
@@ -666,181 +668,158 @@ def main():
     if args.root:
         log('Default root (client-supplied):', args.root)
     url = f'http://{HOST}:{args.port}/'
-    if args.no_windowed:
-        args.windowed = False
-    else:
-        args.windowed = True
-    if args.windowed and not WEBVIEW_IMPORT_SUCCESS:
-        log('pywebview not available; falling back to system browser')
-        args.windowed = False
-    else:
-        log('Windowed mode enabled; using pywebview' if args.windowed else 'Windowed mode disabled; using system browser')
-    if args.windowed:
-        def _serve():
-            try:
-                server.serve_forever()
-            except Exception:
-                pass
-        t = threading.Thread(target=_serve, daemon=True)
-        t.start()
-        api = None
-        try:
-            log('Starting windowed UI via pywebview...')
-            api = Api() # start maximized
-            api._server_port = args.port
-            win = webview.create_window('Project Kestrel', url, js_api=api, maximized=True)
-            api._main_window = win
+    if not WEBVIEW_IMPORT_SUCCESS:
+        raise RuntimeError('pywebview is required. Browser-only mode is no longer supported.')
+    log('Windowed mode enabled; using pywebview')
 
-            # When the analysis queue is running, intercept the close event so the
-            # window minimizes to the taskbar instead of killing mid-analysis.
-            def _on_closing():
-                # Check for unsaved changes via the Python-side flag
-                # (avoid evaluate_js here — it deadlocks because closing runs on the GUI thread)
-                has_unsaved = getattr(api, '_has_unsaved_changes', False)
-
-                def _cleanup_preview_cache_before_exit():
-                    try:
-                        if hasattr(api, 'cleanup_tracked_culling_caches'):
-                            api.cleanup_tracked_culling_caches()
-                    except Exception as e:
-                        log('Cache cleanup on close failed:', e)
-
-                # When an analysis is running or paused, prompt the user with
-                # options to Minimize, Exit (cancel) or Cancel the close.
-                if _queue_manager.is_running or _queue_manager.is_paused:
-                    try:
-                        # Use native Windows MessageBox if available for a simple
-                        # three-button prompt. Fallback to tkinter dialog when not.
-                        if sys.platform.startswith('win'):
-                            import ctypes
-                            MB_YESNOCANCEL = 0x00000003
-                            MB_ICONQUESTION = 0x00000020
-                            title = 'Analysis in progress'
-                            if _queue_manager.is_paused:
-                                msg = 'Analysis is paused. Exit Project Kestrel? You can re-open later to resume.'
-                            else:
-                                msg = 'Analysis is in progress. Cancel analysis and exit?'
-                            resp = ctypes.windll.user32.MessageBoxW(0, msg, title, MB_YESNOCANCEL | MB_ICONQUESTION)
-                            # IDYES=6 -> Exit (cancel analysis and close)
-                            # IDNO=7  -> Minimize instead of closing
-                            # IDCANCEL=2 -> Do not close
-                            if resp == 6:
-                                try:
-                                    _queue_manager.cancel()
-                                except Exception:
-                                    pass
-                                _cleanup_preview_cache_before_exit()
-                                return True
-                            if resp == 7:
-                                try:
-                                    win.minimize()
-                                except Exception:
-                                    pass
-                                return False
-                            return False
-                        else:
-                            # Tkinter fallback
-                            import tkinter as _tk
-                            from tkinter import messagebox as _mb
-                            root = _tk.Tk()
-                            root.withdraw()
-                            if _queue_manager.is_paused:
-                                msg = 'Analysis is paused. Exit Project Kestrel? You can re-open later to resume.'
-                            else:
-                                msg = 'Analysis is in progress. Cancel analysis and exit?'
-                            res = _mb.askyesnocancel('Analysis in progress', msg)
-                            root.destroy()
-                            # askyesnocancel returns True=Yes, False=No, None=Cancel
-                            if res is True:
-                                try:
-                                    _queue_manager.cancel()
-                                except Exception:
-                                    pass
-                                _cleanup_preview_cache_before_exit()
-                                return True
-                            if res is False:
-                                try:
-                                    win.minimize()
-                                except Exception:
-                                    pass
-                                return False
-                            return False
-                    except Exception:
-                        # If the prompt fails, fall back to minimizing when running
-                        try:
-                            win.minimize()
-                        except Exception:
-                            pass
-                        return False
-
-                # Prompt for unsaved changes when no analysis is running
-                if has_unsaved:
-                    try:
-                        if sys.platform.startswith('win'):
-                            import ctypes
-                            MB_YESNO = 0x00000004
-                            MB_ICONWARNING = 0x00000030
-                            msg = 'You have unsaved changes that will be lost. Close anyway?'
-                            title = 'Unsaved Changes'
-                            resp = ctypes.windll.user32.MessageBoxW(0, msg, title, MB_YESNO | MB_ICONWARNING)
-                            if resp == 6:  # Yes – close and discard
-                                _cleanup_preview_cache_before_exit()
-                                return True
-                            return False  # No – don't close
-                        else:
-                            import tkinter as _tk
-                            from tkinter import messagebox as _mb
-                            root = _tk.Tk()
-                            root.withdraw()
-                            res = _mb.askyesno('Unsaved Changes',
-                                               'You have unsaved changes that will be lost. Close anyway?')
-                            root.destroy()
-                            if res:
-                                _cleanup_preview_cache_before_exit()
-                                return True
-                            return False
-                            return True
-                    except Exception:
-                        _cleanup_preview_cache_before_exit()
-                        return True  # on failure, allow close
-
-                _cleanup_preview_cache_before_exit()
-                return True  # allow normal close
-
-            try:
-                win.events.closing += _on_closing
-            except Exception:
-                pass  # older pywebview versions may not support this event
-
-            webview.start()
-        except Exception as e:
-            log('Windowed mode failed at runtime; falling back to browser:', repr(e))
-            try:
-                webbrowser.open(url)
-            except Exception:
-                pass
-        finally:
-            try:
-                if api is not None and hasattr(api, 'cleanup_tracked_culling_caches'):
-                    api.cleanup_tracked_culling_caches()
-            except Exception as e:
-                log('Cache cleanup during shutdown failed:', e)
-            server.shutdown()
-            server.server_close()
-            log('Server stopped.')
-    else:
-        if not args.no_browser:
-            try:
-                webbrowser.open(url)
-            except Exception:
-                pass
+    def _serve():
         try:
             server.serve_forever()
-        except KeyboardInterrupt:
+        except Exception:
             pass
-        finally:
-            server.server_close()
-            log('Server stopped.')
+
+    t = threading.Thread(target=_serve, daemon=True)
+    t.start()
+    api = None
+    try:
+        log('Starting windowed UI via pywebview...')
+        api = Api() # start maximized
+        api._server_port = args.port
+        win = webview.create_window('Project Kestrel', url, js_api=api, maximized=True)
+        api._main_window = win
+
+        # When the analysis queue is running, intercept the close event so the
+        # window minimizes to the taskbar instead of killing mid-analysis.
+        def _on_closing():
+            # Check for unsaved changes via the Python-side flag
+            # (avoid evaluate_js here - it deadlocks because closing runs on the GUI thread)
+            has_unsaved = getattr(api, '_has_unsaved_changes', False)
+
+            def _cleanup_preview_cache_before_exit():
+                try:
+                    if hasattr(api, 'cleanup_tracked_culling_caches'):
+                        api.cleanup_tracked_culling_caches()
+                except Exception as e:
+                    log('Cache cleanup on close failed:', e)
+
+            # When an analysis is running or paused, prompt the user with
+            # options to Minimize, Exit (cancel) or Cancel the close.
+            if _queue_manager.is_running or _queue_manager.is_paused:
+                try:
+                    # Use native Windows MessageBox if available for a simple
+                    # three-button prompt. Fallback to tkinter dialog when not.
+                    if sys.platform.startswith('win'):
+                        import ctypes
+                        MB_YESNOCANCEL = 0x00000003
+                        MB_ICONQUESTION = 0x00000020
+                        title = 'Analysis in progress'
+                        if _queue_manager.is_paused:
+                            msg = 'Analysis is paused. Exit Project Kestrel? You can re-open later to resume.'
+                        else:
+                            msg = 'Analysis is in progress. Cancel analysis and exit?'
+                        resp = ctypes.windll.user32.MessageBoxW(0, msg, title, MB_YESNOCANCEL | MB_ICONQUESTION)
+                        # IDYES=6 -> Exit (cancel analysis and close)
+                        # IDNO=7  -> Minimize instead of closing
+                        # IDCANCEL=2 -> Do not close
+                        if resp == 6:
+                            try:
+                                _queue_manager.cancel()
+                            except Exception:
+                                pass
+                            _cleanup_preview_cache_before_exit()
+                            return True
+                        if resp == 7:
+                            try:
+                                win.minimize()
+                            except Exception:
+                                pass
+                            return False
+                        return False
+                    else:
+                        # Tkinter fallback
+                        import tkinter as _tk
+                        from tkinter import messagebox as _mb
+                        root = _tk.Tk()
+                        root.withdraw()
+                        if _queue_manager.is_paused:
+                            msg = 'Analysis is paused. Exit Project Kestrel? You can re-open later to resume.'
+                        else:
+                            msg = 'Analysis is in progress. Cancel analysis and exit?'
+                        res = _mb.askyesnocancel('Analysis in progress', msg)
+                        root.destroy()
+                        # askyesnocancel returns True=Yes, False=No, None=Cancel
+                        if res is True:
+                            try:
+                                _queue_manager.cancel()
+                            except Exception:
+                                pass
+                            _cleanup_preview_cache_before_exit()
+                            return True
+                        if res is False:
+                            try:
+                                win.minimize()
+                            except Exception:
+                                pass
+                            return False
+                        return False
+                except Exception:
+                    # If the prompt fails, fall back to minimizing when running
+                    try:
+                        win.minimize()
+                    except Exception:
+                        pass
+                    return False
+
+            # Prompt for unsaved changes when no analysis is running
+            if has_unsaved:
+                try:
+                    if sys.platform.startswith('win'):
+                        import ctypes
+                        MB_YESNO = 0x00000004
+                        MB_ICONWARNING = 0x00000030
+                        msg = 'You have unsaved changes that will be lost. Close anyway?'
+                        title = 'Unsaved Changes'
+                        resp = ctypes.windll.user32.MessageBoxW(0, msg, title, MB_YESNO | MB_ICONWARNING)
+                        if resp == 6:  # Yes - close and discard
+                            _cleanup_preview_cache_before_exit()
+                            return True
+                        return False  # No - don't close
+                    else:
+                        import tkinter as _tk
+                        from tkinter import messagebox as _mb
+                        root = _tk.Tk()
+                        root.withdraw()
+                        res = _mb.askyesno(
+                            'Unsaved Changes',
+                            'You have unsaved changes that will be lost. Close anyway?'
+                        )
+                        root.destroy()
+                        if res:
+                            _cleanup_preview_cache_before_exit()
+                            return True
+                        return False
+                except Exception:
+                    _cleanup_preview_cache_before_exit()
+                    return True  # on failure, allow close
+
+            _cleanup_preview_cache_before_exit()
+            return True  # allow normal close
+
+        try:
+            win.events.closing += _on_closing
+        except Exception:
+            pass  # older pywebview versions may not support this event
+
+        webview.start()
+    finally:
+        try:
+            if api is not None and hasattr(api, 'cleanup_tracked_culling_caches'):
+                api.cleanup_tracked_culling_caches()
+        except Exception as e:
+            log('Cache cleanup during shutdown failed:', e)
+        server.shutdown()
+        server.server_close()
+        log('Server stopped.')
 
     _mark_session_clean_exit()
 

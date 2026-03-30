@@ -5,7 +5,7 @@
   <meta name="viewport" content="width=device-width, initial-scale=1" />
   <title>Culling Assistant — Project Kestrel</title>
   <link rel="icon" href="data:," />
-  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
+  <script src="csv_parser.js"></script>
   <script src="bridge_config.js"></script>
   <style>
     :root {
@@ -2614,7 +2614,10 @@
       const res = await window.pywebview.api.read_kestrel_csv(rootPath);
       if (!res.success) throw new Error(res.error || 'Failed to read CSV');
 
-      const parsed = Papa.parse(res.data, { header: true, skipEmptyLines: true });
+      if (!window.KestrelCsv || typeof window.KestrelCsv.parse !== 'function') {
+        throw new Error('CSV parser unavailable (csv_parser.js not loaded)');
+      }
+      const parsed = window.KestrelCsv.parse(res.data, { header: true, skipEmptyLines: true });
       header = parsed.meta.fields || [];
       rows = parsed.data || [];
       activeCropIndexByImage.clear();

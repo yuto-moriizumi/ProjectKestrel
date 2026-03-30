@@ -21,6 +21,7 @@ Bugs
 * Canon EOS R5 Mark II RAW Decode Issue --> Bumped Rawpy dependency from 0.23.1 to 0.26.1 [DONE]
 * Resolve dependabot dependency security vulnerability alerts [DONE]
 * Conduct comprehensive security review.
+* Security Fixes: remove browser mode fallback, tighten exposed API endpoints, enforce schema validation for settings files, tighten path normalization escapes, and reduce blast radius of auth token breach. [IN PROGRESS]
 
 
 Features under consideration

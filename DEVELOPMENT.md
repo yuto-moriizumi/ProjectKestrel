@@ -80,6 +80,11 @@ python analyzer/cli.py "C:\path\to\photos" --gpu
 python visualizer/visualizer.py --port 8765 --root "C:\path\to\analyzed\photos"
 ```
 
+Security and runtime mode notes:
+- The visualizer is desktop-first and requires pywebview.
+- Browser-only fallback mode is intentionally unsupported.
+- Keep local API bridge security checks aligned with the token+origin policy.
+
 ## Building Executables
 
 ### Prerequisites

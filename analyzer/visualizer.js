@@ -1,12 +1,5 @@
-    // State
-    // NOTE: Two modes for file access:
-    // 1. Python API mode (desktop app): Uses rootPath + Python backend API calls
-    // 2. File System Access API mode (browser): Uses rootDirHandle for direct file access
-    // The getBlobUrlForPath function automatically chooses the best available method
-    let rootDirHandle = null;      // Top-level photo folder (contains .kestrel) - for File System Access API
-    let rootIsKestrel = false;     // True if user selected the .kestrel folder itself
-    let rootPath = '';             // Absolute path to root folder (for Python API)
-    let csvFileHandle = null;      // .kestrel/kestrel_database.csv
+    // State (desktop mode only)
+    let rootPath = '';             // Absolute path to root folder (desktop pywebview mode)
     let rows = [];                 // CSV rows (objects)
     let _scenedata = {};           // Map of rootPath → kestrel_scenedata.json contents
     let header = [];               // CSV header fields
@@ -88,12 +81,10 @@
     const sceneDlg = el('#sceneDlg');
     const versionBadge = el('#versionBadge');
 
-    const supportsFS = 'showDirectoryPicker' in window;
-    let hasPywebviewApi = typeof window.pywebview !== 'undefined';
+    let hasPywebviewApi = !!(window.pywebview && window.pywebview.api);
 
     // Debug: Log what APIs are available (initial check)
     console.log('[DEBUG] Initial API Detection:');
-    console.log('  - File System Access API (showDirectoryPicker):', supportsFS);
     console.log('  - Pywebview API (window.pywebview):', hasPywebviewApi);
     if (hasPywebviewApi) {
       console.log('  - window.pywebview object:', window.pywebview);
@@ -127,17 +118,19 @@
       return false;
     }
 
-    // Start checking for pywebview immediately and update UI when ready
+    // Desktop mode requires pywebview API at startup.
     (async function() {
       const apiReady = !hasPywebviewApi ? await waitForPywebview() : true;
+      if (!apiReady) {
+        setStatus('Error: Desktop API unavailable. Please relaunch Project Kestrel.');
+        const compat = el('#compat');
+        if (compat) compat.classList.remove('hidden');
+        return;
+      }
+      hasPywebviewApi = true;
       // After API is ready, check legal agreement
       checkLegalAgreement();
-      // Show/hide compatibility warning
-      if (!supportsFS && !apiReady) {
-        el('#compat').classList.remove('hidden');
-      } else if (apiReady) {
-        el('#compat').classList.add('hidden');
-      }
+      el('#compat').classList.add('hidden');
       // After API is confirmed ready, wait for settings to be hydrated, then check donation threshold
       await new Promise(function(r) { setTimeout(r, 500); });
       // Hydrate settings from server to ensure localStorage has the latest data
@@ -569,52 +562,11 @@
       return a.replace(/\/$/, '') + '/' + b.replace(/^\//, '');
     }
 
-    async function getHandleFromRelativePath(dirHandle, relPath) {
-      relPath = sanitizePath(relPath);
-      if (rootIsKestrel && relPath.toLowerCase().startsWith('.kestrel/')) {
-        relPath = relPath.substring('.kestrel/'.length);
+    function parseCsvText(text) {
+      if (!window.KestrelCsv || typeof window.KestrelCsv.parse !== 'function') {
+        throw new Error('CSV parser unavailable (csv_parser.js not loaded)');
       }
-      const parts = relPath.split('/').filter(Boolean);
-      let handle = dirHandle;
-      for (let i = 0; i < parts.length; i++) {
-        const isLast = i === parts.length - 1;
-        try {
-          handle = await handle.getDirectoryHandle(parts[i]);
-        } catch (e) {
-          if (isLast) {
-            // maybe file
-            try { return await handle.getFileHandle(parts[i]); } catch (_) { throw e; }
-          } else {
-            throw e;
-          }
-        }
-      }
-      return handle;
-    }
-
-    // Try to turn an absolute Windows path into a path relative to the selected root
-    // Also handles paths that are already relative (from new relative roots format)
-    function toRootRelative(absPath) {
-      if (!absPath || !rootDirHandle) return null;
-      const p = sanitizePath(absPath);
-
-      // Check if path is ALREADY relative (new format)
-      // Relative paths start with .kestrel/ or kestrel/ and don't have drive letters or leading /
-      if (p.toLowerCase().startsWith('.kestrel/') || p.toLowerCase().startsWith('kestrel/')) {
-        // Already relative - return as-is, but strip .kestrel/ prefix if rootIsKestrel
-        return rootIsKestrel ? p.replace(/^\.?kestrel\//i, '') : p;
-      }
-
-      // Check for absolute path with embedded .kestrel folder (old format)
-      const idx = p.toLowerCase().lastIndexOf('/.kestrel/');
-      if (idx >= 0) {
-        const rel = p.substring(idx + 1); // include .kestrel/…
-        return rootIsKestrel ? rel.replace(/^\.kestrel\//i, '') : rel;
-      }
-
-      // fallback: if only filename, return that
-      const base = p.split('/').pop();
-      return base || null;
+      return window.KestrelCsv.parse(text, { header: true, skipEmptyLines: true });
     }
 
 
@@ -657,19 +609,6 @@
           }
         } catch (e) {
           console.error('Python API image read failed:', e);
-          return null;
-        }
-      }
-
-      // PRIORITY 2: File System Access API (browser mode only)
-      if (!rootPath && rootDirHandle) {
-        try {
-          const fileHandle = await getHandleFromRelativePath(rootDirHandle, rel);
-          const file = await fileHandle.getFile();
-          const url = URL.createObjectURL(file);
-          blobUrlCache.set(cacheKey, url);
-          return url;
-        } catch (e) {
           return null;
         }
       }
@@ -3601,76 +3540,6 @@
       setStatus('Reverted to last saved state.');
     }
 
-    // CSV IO
-    async function loadCsvFromHandle(fileHandle) {
-      csvFileHandle = fileHandle;
-      const file = await fileHandle.getFile();
-      const text = await file.text();
-      const parsed = Papa.parse(text, { header: true, skipEmptyLines: true });
-      header = parsed.meta.fields || [];
-      rows = (parsed.data || []).map(r => ({ ...r, scene_count: r.scene_count }));
-      _sceneActiveCropIndexByImage.clear();
-      ensureSceneNameColumn();
-      ensureRatingColumns();
-      _clearDirtyRoots();
-      _setDirtyUi(false);
-      takeSnapshot();
-      await renderScenes();
-    }
-
-    // Try to find .kestrel/kestrel_database.csv in the selected folder (optionally nested)
-    async function findKestrelDatabase(dirHandle, maxDepth = 3, depth = 0) {
-      // If user selected the .kestrel folder itself, read directly
-      if (dirHandle && dirHandle.name === '.kestrel') {
-        try {
-          const csvHandle = await dirHandle.getFileHandle('kestrel_database.csv');
-          return { rootHandle: dirHandle, fileHandle: csvHandle, rootIsKestrel: true };
-        } catch (_) {
-          // fall through to normal search
-        }
-      }
-      // First, check for a .kestrel folder in this folder
-      try {
-        const kestrelDir = await dirHandle.getDirectoryHandle('.kestrel');
-        const csvHandle = await kestrelDir.getFileHandle('kestrel_database.csv');
-        return { rootHandle: dirHandle, fileHandle: csvHandle, rootIsKestrel: false };
-      } catch (_) {
-        // Not found at this level; continue
-      }
-
-      if (depth >= maxDepth) return null;
-
-      // Search subfolders (limited depth)
-      try {
-        for await (const entry of dirHandle.values()) {
-          if (entry.kind !== 'directory') continue;
-          if (entry.name === '.kestrel') continue;
-          const found = await findKestrelDatabase(entry, maxDepth, depth + 1);
-          if (found) return found;
-        }
-      } catch (_) {
-        // Ignore permission/iteration errors
-      }
-      return null;
-    }
-
-    async function tryOpenDefaultCsv(dirHandle) {
-      try {
-        const found = await findKestrelDatabase(dirHandle, 2);
-        if (!found) throw new Error('not found');
-        rootDirHandle = found.rootHandle;
-        rootIsKestrel = !!found.rootIsKestrel;
-        await loadCsvFromHandle(found.fileHandle);
-        const mergeBtn = document.getElementById('openMerge');
-        if (mergeBtn) mergeBtn.disabled = false;
-        const rootLabel = rootIsKestrel ? '.kestrel (selected folder)' : (rootDirHandle.name || 'selected folder');
-        setStatus(`Loaded .kestrel/kestrel_database.csv (root: ${rootLabel})`);
-      } catch (e) {
-        setStatus('Could not find .kestrel/kestrel_database.csv in this folder (or its subfolders). Use "Open Folder or CSV…" to try a CSV file directly.');
-        alert("Couldn't find Kestrel Analysis files. Make sure you analyze this folder with Kestrel Analyzer.");
-      }
-    }
-
     function csvEscape(val) {
       if (val == null) return '';
       let s = String(val);
@@ -3693,19 +3562,6 @@
         const lines = [colList.join(',')];
         for (const r of rowList) lines.push(colList.map(k => csvEscape(k in r ? r[k] : '')).join(','));
         return lines.join('\r\n');
-      }
-
-      // FSAPI mode (browser): single file handle
-      if (csvFileHandle) {
-        const content = rowsToCsvString(allCols, rows);
-        const writable = await csvFileHandle.createWritable();
-        await writable.write(content);
-        await writable.close();
-        _clearDirtyRoots();
-        _setDirtyUi(false);
-        takeSnapshot();
-        setStatus('Saved changes to kestrel_database.csv');
-        return;
       }
 
       // Pywebview desktop mode: save both CSV row state and scenedata JSON.
@@ -3775,7 +3631,7 @@
         return;
       }
 
-      alert('No CSV opened and no save method available.');
+      setStatus('Save unavailable: Desktop API not detected.');
     }
 
     // Warn user on unsaved changes when attempting to close/refresh
@@ -3791,16 +3647,10 @@
       }
     });
 
-    // Attempt to notify backend to shutdown when the page is fully unloaded
+    // Cleanup local caches when the page unloads.
     window.addEventListener('unload', () => {
       try {
         _cleanupCachesOnAppClose();
-        const backendUrl = getSetting('backendUrl', window.location.origin).replace(/\/$/, '');
-        const headers = { 'Content-Type': 'application/json' };
-        if (window.__BRIDGE_TOKEN) headers['X-Bridge-Token'] = window.__BRIDGE_TOKEN;
-        navigator.sendBeacon && navigator.sendBeacon(backendUrl + '/shutdown', new Blob([JSON.stringify({ reason: 'page_unload' })], { type: 'application/json' }));
-        // Fallback (best-effort, may be ignored on some browsers)
-        fetch(backendUrl + '/shutdown', { method: 'POST', keepalive: true, headers, body: JSON.stringify({ reason: 'page_unload' }) }).catch(() => { });
       } catch (_) { }
     });
 
@@ -3871,21 +3721,18 @@
     }
 
     async function hydrateSettingsFromServer() {
-      const backendUrl = (getSetting('backendUrl', window.location.origin) || window.location.origin).replace(/\/$/, '');
       try {
-        const headers = window.__BRIDGE_TOKEN ? { 'X-Bridge-Token': window.__BRIDGE_TOKEN } : {};
-        const res = await fetch(backendUrl + '/settings', { headers });
-        if (!res.ok) return;
-        const data = await res.json();
-        if (data && data.settings && typeof data.settings === 'object') {
-          saveSettings(data.settings);
-          _autoSaveEnabled = data.settings.auto_save_enabled !== false;
-          if (!_autoSaveEnabled) {
-            clearTimeout(_autoSaveTimer);
-            _autoSaveTimer = null;
-          }
-          _updateSaveRevertVisibility();
+        if (!window.pywebview?.api?.get_settings) return;
+        const data = await window.pywebview.api.get_settings();
+        const incoming = (data && data.settings && typeof data.settings === 'object') ? data.settings : null;
+        if (!incoming) return;
+        saveSettings(incoming);
+        _autoSaveEnabled = incoming.auto_save_enabled !== false;
+        if (!_autoSaveEnabled) {
+          clearTimeout(_autoSaveTimer);
+          _autoSaveTimer = null;
         }
+        _updateSaveRevertVisibility();
       } catch (_) { }
     }
 
@@ -4016,15 +3863,6 @@
       if (hasPywebviewApi && window.pywebview?.api?.save_settings_data) {
         try { await window.pywebview.api.save_settings_data(settings); } catch (_) { }
       }
-      try {
-        const backendUrl = getSetting('backendUrl', 'http://127.0.0.1:8765');
-        const headers = { 'Content-Type': 'application/json', ...(window.__BRIDGE_TOKEN ? { 'X-Bridge-Token': window.__BRIDGE_TOKEN } : {}) };
-        await fetch(backendUrl.replace(/\/$/, '') + '/settings', {
-          method: 'POST',
-          headers,
-          body: JSON.stringify({ settings })
-        });
-      } catch (_) { }
       document.getElementById('settingsDlg').close();
       // If rating profile changed and folders are loaded, reapply immediately
       if (ratingProfile !== prevProfile && rows.length > 0) {
@@ -4197,15 +4035,10 @@
         screenshot_b64: document.getElementById('feedbackSsPreview').dataset.b64 || '',
       };
       try {
-        let result;
-        if (hasPywebviewApi && window.pywebview?.api?.send_feedback) {
-          result = await window.pywebview.api.send_feedback(data);
-        } else {
-          const backendUrl = (getSetting('backendUrl', window.location.origin) || window.location.origin).replace(/\/$/, '');
-          const headers = { 'Content-Type': 'application/json', ...(window.__BRIDGE_TOKEN ? { 'X-Bridge-Token': window.__BRIDGE_TOKEN } : {}) };
-          const res = await fetch(backendUrl + '/feedback', { method: 'POST', headers, body: JSON.stringify(data) });
-          result = await res.json();
+        if (!window.pywebview?.api?.send_feedback) {
+          throw new Error('Desktop API unavailable');
         }
+        const result = await window.pywebview.api.send_feedback(data);
         if (result && result.success !== false) {
           document.getElementById('feedbackStatus').textContent = '✓ Feedback sent — thank you!';
           setTimeout(() => { try { document.getElementById('feedbackDlg').close(); } catch (_) { } }, 1200);
@@ -4341,19 +4174,19 @@
     // because that dialog is defined after this script block and wouldn't be in the DOM yet.
     // ─── End Donation ─────────────────────────────────────────────────────
 
-    // Info dialog: load kestrel_metadata.json from opened photo folder (.kestrel)
-    async function getMetadataHandle() {
-      if (!rootDirHandle) return null;
-      try { return await getHandleFromRelativePath(rootDirHandle, '.kestrel/kestrel_metadata.json'); } catch { return null; }
-    }
     async function readMetadata() {
-      const h = await getMetadataHandle();
-      if (!h) return { error: 'kestrel_metadata.json not found. Use "Open Photo Folder…" to select your root.' };
+      if (!rootPath || !window.pywebview?.api?.read_kestrel_metadata) {
+        return { error: 'kestrel_metadata.json not found. Open a folder in desktop mode first.' };
+      }
       try {
-        const file = await h.getFile();
-        const text = await file.text();
-        try { return JSON.parse(text); } catch { return { error: 'Failed to parse JSON in kestrel_metadata.json' }; }
-      } catch { return { error: 'Unable to read kestrel_metadata.json' }; }
+        const res = await window.pywebview.api.read_kestrel_metadata(rootPath);
+        if (!res?.success || !res?.metadata || typeof res.metadata !== 'object') {
+          return { error: res?.error || 'Unable to read kestrel_metadata.json' };
+        }
+        return res.metadata;
+      } catch {
+        return { error: 'Unable to read kestrel_metadata.json' };
+      }
     }
     async function openInfo() {
       const dlg = document.getElementById('infoDlg');
@@ -4366,7 +4199,7 @@
       if (meta && !meta.error) {
         // Add derived helper fields (non-destructive)
         const enriched = { ...meta };
-        if (rootDirHandle) enriched.photo_root_name = rootDirHandle.name || '';
+        if (rootPath) enriched.photo_root_name = rootPath.replace(/.*[/\\]/, '') || rootPath;
         contentEl.textContent = JSON.stringify(enriched, null, 2);
       } else {
         contentEl.textContent = '—';
@@ -4413,7 +4246,7 @@
 
       if (!origRel) { setStatus('No filename available for this row.'); return; }
       if (!rootToSend) { setStatus('Set Local Root in Settings to enable launching originals.'); showSettings(); return; }
-      const backendUrl = getSetting('backendUrl', window.location.origin);
+      const backendUrl = window.location.origin;
       const editor = getSetting('editor', 'system');
       try {
         const res = await fetch(backendUrl.replace(/\/$/, '') + '/open', {
@@ -5361,74 +5194,58 @@
     const CONF_HIGH = 0.75;
     const CONF_LOW = 0.30;
 
-    /** Call the backend (pywebview API or HTTP) to start the queue. */
+    /** Call the backend queue API (desktop pywebview mode only). */
     async function apiStartQueue(paths, useGpu = true, wildlifeEnabled = true) {
-      if (hasPywebviewApi && window.pywebview?.api?.start_analysis_queue) {
-        return window.pywebview.api.start_analysis_queue(JSON.stringify(paths), useGpu, wildlifeEnabled);
+      if (!window.pywebview?.api?.start_analysis_queue) {
+        throw new Error('Desktop API unavailable: start_analysis_queue');
       }
-      // HTTP fallback (browser mode)
-      const headers = { 'Content-Type': 'application/json', ...(window.__BRIDGE_TOKEN ? { 'X-Bridge-Token': window.__BRIDGE_TOKEN } : {}) };
-      const res = await fetch('/queue/start', { method: 'POST', headers, body: JSON.stringify({ paths, use_gpu: useGpu, wildlife_enabled: wildlifeEnabled }) });
-      return res.json();
+      return window.pywebview.api.start_analysis_queue(JSON.stringify(paths), useGpu, wildlifeEnabled);
     }
 
     async function apiQueueControl(action) {
-      if (hasPywebviewApi && window.pywebview?.api) {
-        const fn = { pause: 'pause_analysis_queue', resume: 'resume_analysis_queue', cancel: 'cancel_analysis_queue', clear: 'clear_queue_done' }[action];
-        if (fn && window.pywebview.api[fn]) return window.pywebview.api[fn]();
+      if (!window.pywebview?.api) {
+        throw new Error('Desktop API unavailable: queue control');
       }
-      const headers = { 'Content-Type': 'application/json', ...(window.__BRIDGE_TOKEN ? { 'X-Bridge-Token': window.__BRIDGE_TOKEN } : {}) };
-      const res = await fetch(`/queue/${action}`, { method: 'POST', headers, body: '{}' });
-      return res.json();
+      const fn = { pause: 'pause_analysis_queue', resume: 'resume_analysis_queue', cancel: 'cancel_analysis_queue', clear: 'clear_queue_done' }[action];
+      if (!fn || typeof window.pywebview.api[fn] !== 'function') {
+        throw new Error(`Desktop API missing queue action: ${action}`);
+      }
+      return window.pywebview.api[fn]();
     }
 
     async function apiGetQueueStatus() {
-      if (hasPywebviewApi && window.pywebview?.api?.get_queue_status) {
-        return window.pywebview.api.get_queue_status();
+      if (!window.pywebview?.api?.get_queue_status) {
+        throw new Error('Desktop API unavailable: get_queue_status');
       }
-      const headers = window.__BRIDGE_TOKEN ? { 'X-Bridge-Token': window.__BRIDGE_TOKEN } : {};
-      const res = await fetch('/queue/status', { headers });
-      return res.json();
+      return window.pywebview.api.get_queue_status();
     }
 
     async function apiGetRecoveryStatus() {
-      if (hasPywebviewApi && window.pywebview?.api?.get_recovery_status) {
-        return window.pywebview.api.get_recovery_status();
+      if (!window.pywebview?.api?.get_recovery_status) {
+        throw new Error('Desktop API unavailable: get_recovery_status');
       }
-      const headers = window.__BRIDGE_TOKEN ? { 'X-Bridge-Token': window.__BRIDGE_TOKEN } : {};
-      const res = await fetch('/recovery/status', { headers });
-      return res.json();
+      return window.pywebview.api.get_recovery_status();
     }
 
     async function apiRestoreRecoveryQueue() {
-      if (hasPywebviewApi && window.pywebview?.api?.restore_analysis_queue) {
-        return window.pywebview.api.restore_analysis_queue();
+      if (!window.pywebview?.api?.restore_analysis_queue) {
+        throw new Error('Desktop API unavailable: restore_analysis_queue');
       }
-      const headers = { 'Content-Type': 'application/json', ...(window.__BRIDGE_TOKEN ? { 'X-Bridge-Token': window.__BRIDGE_TOKEN } : {}) };
-      const res = await fetch('/recovery/restore', { method: 'POST', headers, body: '{}' });
-      return res.json();
+      return window.pywebview.api.restore_analysis_queue();
     }
 
     async function apiClearRecoveryState(clearQueueState = true) {
-      if (hasPywebviewApi && window.pywebview?.api?.clear_recovery_state) {
-        return window.pywebview.api.clear_recovery_state(!!clearQueueState);
+      if (!window.pywebview?.api?.clear_recovery_state) {
+        throw new Error('Desktop API unavailable: clear_recovery_state');
       }
-      const headers = { 'Content-Type': 'application/json', ...(window.__BRIDGE_TOKEN ? { 'X-Bridge-Token': window.__BRIDGE_TOKEN } : {}) };
-      const res = await fetch('/recovery/clear', {
-        method: 'POST',
-        headers,
-        body: JSON.stringify({ clear_queue_state: !!clearQueueState }),
-      });
-      return res.json();
+      return window.pywebview.api.clear_recovery_state(!!clearQueueState);
     }
 
     async function apiSendRecoveryCrashReport() {
-      if (hasPywebviewApi && window.pywebview?.api?.send_recovery_crash_report) {
-        return window.pywebview.api.send_recovery_crash_report();
+      if (!window.pywebview?.api?.send_recovery_crash_report) {
+        throw new Error('Desktop API unavailable: send_recovery_crash_report');
       }
-      const headers = { 'Content-Type': 'application/json', ...(window.__BRIDGE_TOKEN ? { 'X-Bridge-Token': window.__BRIDGE_TOKEN } : {}) };
-      const res = await fetch('/recovery/report', { method: 'POST', headers, body: '{}' });
-      return res.json();
+      return window.pywebview.api.send_recovery_crash_report();
     }
 
     let _startupRecoveryHandled = false;
@@ -6183,7 +6000,7 @@
             if (!hasPywebviewApi || !window.pywebview?.api?.read_kestrel_csv) continue;
             const result = await window.pywebview.api.read_kestrel_csv(p);
             if (!result.success) continue;
-            const parsed = Papa.parse(result.data, { header: true, skipEmptyLines: true });
+            const parsed = parseCsvText(result.data);
             const newRows = parsed.data || [];
             const newFields = parsed.meta.fields || [];
             const root = result.root || p;
@@ -6512,7 +6329,7 @@
           const result = await window.pywebview.api.read_kestrel_csv(p);
           if (myVer !== _loadFoldersVersion) { hideProgress(); return; }
           if (!result.success) continue;
-          const parsed = Papa.parse(result.data, { header: true, skipEmptyLines: true });
+          const parsed = parseCsvText(result.data);
           const newRows = parsed.data || [];
           const newFields = parsed.meta.fields || [];
           for (const f of newFields) if (!header.includes(f)) header.push(f);
@@ -6551,7 +6368,6 @@
       // Per-row __rootPath handles multi-folder image loading in getBlobUrlForPath.
       const firstRow = rows.find(r => r.__rootPath);
       if (firstRow) rootPath = firstRow.__rootPath;
-      rootDirHandle = null;
       ensureSceneNameColumn();
       ensureRatingColumns();
       _clearDirtyRoots();
@@ -6581,7 +6397,7 @@
         }
 
         // Parse the CSV data
-        const parsed = Papa.parse(result.data, { header: true, skipEmptyLines: true });
+        const parsed = parseCsvText(result.data);
         header = parsed.meta.fields || [];
         const loadedRoot = result.root || folderPath;
         rows = (parsed.data || []).map(r => ({ ...r, __rootPath: loadedRoot, __folderSlot: 0 }));
@@ -6614,8 +6430,6 @@
 
         // IMPORTANT: Set rootPath BEFORE renderScenes so image loading works
         rootPath = loadedRoot;
-        rootDirHandle = null; // Clear handle since we're using Python API
-        rootIsKestrel = false;
         _clearDirtyRoots();
         _setDirtyUi(false);
         takeSnapshot();
@@ -6712,74 +6526,7 @@
           }
         }
 
-        // PRIORITY 2: File System Access API (browser mode only)
-        // This only runs when NOT in pywebview context
-        if (supportsFS) {
-          // Primary path: pick a folder (root or .kestrel)
-          try {
-            rootDirHandle = await window.showDirectoryPicker();
-            rootIsKestrel = rootDirHandle && rootDirHandle.name === '.kestrel';
-            rootPath = ''; // Clear rootPath since we're using handle-based API
-            await tryOpenDefaultCsv(rootDirHandle);
-            return;
-          } catch (e) {
-            if (e.name !== 'AbortError') {
-              console.error('showDirectoryPicker failed:', e);
-            }
-            // user may have cancelled; fall through to file picker
-          }
-
-          // Secondary path: open CSV directly
-          try {
-            const [fh] = await window.showOpenFilePicker({ types: [{ description: 'CSV', accept: { 'text/csv': ['.csv'] } }] });
-            if (!fh) return;
-            rootDirHandle = null;
-            rootIsKestrel = false;
-            rootPath = ''; // Clear rootPath
-            await loadCsvFromHandle(fh);
-            const mergeBtn = document.getElementById('openMerge');
-            if (mergeBtn) mergeBtn.disabled = true;
-            setStatus('CSV loaded (limited previews; use folder selection for full features)');
-            return;
-          } catch (e) {
-            if (e.name !== 'AbortError') {
-              console.error('showOpenFilePicker failed:', e);
-            }
-            // cancelled
-          }
-          return;
-        }
-
-        // Last resort fallback: file input for CSV only
-        setStatus('Opening file picker (limited functionality)...');
-        const input = document.createElement('input');
-        input.type = 'file';
-        input.accept = '.csv,text/csv';
-        rootDirHandle = null;
-        rootPath = ''; // Clear both for fallback mode
-        input.onchange = async () => {
-          const file = input.files[0];
-          if (!file) return;
-          try {
-            const text = await file.text();
-            const parsed = Papa.parse(text, { header: true, skipEmptyLines: true });
-            header = parsed.meta.fields || [];
-            rows = parsed.data || [];
-            _sceneActiveCropIndexByImage.clear();
-            ensureSceneNameColumn();
-            ensureRatingColumns();
-            _clearDirtyRoots();
-            _setDirtyUi(false);
-            takeSnapshot();
-            await renderScenes();
-            setStatus('CSV loaded (limited features - no folder access)');
-            alert('CSV loaded successfully.\n\nNote: Image previews and opening files in editors will not work without folder access.\n\nFor full functionality, use the desktop app or a Chromium-based browser (Chrome, Edge, Brave).');
-          } catch (e) {
-            alert(`Failed to load CSV: ${e.message}`);
-            setStatus('CSV load failed');
-          }
-        };
-        input.click();
+        setStatus('Folder picker unavailable: Desktop API missing.');
       } catch (e) {
         console.error('Unexpected error in pickFolder:', e);
         setStatus('An unexpected error occurred');

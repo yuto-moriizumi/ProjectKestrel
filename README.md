@@ -82,6 +82,11 @@ python analyzer/visualizer.py
 ```
 *(Note: In the unified version, the visualizer serves as the main entry point for both analysis and browsing.)*
 
+Security baseline:
+- Project Kestrel runs in desktop mode via pywebview.
+- Browser-only fallback mode is no longer supported.
+- The app is intended to run fully offline once dependencies are installed.
+
 Features of the visualizer:
 - **Scene View**: Browse grouped similar images
 - **Species Search**: Filter by bird species keywords
