@@ -6991,6 +6991,9 @@
         try {
           if (hasPywebviewApi && window.pywebview?.api?.agree_to_legal) {
             await window.pywebview.api.agree_to_legal();
+            // Keep local settings in sync immediately after consent so later
+            // UI-driven settings writes include the persisted legal flags.
+            await hydrateSettingsFromServer();
             document.getElementById('legalNotice').classList.add('hidden');
             showToast('Terms accepted. Welcome to Project Kestrel!', 4000);
           }

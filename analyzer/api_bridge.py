@@ -857,7 +857,13 @@ class Api:
         try:
             if not isinstance(settings_dict, dict):
                 return {'success': False, 'error': 'Invalid settings'}
-            save_persisted_settings(settings_dict)
+            # Merge into existing persisted settings so stale/minimal frontend
+            # payloads cannot drop unrelated keys (for example legal consent flags).
+            existing = load_persisted_settings()
+            if not isinstance(existing, dict):
+                existing = {}
+            merged = {**existing, **settings_dict}
+            save_persisted_settings(merged)
             return {'success': True}
         except Exception as e:
             print(f'[API] save_settings_data() -> Error: {e}', flush=True)

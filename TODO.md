@@ -37,9 +37,9 @@ Features under consideration
 Test before release:
 * Fix to Mask-RCNN Region Proposal System [DONE]
 * Quality classifier performance on revised pipeline
-* RAW+JPG co-movement fix in Culing Assistant + test restore capability persists after Kestrel re-opens.
-* Improvement to crash handling and error logging.
-* Test rawpy decode issue.
+* RAW+JPG co-movement fix in Culing Assistant + test restore capability persists after Kestrel re-opens. [DONE, FIXED]
+* Improvement to crash handling and error logging. 
+* Test rawpy decode issue. [DONE, FIXED]
 
 
 
