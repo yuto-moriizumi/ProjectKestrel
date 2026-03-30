@@ -1,6 +1,6 @@
 # Core ML/AI Dependencies
 torch==2.11.0
-torchvision==0.21.0
+torchvision==0.26.0
 tensorflow
 onnxruntime==1.23.2
 
@@ -11,7 +11,6 @@ certifi
 
 # Computer Vision
 opencv-python==4.11.0.86
-pillow==11.3.0
 rawpy==0.26.1
 
 # Data Processing
