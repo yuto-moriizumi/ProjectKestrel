@@ -525,7 +525,6 @@ class Api:
             dict with 'success': bool, 'tree': list[node], 'error': str
             Each node: {name, path, has_kestrel, children: [...]}
         """
-        print(f"[API] list_subfolders() called: root='{root_path}' max_depth={max_depth}", flush=True)
         try:
             root_path = root_path.strip().rstrip('/\\')
             if not root_path or not os.path.isdir(root_path):
@@ -590,10 +589,6 @@ class Api:
                             root_kestrel_version = json.load(mf).get('version', '')
                 except Exception:
                     pass
-            if limit_reached[0]:
-                print(f"[API] list_subfolders() -> Node limit reached ({MAX_NODES}); scan truncated at {node_count[0]} nodes", flush=True)
-            else:
-                print(f"[API] list_subfolders() -> {node_count[0]} nodes found, root_has_kestrel={root_has_kestrel}", flush=True)
             return {
                 'success': True,
                 'tree': tree,
@@ -616,11 +611,9 @@ class Api:
             else:
                 csv_path = os.path.join(folder_path, '.kestrel', 'kestrel_database.csv')
             if not os.path.exists(csv_path):
-                print(f'[API] write_kestrel_csv({folder_path!r}) -> CSV not found: {csv_path}', flush=True)
                 return {'success': False, 'error': f'CSV not found: {csv_path}'}
             with open(csv_path, 'w', encoding='utf-8', newline='') as f:
                 f.write(csv_content)
-            print(f'[API] write_kestrel_csv({folder_path!r}) -> {len(csv_content)} bytes written to {csv_path}', flush=True)
             return {'success': True, 'path': csv_path}
         except Exception as e:
             print(f'[API] write_kestrel_csv({folder_path!r}) -> Error: {e}', flush=True)
@@ -783,7 +776,6 @@ class Api:
 
             with open(scenedata_path, 'w', encoding='utf-8') as f:
                 json.dump(scenedata, f, indent=2)
-            print(f'[API] write_kestrel_scenedata({folder_path!r}) -> {scenedata_path}', flush=True)
             return {'success': True, 'path': scenedata_path, 'error': ''}
         except Exception as e:
             print(f'[API] write_kestrel_scenedata({folder_path!r}) -> Error: {e}', flush=True)
@@ -800,7 +792,6 @@ class Api:
                 subprocess.Popen(['open', path])
             else:
                 subprocess.Popen(['xdg-open', path])
-            print(f'[API] open_folder({path!r}) -> success', flush=True)
             return {'success': True}
         except Exception as e:
             print(f'[API] open_folder({path!r}) -> Error: {e}', flush=True)
@@ -810,7 +801,6 @@ class Api:
         """Open a URL in the system default browser (pywebview desktop mode)."""
         try:
             webbrowser.open(url)
-            print(f'[API] open_url({url!r}) -> success', flush=True)
             return {'success': True}
         except Exception as e:
             print(f'[API] open_url({url!r}) -> Error: {e}', flush=True)
@@ -832,7 +822,8 @@ class Api:
             machine_id = _telemetry.get_machine_id(settings)
             log_tail = ''
             if data.get('include_logs', False):
-                log_tail = _telemetry.get_recent_log_tail()
+                active_folder = str(settings.get('active_analysis_path', '') or '').strip()
+                log_tail = _telemetry.get_recent_log_tail(folder=active_folder or None)
             _telemetry.send_feedback(
                 report_type=data.get('type', 'general'),
                 description=data.get('description', ''),
@@ -842,7 +833,6 @@ class Api:
                 machine_id=machine_id,
                 version=_telemetry._read_version(),
             )
-            print(f'[API] send_feedback() -> queued ({data.get("type", "general")})', flush=True)
             return {'success': True}
         except Exception as e:
             print(f'[API] send_feedback() -> Error: {e}', flush=True)

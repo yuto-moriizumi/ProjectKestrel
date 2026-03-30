@@ -42,7 +42,8 @@ import secrets
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import threading
 from urllib.parse import urlparse
-from typing import Set
+from datetime import datetime
+from typing import Optional, Set, TextIO
 
 # --- Extracted modules ---
 from settings_utils import load_persisted_settings, save_persisted_settings, log, _normalize
@@ -79,6 +80,83 @@ ALLOWED_EDITORS: Set[str] = {
 _default_exts = ['.cr3', '.cr2', '.nef', '.arw', '.dng', '.raf', '.orf', '.rw2', '.sr2', '.jpg', '.jpeg', '.png', '.tif', '.tiff']
 ALLOWED_EXTENSIONS: Set[str] = set(os.environ.get('KESTREL_ALLOWED_EXTENSIONS', ','.join(_default_exts)).lower().split(','))
 ALLOW_ANY_EXTENSION = os.environ.get('KESTREL_ALLOW_ANY_EXTENSION') == '1'
+
+_RUNTIME_LOG_HANDLE: Optional[TextIO] = None
+
+
+class _TeeStream:
+    """Mirror writes to the original stream and a runtime log file."""
+
+    def __init__(self, original_stream, log_handle: TextIO):
+        self._original_stream = original_stream
+        self._log_handle = log_handle
+        self.encoding = getattr(original_stream, 'encoding', 'utf-8')
+        self.errors = getattr(original_stream, 'errors', 'replace')
+
+    def write(self, data):
+        text = data if isinstance(data, str) else str(data)
+        try:
+            self._original_stream.write(text)
+        except Exception:
+            pass
+        try:
+            self._log_handle.write(text)
+        except Exception:
+            pass
+        return len(text)
+
+    def flush(self):
+        try:
+            self._original_stream.flush()
+        except Exception:
+            pass
+        try:
+            self._log_handle.flush()
+        except Exception:
+            pass
+
+    def isatty(self):
+        try:
+            return self._original_stream.isatty()
+        except Exception:
+            return False
+
+    def fileno(self):
+        return self._original_stream.fileno()
+
+    @property
+    def buffer(self):
+        return getattr(self._original_stream, 'buffer', None)
+
+    def __getattr__(self, name):
+        return getattr(self._original_stream, name)
+
+
+def _enable_runtime_log_capture() -> str:
+    """Capture process stdout/stderr to a persistent runtime log file."""
+    global _RUNTIME_LOG_HANDLE
+    try:
+        try:
+            from kestrel_analyzer.logging_utils import resolve_log_dir
+        except ImportError:
+            from analyzer.kestrel_analyzer.logging_utils import resolve_log_dir
+
+        base_log_dir = resolve_log_dir(None)
+    except Exception:
+        base_log_dir = os.path.join(os.path.expanduser('~'), '.kestrel')
+
+    try:
+        runtime_dir = os.path.join(base_log_dir, 'logs')
+        os.makedirs(runtime_dir, exist_ok=True)
+        ts = datetime.utcnow().strftime('%Y%m%dT%H%M%SZ')
+        runtime_log_path = os.path.join(runtime_dir, f'kestrel_runtime_{ts}.log')
+
+        _RUNTIME_LOG_HANDLE = open(runtime_log_path, 'a', encoding='utf-8', buffering=1)
+        sys.stdout = _TeeStream(sys.stdout, _RUNTIME_LOG_HANDLE)
+        sys.stderr = _TeeStream(sys.stderr, _RUNTIME_LOG_HANDLE)
+        return runtime_log_path
+    except Exception:
+        return ''
 
 
 def build_original_path(root: str, rel: str) -> str:
@@ -377,7 +455,8 @@ class Handler(SimpleHTTPRequestHandler):
             machine_id = _telemetry.get_machine_id(settings)
             log_tail = ''
             if payload.get('include_logs', False):
-                log_tail = _telemetry.get_recent_log_tail()
+                active_folder = str(settings.get('active_analysis_path', '') or '').strip()
+                log_tail = _telemetry.get_recent_log_tail(folder=active_folder or None)
             _telemetry.send_feedback(
                 report_type=payload.get('type', 'general'),
                 description=payload.get('description', ''),
@@ -432,6 +511,10 @@ def parse_args():
 
 def main():
     args = parse_args()
+    runtime_log_path = _enable_runtime_log_capture()
+    if runtime_log_path:
+        log('Runtime log capture enabled:', runtime_log_path)
+
     # When visualizer.py is run from inside analyzer/ (merged layout) set
     # the working directory to the repository root so assets and shared
     # files (assets/, visualizer files) are served correctly.
@@ -662,7 +745,7 @@ if __name__ == '__main__':
                 # Fetch recent log tail, passing the active folder's log if available
                 _folder_path = _crash_settings.get('active_analysis_path', '')
                 if _folder_path:
-                    _log_tail = _telemetry.get_recent_log_tail(folder_path=_folder_path)
+                    _log_tail = _telemetry.get_recent_log_tail(folder=_folder_path)
                 else:
                     _log_tail = _telemetry.get_recent_log_tail()
                 

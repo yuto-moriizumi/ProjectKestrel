@@ -492,7 +492,6 @@ class QueueManager:
                 settings.get('kestrel_impact_total_seconds', 0.0) + elapsed, 1
             )
             save_persisted_settings(settings)
-            print(f"[impact] total_files={settings['kestrel_impact_total_files']} total_hours={round(settings['kestrel_impact_total_seconds']/3600,2)}", flush=True)
 
             was_cancelled = (item.status == 'cancelled')
             stats = _telemetry.collect_folder_stats(
@@ -514,9 +513,7 @@ class QueueManager:
             if not settings.get('analytics_consent_shown', False):
                 settings['pending_analytics'] = analytics_payload
                 save_persisted_settings(settings)
-                print("[analytics] Consent not yet shown; cached analytics payload.", flush=True)
             elif settings.get('analytics_opted_in', False):
-                print("[analytics] Sending folder analytics for", item.path, "files_analyzed:", files_this_session, "elapsed_s:", round(elapsed, 1), flush=True)
                 _telemetry.send_folder_analytics(**analytics_payload)
         except Exception:
             pass  # failsafe — never disrupt queue operation
