@@ -265,25 +265,6 @@ class AnalysisPipeline:
             os.makedirs(export_dir, exist_ok=True)
             os.makedirs(crop_dir, exist_ok=True)
 
-            metadata_path = os.path.join(kestrel_dir, METADATA_FILENAME)
-            try:
-                if os.path.exists(metadata_path):
-                    with open(metadata_path, "r", encoding="utf-8") as mf:
-                        _meta = json.load(mf)
-                else:
-                    _meta = {"version": VERSION, "analyzer": analyzer_name}
-                _meta["exposure_pipeline_version"] = 2
-                _meta["exposure_render_mode"] = "no_auto_bright_metered_v1"
-                _meta["exposure_compensation_profile"] = exposure_profile
-                with open(metadata_path, "w", encoding="utf-8") as mf:
-                    json.dump(_meta, mf, indent=2)
-            except Exception as _meta_init_e:
-                log_warning(
-                    self._log_path,
-                    f"Failed to initialize exposure metadata: {_meta_init_e}",
-                    stage=stage_ctx["stage"],
-                )
-
             stage_ctx["stage"] = "load_database"
             database, db_path = load_database(kestrel_dir, analyzer_name, log_path=self._log_path)
 
@@ -357,6 +338,9 @@ class AnalysisPipeline:
                     "secondary_family_list": [],
                     "secondary_family_scores": [],
                     "exposure_correction": 0.0,
+                    "exposure_pipeline": "legacy_auto_bright_v1",
+                    "exposure_subject_stops": 0.0,
+                    "exposure_meter_scale": 1.0,
                     "detection_scores": [],
                     "capture_time": "",
                     "orientation": "unknown",
@@ -374,7 +358,9 @@ class AnalysisPipeline:
                         raise RuntimeError("Image read returned None")
 
                     if raw_obj is not None:
+                        entry["exposure_pipeline"] = "no_auto_bright_metered_v1"
                         metered_img, raw_meter_scale, meter_debug = build_metered_detection_image(raw_obj)
+                        entry["exposure_meter_scale"] = float(raw_meter_scale)
                         if metered_img is not None:
                             img = metered_img
                         elif meter_debug.get("error"):
@@ -516,6 +502,9 @@ class AnalysisPipeline:
                             "quality": -1.0,
                             "rating": 0,
                             "exposure_correction": 0.0,
+                            "exposure_pipeline": entry.get("exposure_pipeline", "legacy_auto_bright_v1"),
+                            "exposure_subject_stops": 0.0,
+                            "exposure_meter_scale": float(entry.get("exposure_meter_scale", 1.0)),
                             "bbox": {
                                 "x_min": 0,
                                 "x_max": int(w),
@@ -588,6 +577,12 @@ class AnalysisPipeline:
                             if raw_obj is not None
                             else float(stops)
                         )
+                        meter_scale = float(raw_meter_scale if raw_obj is not None else 1.0)
+                        pipeline_mode = (
+                            "no_auto_bright_metered_v1"
+                            if raw_obj is not None
+                            else "legacy_auto_bright_v1"
+                        )
                         crop_bbox = self.mask_rcnn.get_square_crop_box(masks[primary_mask_i])
                         quality_crop, quality_mask = self.mask_rcnn.get_square_crop(
                             masks[primary_mask_i], img_src, resize=True
@@ -604,6 +599,9 @@ class AnalysisPipeline:
                             "rating": quality_to_rating(quality_score, rating_thresholds),
                             "quality_crop": quality_crop,
                             "exposure_correction": round(total_stops, 4),
+                            "exposure_pipeline": pipeline_mode,
+                            "exposure_subject_stops": round(float(stops), 4),
+                            "exposure_meter_scale": round(meter_scale, 6),
                             "crop_bbox": crop_bbox,
                         }
 
@@ -635,6 +633,12 @@ class AnalysisPipeline:
                                 if raw_obj is not None
                                 else float(stops)
                             )
+                            meter_scale = float(raw_meter_scale if raw_obj is not None else 1.0)
+                            pipeline_mode = (
+                                "no_auto_bright_metered_v1"
+                                if raw_obj is not None
+                                else "legacy_auto_bright_v1"
+                            )
                             species_crop = self.mask_rcnn.get_species_crop(pred_boxes[i], img_src)
                             crop_bbox = self.mask_rcnn.get_square_crop_box(masks[i])
                             quality_crop, quality_mask = self.mask_rcnn.get_square_crop(masks[i], img_src, resize=True)
@@ -647,6 +651,9 @@ class AnalysisPipeline:
                                     "quality_mask": quality_mask,
                                     "stops": stops,
                                     "total_stops": total_stops,
+                                    "exposure_pipeline": pipeline_mode,
+                                    "exposure_subject_stops": round(float(stops), 4),
+                                    "exposure_meter_scale": round(meter_scale, 6),
                                     "crop_bbox": crop_bbox,
                                 }
                             )
@@ -739,6 +746,9 @@ class AnalysisPipeline:
                                 "rating": i["rating"],
                                 "quality_crop": i["quality_crop"],
                                 "exposure_correction": i.get("exposure_correction", 0.0),
+                                "exposure_pipeline": i.get("exposure_pipeline", "legacy_auto_bright_v1"),
+                                "exposure_subject_stops": i.get("exposure_subject_stops", 0.0),
+                                "exposure_meter_scale": i.get("exposure_meter_scale", 1.0),
                                 "crop_bbox": i.get("crop_bbox"),
                             }
                             for i in bird_items
@@ -753,6 +763,9 @@ class AnalysisPipeline:
                                 "family_confidence": primary_bird["family_confidence"],
                                 "quality": primary_bird["quality"],
                                 "exposure_correction": primary_bird["exposure_correction"],
+                                "exposure_pipeline": primary_bird["exposure_pipeline"],
+                                "exposure_subject_stops": primary_bird["exposure_subject_stops"],
+                                "exposure_meter_scale": primary_bird["exposure_meter_scale"],
                             }
                         )
                         all_species = [b["species"] for b in bird_data]
@@ -809,6 +822,9 @@ class AnalysisPipeline:
                                     "family_confidence": result["family_confidence"],
                                     "quality": result["quality"],
                                     "exposure_correction": result["exposure_correction"],
+                                    "exposure_pipeline": result.get("exposure_pipeline", "legacy_auto_bright_v1"),
+                                    "exposure_subject_stops": result.get("exposure_subject_stops", 0.0),
+                                    "exposure_meter_scale": result.get("exposure_meter_scale", 1.0),
                                 }
                             )
                             crop_items_for_write = [result]
@@ -832,6 +848,9 @@ class AnalysisPipeline:
                                     "rating": 0,
                                     "quality_crop": img_small,
                                     "exposure_correction": entry.get("exposure_correction", 0.0),
+                                    "exposure_pipeline": entry.get("exposure_pipeline", "legacy_auto_bright_v1"),
+                                    "exposure_subject_stops": entry.get("exposure_subject_stops", 0.0),
+                                    "exposure_meter_scale": entry.get("exposure_meter_scale", 1.0),
                                     "crop_bbox": {
                                         "x_min": 0,
                                         "x_max": int(img_w),
@@ -891,6 +910,9 @@ class AnalysisPipeline:
                                 "quality": float(crop_item.get("quality", -1.0)),
                                 "rating": int(crop_item.get("rating", 0)),
                                 "exposure_correction": float(crop_item.get("exposure_correction", 0.0)),
+                                "exposure_pipeline": str(crop_item.get("exposure_pipeline", "legacy_auto_bright_v1") or "legacy_auto_bright_v1"),
+                                "exposure_subject_stops": float(crop_item.get("exposure_subject_stops", 0.0)),
+                                "exposure_meter_scale": float(crop_item.get("exposure_meter_scale", 1.0)),
                                 "bbox": {
                                     "x_min": int(bbox.get("x_min", 0)),
                                     "x_max": int(bbox.get("x_max", img_w)),
@@ -921,6 +943,9 @@ class AnalysisPipeline:
                             "family_confidence": primary_crop["family_confidence"],
                             "quality": primary_crop["quality"],
                             "exposure_correction": primary_crop["exposure_correction"],
+                            "exposure_pipeline": primary_crop.get("exposure_pipeline", "legacy_auto_bright_v1"),
+                            "exposure_subject_stops": primary_crop.get("exposure_subject_stops", 0.0),
+                            "exposure_meter_scale": primary_crop.get("exposure_meter_scale", 1.0),
                             "crop_path": primary_crop["crop_path"],
                             "crops_json": json.dumps(serialized_crops),
                             "primary_crop_index": primary_crop_index,
@@ -1015,10 +1040,26 @@ class AnalysisPipeline:
                                 _meta = _json.load(mf)
                         else:
                             _meta = {"version": VERSION, "analyzer": analyzer_name}
+
+                        pipeline_modes = set()
+                        if "exposure_pipeline" in database.columns:
+                            for _mode in database["exposure_pipeline"].tolist():
+                                _mode_txt = str(_mode or "").strip().lower()
+                                if _mode_txt:
+                                    pipeline_modes.add(_mode_txt)
+                        if pipeline_modes == {"no_auto_bright_metered_v1"}:
+                            render_mode_meta = "no_auto_bright_metered_v1"
+                        elif pipeline_modes == {"legacy_auto_bright_v1"}:
+                            render_mode_meta = "legacy_auto_bright_v1"
+                        elif pipeline_modes:
+                            render_mode_meta = "mixed_per_row_v1"
+                        else:
+                            render_mode_meta = "legacy_auto_bright_v1"
+
                         _meta["quality_distribution"] = distribution
                         _meta["quality_distribution_stored"] = True
                         _meta["exposure_pipeline_version"] = 2
-                        _meta["exposure_render_mode"] = "no_auto_bright_metered_v1"
+                        _meta["exposure_render_mode"] = render_mode_meta
                         _meta["exposure_compensation_profile"] = exposure_profile
                         with open(metadata_path, "w", encoding="utf-8") as mf:
                             _json.dump(_meta, mf, indent=2)

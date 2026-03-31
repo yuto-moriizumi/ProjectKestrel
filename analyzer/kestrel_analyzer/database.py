@@ -30,6 +30,9 @@ BASE_COLUMNS = [
     "secondary_family_list",
     "secondary_family_scores",
     "exposure_correction",
+    "exposure_pipeline",
+    "exposure_subject_stops",
+    "exposure_meter_scale",
     "detection_scores",
     "capture_time",
 ]
@@ -322,6 +325,12 @@ def ensure_columns(database: pd.DataFrame) -> pd.DataFrame:
                 database[col] = "Unknown" if "family" in col else 0.0
     if "exposure_correction" not in database.columns:
         database["exposure_correction"] = 0.0
+    if "exposure_pipeline" not in database.columns:
+        database["exposure_pipeline"] = "legacy_auto_bright_v1"
+    if "exposure_subject_stops" not in database.columns:
+        database["exposure_subject_stops"] = 0.0
+    if "exposure_meter_scale" not in database.columns:
+        database["exposure_meter_scale"] = 1.0
     if "detection_scores" not in database.columns:
         database["detection_scores"] = [[] for _ in range(len(database))]
     if "crops_json" not in database.columns:

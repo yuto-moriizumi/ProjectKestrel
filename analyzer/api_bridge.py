@@ -184,6 +184,9 @@ class Api:
                 mode_raw = str(metadata.get('exposure_render_mode', '') or '').strip().lower()
                 if mode_raw in {'legacy_auto_bright_v1', 'no_auto_bright_metered_v1'}:
                     mode = mode_raw
+                elif mode_raw == 'mixed_per_row_v1':
+                    # Without row-level mode, mixed folders should safely fall back to legacy.
+                    mode = 'legacy_auto_bright_v1'
                 elif str(metadata.get('exposure_pipeline_version', '')).strip() in {'2', '2.0'}:
                     mode = 'no_auto_bright_metered_v1'
         except Exception:
@@ -1985,7 +1988,13 @@ class Api:
             log(f'notify_main_window_refresh error: {e}')
             return {'success': False, 'error': str(e)}
 
-    def read_raw_full(self, filename: str, root_path: str, exp_correction: float = 0.0):
+    def read_raw_full(
+        self,
+        filename: str,
+        root_path: str,
+        exp_correction: float = 0.0,
+        exposure_mode: str = '',
+    ):
         """Process a RAW file and return full-resolution JPEG as base64.
         Results are cached in {root}/.kestrel/culling_TMP/ for fast subsequent loads.
         Falls back to read_image_file for non-RAW formats.
@@ -1993,6 +2002,9 @@ class Api:
         exp_correction: exposure offset in stops applied during postprocessing.
             0.0 (default) = no correction, matches standard display preview.
             Positive = brighten, negative = darken.  Clamped to [-2.0, +3.0].
+
+        exposure_mode: optional per-row render mode from CSV. When omitted,
+            mode falls back to folder metadata.
         """
         from io import BytesIO
 
@@ -2026,7 +2038,11 @@ class Api:
                 exp_correction = 0.0
             exp_correction = max(-2.0, min(3.0, exp_correction))
 
-            render_mode = self._get_exposure_render_mode(root_path_real)
+            mode_override = str(exposure_mode or '').strip().lower()
+            if mode_override in {'legacy_auto_bright_v1', 'no_auto_bright_metered_v1'}:
+                render_mode = mode_override
+            else:
+                render_mode = self._get_exposure_render_mode(root_path_real)
             use_no_auto_bright = render_mode == 'no_auto_bright_metered_v1'
 
             settings = load_persisted_settings()
@@ -2053,6 +2069,7 @@ class Api:
                 'full_path': full_path,
                 'platform': sys.platform,
                 'exp_correction': round(float(exp_correction), 4),
+                'requested_mode': mode_override,
                 'render_mode': render_mode,
                 'use_no_auto_bright': bool(use_no_auto_bright),
                 'use_cache': bool(use_cache),

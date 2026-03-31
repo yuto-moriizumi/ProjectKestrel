@@ -797,6 +797,9 @@
         quality: _numberOr(crop?.quality, -1),
         rating: Math.max(0, Math.min(5, _intOr(crop?.rating, 0))),
         exposure_correction: _numberOr(crop?.exposure_correction, 0),
+        exposure_pipeline: getRowExposurePipelineMode(crop),
+        exposure_subject_stops: _numberOr(crop?.exposure_subject_stops, 0),
+        exposure_meter_scale: _numberOr(crop?.exposure_meter_scale, 1),
         bbox: _normalizeCropBbox(crop?.bbox),
       }));
     }
@@ -835,6 +838,11 @@
           quality: _numberOr(src.quality, _numberOr(row.quality, -1)),
           rating: Math.max(0, Math.min(5, _intOr(src.rating, 0))),
           exposure_correction: _numberOr(src.exposure_correction, _numberOr(row.exposure_correction, 0)),
+          exposure_pipeline: String(src.exposure_pipeline || row.exposure_pipeline || 'legacy_auto_bright_v1').trim().toLowerCase() === 'no_auto_bright_metered_v1'
+            ? 'no_auto_bright_metered_v1'
+            : 'legacy_auto_bright_v1',
+          exposure_subject_stops: _numberOr(src.exposure_subject_stops, _numberOr(row.exposure_subject_stops, 0)),
+          exposure_meter_scale: _numberOr(src.exposure_meter_scale, _numberOr(row.exposure_meter_scale, 1)),
           bbox: _normalizeCropBbox(src.bbox),
         });
       }
@@ -852,6 +860,9 @@
           quality: _numberOr(row.quality, -1),
           rating: Math.max(0, Math.min(5, _intOr(row.normalized_rating, 0))),
           exposure_correction: _numberOr(row.exposure_correction, 0),
+          exposure_pipeline: getRowExposurePipelineMode(row),
+          exposure_subject_stops: _numberOr(row.exposure_subject_stops, 0),
+          exposure_meter_scale: _numberOr(row.exposure_meter_scale, 1),
           bbox: _fullFrameBbox(),
         });
       }
@@ -920,6 +931,9 @@
       row.family_confidence = _numberOr(crop.family_confidence, _numberOr(row.family_confidence, 0));
       row.quality = _numberOr(crop.quality, _numberOr(row.quality, -1));
       row.exposure_correction = _numberOr(crop.exposure_correction, _numberOr(row.exposure_correction, 0));
+      row.exposure_pipeline = getRowExposurePipelineMode(crop);
+      row.exposure_subject_stops = _numberOr(crop.exposure_subject_stops, _numberOr(row.exposure_subject_stops, 0));
+      row.exposure_meter_scale = _numberOr(crop.exposure_meter_scale, _numberOr(row.exposure_meter_scale, 1));
 
       const origin = String(getOrigin(row) || '').toLowerCase();
       if (origin !== 'manual') {
@@ -958,6 +972,9 @@
       if (!header.includes('rating_origin')) header.push('rating_origin');
       if (!header.includes('normalized_rating')) header.push('normalized_rating');
       if (!header.includes('exposure_correction')) header.push('exposure_correction');
+      if (!header.includes('exposure_pipeline')) header.push('exposure_pipeline');
+      if (!header.includes('exposure_subject_stops')) header.push('exposure_subject_stops');
+      if (!header.includes('exposure_meter_scale')) header.push('exposure_meter_scale');
       if (!header.includes('detection_scores')) header.push('detection_scores');
       if (!header.includes('culled')) header.push('culled');
       if (!header.includes('culled_origin')) header.push('culled_origin');
@@ -966,9 +983,13 @@
         if (!('rating_origin' in r)) r.rating_origin = '';
         if (!('normalized_rating' in r)) r.normalized_rating = '';
         if (!('exposure_correction' in r)) r.exposure_correction = '0';
+        if (!('exposure_pipeline' in r)) r.exposure_pipeline = 'legacy_auto_bright_v1';
+        if (!('exposure_subject_stops' in r)) r.exposure_subject_stops = '0';
+        if (!('exposure_meter_scale' in r)) r.exposure_meter_scale = '1';
         if (!('detection_scores' in r)) r.detection_scores = '';
         if (!('culled' in r)) r.culled = '';
         if (!('culled_origin' in r)) r.culled_origin = '';
+        r.exposure_pipeline = getRowExposurePipelineMode(r);
         r.culled_origin = normalizeCullOrigin(r);
       }
     }
@@ -1767,15 +1788,23 @@
     const sceneRawCache = new Map();   // unique row key -> blob URL
     const sceneRawLoading = new Set(); // (rootPath|filename) currently being fetched
 
+    function getRowExposurePipelineMode(row) {
+      const mode = String(row?.exposure_pipeline || '').trim().toLowerCase();
+      if (mode === 'no_auto_bright_metered_v1') return mode;
+      return 'legacy_auto_bright_v1';
+    }
+
     function getSceneRawCacheKey(row) {
       const disabled = getSetting('raw_exposure_correction_disabled', false);
       const expCorr = disabled ? 0.0 : (parseFloat(row.exposure_correction) || 0);
       const expKey = Number.isFinite(expCorr) ? expCorr.toFixed(4) : '0.0000';
+      const mode = getRowExposurePipelineMode(row);
       return [
         row.__rootPath || '',
         row.filename || '',
         row.export_path || '',
         row.crop_path || '',
+        `mode=${mode}`,
         `exp=${expKey}`
       ].join('|');
     }
@@ -1840,11 +1869,12 @@
     async function loadSceneRawAsync(row) {
       const disabled = getSetting('raw_exposure_correction_disabled', false);
       const expCorr = disabled ? 0.0 : (parseFloat(row.exposure_correction) || 0);
+      const expMode = getRowExposurePipelineMode(row);
       const key = getSceneRawCacheKey(row);
       sceneRawLoading.add(key);
       try {
         const res = await window.pywebview.api.read_raw_full(
-          row.filename, row.__rootPath || '', expCorr
+          row.filename, row.__rootPath || '', expCorr, expMode
         );
         if (res && res.debug) {
           console.info('[raw-debug][scene]', row.filename, res.debug);
