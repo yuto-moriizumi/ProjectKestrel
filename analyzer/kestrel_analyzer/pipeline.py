@@ -29,6 +29,13 @@ from .database import (
     build_scenedata_from_database,
     update_scenedata_with_database,
 )
+from .exposure_compensation import (
+    apply_exposure_correction as ec_apply_exposure_correction,
+    build_metered_detection_image,
+    compose_total_stops as ec_compose_total_stops,
+    compute_exposure_stops as ec_compute_exposure_stops,
+    refine_exposure_stops as ec_refine_exposure_stops,
+)
 from .image_utils import read_image, read_image_for_pipeline
 from .ratings import quality_to_rating, get_profile_thresholds
 from .similarity import compute_image_similarity_akaze, compute_similarity_timestamp
@@ -82,155 +89,7 @@ class AnalysisPipeline:
 
     @staticmethod
     def _compute_exposure_stops(img: np.ndarray, mask: np.ndarray, profile: str = "normal") -> float:
-        """Estimate exposure correction in stops for the masked subject region.
-
-        This is histogram-aware (percentile based), not mean-only.
-
-        The solver first finds the maximum exposure lift that still respects
-        highlight and clipping guardrails, then applies profile-specific
-        aggressiveness.
-
-        Profile can be "lenient", "normal", or "aggressive".
-
-        Returns a value in [-2.0, +3.0] where positive lifts exposure and
-        negative pulls it down.
-        """
-        EPS = 1e-3
-        profile_name = str(profile or "normal").strip().lower()
-        if profile_name not in {"lenient", "normal", "aggressive"}:
-            profile_name = "normal"
-
-        profile_cfg = {
-            "lenient": {
-                "TARGET_HI_P95": 0.90,
-                "TARGET_HI_P98": 0.97,
-                "TARGET_SHADOW_P10": 0.12,
-                "CLIP_THRESH": 0.99,
-                "MAX_CLIP_RATIO": 0.025,
-                "BRIGHTEN_STRENGTH": 0.74,
-                "DARKEN_STRENGTH": 0.7,
-                "MAX_DARKEN": -1.8,
-                "MAX_BRIGHTEN": 1.85,
-                "MAX_ERODE_ITERS": 1,
-            },
-            "normal": {
-                "TARGET_HI_P95": 0.86,
-                "TARGET_HI_P98": 0.945,
-                "TARGET_SHADOW_P10": 0.15,
-                "CLIP_THRESH": 0.985,
-                "MAX_CLIP_RATIO": 0.012,
-                "BRIGHTEN_STRENGTH": 0.88,
-                "DARKEN_STRENGTH": 0.85,
-                "MAX_DARKEN": -1.9,
-                "MAX_BRIGHTEN": 2.45,
-                "MAX_ERODE_ITERS": 3,
-            },
-            "aggressive": {
-                "TARGET_HI_P95": 0.76,
-                "TARGET_HI_P98": 0.84,
-                "TARGET_SHADOW_P10": 0.19,
-                "CLIP_THRESH": 0.965,
-                "MAX_CLIP_RATIO": 0.0015,
-                "BRIGHTEN_STRENGTH": 1.0,
-                "DARKEN_STRENGTH": 1.0,
-                "MAX_DARKEN": -2.0,
-                "MAX_BRIGHTEN": 3.0,
-                "MAX_ERODE_ITERS": 5,
-            },
-        }[profile_name]
-
-        TARGET_HI_P95 = profile_cfg["TARGET_HI_P95"]
-        TARGET_HI_P98 = profile_cfg["TARGET_HI_P98"]
-        TARGET_SHADOW_P10 = profile_cfg["TARGET_SHADOW_P10"]
-        CLIP_THRESH = profile_cfg["CLIP_THRESH"]
-        MAX_CLIP_RATIO = profile_cfg["MAX_CLIP_RATIO"]
-        BRIGHTEN_STRENGTH = profile_cfg["BRIGHTEN_STRENGTH"]
-        DARKEN_STRENGTH = profile_cfg["DARKEN_STRENGTH"]
-        MAX_DARKEN = profile_cfg["MAX_DARKEN"]
-        MAX_BRIGHTEN = profile_cfg["MAX_BRIGHTEN"]
-        MAX_ERODE_ITERS = int(profile_cfg["MAX_ERODE_ITERS"])
-        try:
-            img_f = img.astype(np.float32) / 255.0
-            # Exposure compensation uses a detached mask copy so any erosion
-            # done here cannot alter masks used by overlays/crops/classifier.
-            mask_bool = np.array(mask, dtype=bool, copy=True) if mask is not None else None
-            if (
-                mask_bool is not None
-                and mask_bool.any()
-                and img_f.ndim == 3
-                and img_f.shape[:2] == mask_bool.shape
-            ):
-                # Exclude edge pixels from the exposure histogram because mask
-                # boundaries often contain mixed foreground/background values.
-                mask_u8 = np.array(mask_bool, dtype=np.uint8, copy=True)
-                area = int(np.count_nonzero(mask_u8))
-                if area >= 256:
-                    erode_iters = 1
-                    if area >= 2000:
-                        erode_iters += 1
-                    if area >= 6000:
-                        erode_iters += 1
-                    if area >= 12000:
-                        erode_iters += 1
-                    if area >= 22000:
-                        erode_iters += 1
-                    erode_iters = min(erode_iters, MAX_ERODE_ITERS)
-                    eroded = cv2.erode(mask_u8, np.ones((3, 3), dtype=np.uint8), iterations=erode_iters).astype(bool)
-                    if eroded.any():
-                        mask_bool = eroded
-                pixels = img_f[mask_bool]
-            else:
-                pixels = img_f.reshape(-1, 3)
-            # Perceptual luminance weights (Rec. 709)
-            lum = 0.2126 * pixels[:, 0] + 0.7152 * pixels[:, 1] + 0.0722 * pixels[:, 2]
-            lum = lum[np.isfinite(lum)]
-            if lum.size == 0:
-                return 0.0
-            p10, p95, p98 = np.percentile(lum, [10, 95, 98])
-
-            # Find maximum stop value that still satisfies clipped-pixel ratio.
-            def _clip_ratio_after(stops_val: float) -> float:
-                scale = 2.0 ** float(stops_val)
-                return float(np.mean((lum * scale) >= CLIP_THRESH))
-
-            if _clip_ratio_after(MAX_DARKEN) > MAX_CLIP_RATIO:
-                clip_ceiling = MAX_DARKEN
-            elif _clip_ratio_after(MAX_BRIGHTEN) <= MAX_CLIP_RATIO:
-                clip_ceiling = MAX_BRIGHTEN
-            else:
-                lo = MAX_DARKEN
-                hi = MAX_BRIGHTEN
-                for _ in range(20):
-                    mid = (lo + hi) / 2.0
-                    if _clip_ratio_after(mid) <= MAX_CLIP_RATIO:
-                        lo = mid
-                    else:
-                        hi = mid
-                clip_ceiling = lo
-
-            hi95_stop = float(np.log2(TARGET_HI_P95 / max(float(p95), EPS)))
-            hi98_stop = float(np.log2(TARGET_HI_P98 / max(float(p98), EPS)))
-            highlight_ceiling = min(hi95_stop, hi98_stop, clip_ceiling, MAX_BRIGHTEN)
-
-            # Ensure dark subjects are still lifted when highlight headroom allows.
-            shadow_push_stop = float(np.log2(TARGET_SHADOW_P10 / max(float(p10), EPS)))
-
-            if highlight_ceiling >= 0.0:
-                stops = highlight_ceiling * BRIGHTEN_STRENGTH
-                if shadow_push_stop > 0.0:
-                    stops = max(stops, min(shadow_push_stop, highlight_ceiling))
-            else:
-                # Negative stops darken bright subjects; aggressive mode uses full
-                # darken strength while other profiles back off.
-                stops = highlight_ceiling * DARKEN_STRENGTH
-
-            stops = float(np.clip(stops, MAX_DARKEN, MAX_BRIGHTEN))
-
-            if not np.isfinite(stops):
-                return 0.0
-            return stops
-        except Exception:
-            return 0.0
+        return ec_compute_exposure_stops(img, mask, profile)
 
     @staticmethod
     def _refine_exposure_stops(
@@ -239,74 +98,36 @@ class AnalysisPipeline:
         initial_stops: float,
         profile: str,
         raw_obj=None,
+        *,
+        base_scale: float = 1.0,
+        no_auto_bright: bool = False,
     ) -> float:
-        """Iteratively refine exposure stops for residual clipping/highlights.
-
-        This is used as a safety pass for aggressive profile darkening where
-        one-shot estimation can under-correct very hot highlights.
-        """
-        total = float(initial_stops)
-        profile_name = str(profile or "normal").strip().lower()
-        if profile_name != "aggressive":
-            return total
-        # Refinement is only needed when we're already in highlight-recovery mode.
-        if total >= -0.05:
-            return total
-
-        for _ in range(2):
-            corrected = AnalysisPipeline._apply_exposure_correction(img, total, raw_obj)
-            residual = AnalysisPipeline._compute_exposure_stops(corrected, mask, profile_name)
-            # Only accumulate additional darkening from residual highlight pressure.
-            if not np.isfinite(residual) or residual >= -0.03:
-                break
-            total += residual * 0.85
-            total = float(np.clip(total, -2.0, 3.0))
-            if total <= -1.95:
-                break
-        return total
+        return ec_refine_exposure_stops(
+            img,
+            mask,
+            initial_stops,
+            profile,
+            raw_obj=raw_obj,
+            base_scale=base_scale,
+            no_auto_bright=no_auto_bright,
+        )
 
     @staticmethod
     def _apply_exposure_correction(
-        img: np.ndarray, stops: float, raw_obj=None
+        img: np.ndarray,
+        stops: float,
+        raw_obj=None,
+        *,
+        base_scale: float = 1.0,
+        no_auto_bright: bool = False,
     ) -> np.ndarray:
-        """Return a copy of *img* with exposure shifted by *stops* stops.
-
-        When *raw_obj* is a live rawpy.RawPy instance (RAW files), the
-        correction is applied via rawpy.postprocess(exp_shift=…) in the linear
-        domain before demosaicing, which correctly recovers highlight detail
-        on overexposed subjects rather than clipping.
-
-        For non-RAW sources (JPEG/PNG, or if rawpy re-process fails) the
-        method falls back to pixel-level multiplication.
-
-        Positive stops lifts (brightens), negative stops pulls (darkens).
-        Returns the original array unchanged when stops == 0.0.
-        """
-        if stops == 0.0:
-            return img
-        if raw_obj is not None:
-            try:
-                # exp_shift is in linear scale: 2^stops.
-                # rawpy usable range: 0.25 (−2 stops) … 8.0 (+3 stops).
-                linear_scale = float(np.clip(2.0 ** stops, 0.25, 8.0))
-                # Preserve highlights when brightening to avoid blowing out
-                # any remaining highlight detail.
-                if stops > 1.0:
-                    preserve = 0.95
-                elif stops > 0.4:
-                    preserve = 0.9
-                elif stops > 0.0:
-                    preserve = 0.85
-                else:
-                    preserve = 0.0
-                return raw_obj.postprocess(
-                    exp_shift=linear_scale,
-                    exp_preserve_highlights=preserve,
-                )
-            except Exception:
-                pass  # fall through to pixel-level fallback below
-        factor = 2.0 ** stops
-        return (img.astype(np.float32) * factor).clip(0.0, 255.0).astype(np.uint8)
+        return ec_apply_exposure_correction(
+            img,
+            stops,
+            raw_obj,
+            base_scale=base_scale,
+            no_auto_bright=no_auto_bright,
+        )
 
     @staticmethod
     def _get_image_orientation(img: np.ndarray) -> str:
@@ -444,6 +265,25 @@ class AnalysisPipeline:
             os.makedirs(export_dir, exist_ok=True)
             os.makedirs(crop_dir, exist_ok=True)
 
+            metadata_path = os.path.join(kestrel_dir, METADATA_FILENAME)
+            try:
+                if os.path.exists(metadata_path):
+                    with open(metadata_path, "r", encoding="utf-8") as mf:
+                        _meta = json.load(mf)
+                else:
+                    _meta = {"version": VERSION, "analyzer": analyzer_name}
+                _meta["exposure_pipeline_version"] = 2
+                _meta["exposure_render_mode"] = "no_auto_bright_metered_v1"
+                _meta["exposure_compensation_profile"] = exposure_profile
+                with open(metadata_path, "w", encoding="utf-8") as mf:
+                    json.dump(_meta, mf, indent=2)
+            except Exception as _meta_init_e:
+                log_warning(
+                    self._log_path,
+                    f"Failed to initialize exposure metadata: {_meta_init_e}",
+                    stage=stage_ctx["stage"],
+                )
+
             stage_ctx["stage"] = "load_database"
             database, db_path = load_database(kestrel_dir, analyzer_name, log_path=self._log_path)
 
@@ -524,6 +364,7 @@ class AnalysisPipeline:
 
                 image_path = None
                 raw_obj = None
+                raw_meter_scale = 1.0
                 try:
                     stage_ctx["stage"] = "read_image"
                     stage_ctx["file"] = raw_file
@@ -531,6 +372,18 @@ class AnalysisPipeline:
                     img, raw_obj = read_image_for_pipeline(image_path)
                     if img is None:
                         raise RuntimeError("Image read returned None")
+
+                    if raw_obj is not None:
+                        metered_img, raw_meter_scale, meter_debug = build_metered_detection_image(raw_obj)
+                        if metered_img is not None:
+                            img = metered_img
+                        elif meter_debug.get("error"):
+                            log_warning(
+                                self._log_path,
+                                f"RAW metering fallback to default decode: {meter_debug['error']}",
+                                stage=stage_ctx["stage"],
+                                context={"file": raw_file, "folder": folder},
+                            )
 
                     current_orientation = self._get_image_orientation(img)
                     entry["orientation"] = current_orientation
@@ -720,8 +573,21 @@ class AnalysisPipeline:
                             stops,
                             exposure_profile,
                             raw_obj=raw_obj,
+                            base_scale=raw_meter_scale,
+                            no_auto_bright=raw_obj is not None,
                         )
-                        img_src = self._apply_exposure_correction(img, stops, raw_obj)
+                        img_src = self._apply_exposure_correction(
+                            img,
+                            stops,
+                            raw_obj,
+                            base_scale=raw_meter_scale,
+                            no_auto_bright=raw_obj is not None,
+                        )
+                        total_stops = (
+                            ec_compose_total_stops(stops, raw_meter_scale)
+                            if raw_obj is not None
+                            else float(stops)
+                        )
                         crop_bbox = self.mask_rcnn.get_square_crop_box(masks[primary_mask_i])
                         quality_crop, quality_mask = self.mask_rcnn.get_square_crop(
                             masks[primary_mask_i], img_src, resize=True
@@ -737,7 +603,7 @@ class AnalysisPipeline:
                             "quality": quality_score,
                             "rating": quality_to_rating(quality_score, rating_thresholds),
                             "quality_crop": quality_crop,
-                            "exposure_correction": round(stops, 4),
+                            "exposure_correction": round(total_stops, 4),
                             "crop_bbox": crop_bbox,
                         }
 
@@ -754,8 +620,21 @@ class AnalysisPipeline:
                                 stops,
                                 exposure_profile,
                                 raw_obj=raw_obj,
+                                base_scale=raw_meter_scale,
+                                no_auto_bright=raw_obj is not None,
                             )
-                            img_src = self._apply_exposure_correction(img, stops, raw_obj)
+                            img_src = self._apply_exposure_correction(
+                                img,
+                                stops,
+                                raw_obj,
+                                base_scale=raw_meter_scale,
+                                no_auto_bright=raw_obj is not None,
+                            )
+                            total_stops = (
+                                ec_compose_total_stops(stops, raw_meter_scale)
+                                if raw_obj is not None
+                                else float(stops)
+                            )
                             species_crop = self.mask_rcnn.get_species_crop(pred_boxes[i], img_src)
                             crop_bbox = self.mask_rcnn.get_square_crop_box(masks[i])
                             quality_crop, quality_mask = self.mask_rcnn.get_square_crop(masks[i], img_src, resize=True)
@@ -767,6 +646,7 @@ class AnalysisPipeline:
                                     "quality_crop": quality_crop,
                                     "quality_mask": quality_mask,
                                     "stops": stops,
+                                    "total_stops": total_stops,
                                     "crop_bbox": crop_bbox,
                                 }
                             )
@@ -807,7 +687,10 @@ class AnalysisPipeline:
                                 item["species_confidence"] = float(pred_score[i])
                                 item["family"] = "N/A"
                                 item["family_confidence"] = 0.0
-                            item["exposure_correction"] = round(item["stops"], 4)
+                            item["exposure_correction"] = round(
+                                float(item.get("total_stops", item["stops"])),
+                                4,
+                            )
                             stage_ctx["stage"] = "quality_score"
                             quality_score = self.quality_clf.classify(item["quality_crop"], item["quality_mask"])
                             item["quality"] = quality_score
@@ -1134,6 +1017,9 @@ class AnalysisPipeline:
                             _meta = {"version": VERSION, "analyzer": analyzer_name}
                         _meta["quality_distribution"] = distribution
                         _meta["quality_distribution_stored"] = True
+                        _meta["exposure_pipeline_version"] = 2
+                        _meta["exposure_render_mode"] = "no_auto_bright_metered_v1"
+                        _meta["exposure_compensation_profile"] = exposure_profile
                         with open(metadata_path, "w", encoding="utf-8") as mf:
                             _json.dump(_meta, mf, indent=2)
                     except Exception as _meta_e:

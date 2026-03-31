@@ -19,6 +19,21 @@ from settings_utils import load_persisted_settings, save_persisted_settings, log
 from queue_manager import _queue_manager
 
 try:
+    from kestrel_analyzer.exposure_compensation import preserve_highlights_for_stops as _preserve_highlights_for_stops
+except ImportError:
+    try:
+        from analyzer.kestrel_analyzer.exposure_compensation import preserve_highlights_for_stops as _preserve_highlights_for_stops
+    except ImportError:
+        def _preserve_highlights_for_stops(stops: float) -> float:
+            if stops > 1.0:
+                return 0.95
+            if stops > 0.4:
+                return 0.9
+            if stops > 0.0:
+                return 0.85
+            return 0.0
+
+try:
     from editor_launch import launch as _launch_editor
 except ImportError:
     try:
@@ -125,6 +140,7 @@ class Api:
         # Cache os.path.realpath(root_path) — root_path is constant for the session
         # but realpath() does a GetFinalPathNameByHandle syscall on Windows each time.
         self._realpath_cache: dict = {}
+        self._exposure_mode_cache: dict = {}
         self._has_unsaved_changes: bool = False
         self._cache_cleanup_roots: set[str] = set()
         self._culling_companion_extensions: tuple[str, ...] = _CULLING_COMPANION_EXTENSIONS
@@ -149,6 +165,32 @@ class Api:
             self._cache_cleanup_roots.add(os.path.abspath(rp))
         except Exception:
             pass
+
+    def _get_exposure_render_mode(self, root_path_real: str) -> str:
+        """Return the exposure render mode for a folder, defaulting to legacy behavior."""
+        root_key = os.path.abspath(str(root_path_real or '').strip())
+        if not root_key:
+            return 'legacy_auto_bright_v1'
+        cached = self._exposure_mode_cache.get(root_key)
+        if cached:
+            return cached
+
+        mode = 'legacy_auto_bright_v1'
+        meta_path = os.path.join(root_key, '.kestrel', 'kestrel_metadata.json')
+        try:
+            if os.path.isfile(meta_path):
+                with open(meta_path, 'r', encoding='utf-8') as mf:
+                    metadata = json.load(mf)
+                mode_raw = str(metadata.get('exposure_render_mode', '') or '').strip().lower()
+                if mode_raw in {'legacy_auto_bright_v1', 'no_auto_bright_metered_v1'}:
+                    mode = mode_raw
+                elif str(metadata.get('exposure_pipeline_version', '')).strip() in {'2', '2.0'}:
+                    mode = 'no_auto_bright_metered_v1'
+        except Exception:
+            mode = 'legacy_auto_bright_v1'
+
+        self._exposure_mode_cache[root_key] = mode
+        return mode
 
     def _resolve_editor_target(self, root_path: str, relative_path: str) -> tuple[str, str]:
         """Resolve an editor target from root+relative with boundary-safe normalization."""
@@ -1950,7 +1992,7 @@ class Api:
 
         exp_correction: exposure offset in stops applied during postprocessing.
             0.0 (default) = no correction, matches standard display preview.
-            Positive = brighten, negative = darken.  Clamped to [-1.5, +3.0].
+            Positive = brighten, negative = darken.  Clamped to [-2.0, +3.0].
         """
         from io import BytesIO
 
@@ -1982,19 +2024,25 @@ class Api:
                 exp_correction = float(exp_correction)
             except (TypeError, ValueError):
                 exp_correction = 0.0
-            exp_correction = max(-1.5, min(3.0, exp_correction))
+            exp_correction = max(-2.0, min(3.0, exp_correction))
+
+            render_mode = self._get_exposure_render_mode(root_path_real)
+            use_no_auto_bright = render_mode == 'no_auto_bright_metered_v1'
 
             settings = load_persisted_settings()
             use_cache = bool(settings.get('raw_preview_cache_enabled', True))
             debug_logging_enabled = bool(settings.get('raw_preview_debug_logging_enabled', True))
 
             cache_dir = os.path.join(root_path_real, '.kestrel', 'culling_TMP')
-            # Cache key includes relative path + extension + file identity.
-            # Exposure is intentionally excluded: the UI requests one RAW preview
-            # variant per file, already using the selected exposure correction.
+            # Cache key includes relative path + extension + file identity,
+            # and exposure/mode so previews cannot be reused across EV variants
+            # or different exposure-render pipelines.
             file_stat = os.stat(full_path)
             rel_for_key = os.path.normpath(os.path.relpath(full_path_real, root_path_real)).replace('\\', '/')
-            key_material = f'{rel_for_key}|{ext}|{int(file_stat.st_mtime_ns)}|{int(file_stat.st_size)}'
+            key_material = (
+                f'{rel_for_key}|{ext}|{int(file_stat.st_mtime_ns)}|{int(file_stat.st_size)}'
+                f'|ev={exp_correction:+.4f}|mode={render_mode}'
+            )
             cache_token = hashlib.sha1(key_material.encode('utf-8')).hexdigest()[:16]
             base = os.path.splitext(os.path.basename(filename))[0]
             cache_name = f'{base}_{cache_token}_preview.jpg'
@@ -2005,6 +2053,8 @@ class Api:
                 'full_path': full_path,
                 'platform': sys.platform,
                 'exp_correction': round(float(exp_correction), 4),
+                'render_mode': render_mode,
+                'use_no_auto_bright': bool(use_no_auto_bright),
                 'use_cache': bool(use_cache),
                 'cache_dir': cache_dir,
                 'cache_name': cache_name,
@@ -2014,7 +2064,10 @@ class Api:
             }
 
             if use_cache and os.path.exists(cache_path):
-                log(f'read_raw_full: Cache hit for {filename} (exp={exp_correction:+.3f})')
+                log(
+                    f'read_raw_full: Cache hit for {filename} '
+                    f'(exp={exp_correction:+.3f}, mode={render_mode})'
+                )
                 with open(cache_path, 'rb') as f:
                     cache_bytes = f.read()
                 cache_stat = os.stat(cache_path)
@@ -2032,7 +2085,10 @@ class Api:
             import rawpy
             from PIL import Image
 
-            log(f'read_raw_full: Processing RAW file {filename} (exp={exp_correction:+.3f}, cache={use_cache})')
+            log(
+                f'read_raw_full: Processing RAW file {filename} '
+                f'(exp={exp_correction:+.3f}, mode={render_mode}, cache={use_cache})'
+            )
             with rawpy.imread(full_path) as raw:
                 try:
                     sizes = raw.sizes
@@ -2048,16 +2104,20 @@ class Api:
                 except Exception:
                     raw_sizes = {}
 
-                # Match pipeline postprocess flow: first call with defaults, then expose-shift if needed
-                rgb = raw.postprocess()
-
-                if exp_correction != 0.0:
-                    linear_scale = float(max(0.25, min(8.0, 2.0 ** exp_correction)))
-                    preserve = 0.8 if exp_correction > 0 else 0.0
+                linear_scale = float(max(0.25, min(8.0, 2.0 ** exp_correction)))
+                if use_no_auto_bright:
                     rgb = raw.postprocess(
+                        no_auto_bright=True,
                         exp_shift=linear_scale,
-                        exp_preserve_highlights=preserve,
+                        exp_preserve_highlights=_preserve_highlights_for_stops(exp_correction),
                     )
+                else:
+                    rgb = raw.postprocess()
+                    if exp_correction != 0.0:
+                        rgb = raw.postprocess(
+                            exp_shift=linear_scale,
+                            exp_preserve_highlights=_preserve_highlights_for_stops(exp_correction),
+                        )
 
             img = Image.fromarray(rgb)
 

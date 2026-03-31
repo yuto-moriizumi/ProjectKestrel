@@ -1769,12 +1769,14 @@
 
     function getSceneRawCacheKey(row) {
       const disabled = getSetting('raw_exposure_correction_disabled', false);
+      const expCorr = disabled ? 0.0 : (parseFloat(row.exposure_correction) || 0);
+      const expKey = Number.isFinite(expCorr) ? expCorr.toFixed(4) : '0.0000';
       return [
         row.__rootPath || '',
         row.filename || '',
         row.export_path || '',
         row.crop_path || '',
-        disabled ? 'noexp' : 'exp'
+        `exp=${expKey}`
       ].join('|');
     }
 
