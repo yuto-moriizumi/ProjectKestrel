@@ -23,6 +23,7 @@ Bugs
 * Security Fixes: remove browser mode fallback, tighten exposed API endpoints, enforce schema validation for settings files, tighten path normalization escapes, and reduce blast radius of auth token breach. [DONE]
 * Some exposure compensation adjustment failures for overexposed images persists [DONE]
 * Swapped position of the bird crop and full image thumbnail. [DONE]
+* Added slider to control size of the two UI elements.
 
 
 Features under consideration

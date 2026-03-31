@@ -1276,18 +1276,43 @@
     .scene-previews {
       flex: 1 1 auto;
       display: flex;
-      gap: 12px;
+      gap: 0;
       padding: 8px 14px 4px;
       min-height: 0;
     }
     #scenePreviewCrop {
-      height: 100%;
-      aspect-ratio: 1 / 1;
-      flex: 0 0 auto;
+      flex: 0.32 1 0;
+      min-width: 140px;
     }
     #scenePreviewExport {
-      flex: 1 1 auto;
-      min-width: 0;
+      flex: 0.68 1 0;
+      min-width: 180px;
+    }
+    .scene-preview-divider {
+      flex: 0 0 10px;
+      width: 10px;
+      position: relative;
+      cursor: col-resize;
+      touch-action: none;
+      user-select: none;
+      outline: none;
+    }
+    .scene-preview-divider::before {
+      content: '';
+      position: absolute;
+      top: 8px;
+      bottom: 8px;
+      left: 50%;
+      transform: translateX(-50%);
+      width: 2px;
+      border-radius: 2px;
+      background: #2a3040;
+      transition: background .12s ease;
+    }
+    .scene-preview-divider:hover::before,
+    .scene-preview-divider.dragging::before,
+    .scene-preview-divider:focus-visible::before {
+      background: #3a84e6;
     }
     .scene-preview-panel {
       display: flex;

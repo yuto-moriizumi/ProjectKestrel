@@ -73,6 +73,13 @@
     let _focusedCardId = null;         // Scene ID of the keyboard-focused card in the grid
     // Track which scene dialog is open for refreshing filters
     let currentSceneId = null;
+    const SCENE_PREVIEW_SPLIT_KEY = 'scene_preview_split_ratio';
+    const SCENE_PREVIEW_SPLIT_DEFAULT = 0.68;
+    const SCENE_PREVIEW_SPLIT_MIN = 0.25;
+    const SCENE_PREVIEW_SPLIT_MAX = 0.85;
+    const SCENE_PREVIEW_MIN_EXPORT_PX = 180;
+    const SCENE_PREVIEW_MIN_CROP_PX = 140;
+    let _scenePreviewSplitRatio = SCENE_PREVIEW_SPLIT_DEFAULT;
 
     const el = (sel) => document.querySelector(sel);
     const sceneGrid = el('#sceneGrid');
@@ -2813,6 +2820,54 @@
       renderTopbarTags(scene);
     }
 
+    function _clampScenePreviewSplitRatio(value) {
+      const n = parseFloat(value);
+      if (!Number.isFinite(n)) return SCENE_PREVIEW_SPLIT_DEFAULT;
+      return Math.max(SCENE_PREVIEW_SPLIT_MIN, Math.min(SCENE_PREVIEW_SPLIT_MAX, n));
+    }
+
+    function _getScenePreviewSplitSetting() {
+      return _clampScenePreviewSplitRatio(getSetting(SCENE_PREVIEW_SPLIT_KEY, SCENE_PREVIEW_SPLIT_DEFAULT));
+    }
+
+    function _updateScenePreviewDividerAria(ratio) {
+      const divider = document.getElementById('scenePreviewDivider');
+      if (!divider) return;
+      const pct = Math.round(_clampScenePreviewSplitRatio(ratio) * 100);
+      divider.setAttribute('aria-valuemin', String(Math.round(SCENE_PREVIEW_SPLIT_MIN * 100)));
+      divider.setAttribute('aria-valuemax', String(Math.round(SCENE_PREVIEW_SPLIT_MAX * 100)));
+      divider.setAttribute('aria-valuenow', String(pct));
+      divider.setAttribute('aria-valuetext', `Full image width ${pct}%`);
+    }
+
+    function _applyScenePreviewSplit(ratio) {
+      const exportPanel = el('#scenePreviewExport');
+      const cropPanel = el('#scenePreviewCrop');
+      if (!exportPanel || !cropPanel) return;
+      const clamped = _clampScenePreviewSplitRatio(ratio);
+      _scenePreviewSplitRatio = clamped;
+      exportPanel.style.flex = `${clamped.toFixed(4)} 1 0px`;
+      cropPanel.style.flex = `${(1 - clamped).toFixed(4)} 1 0px`;
+      _updateScenePreviewDividerAria(clamped);
+    }
+
+    function _persistScenePreviewSplit(ratio) {
+      const clamped = _clampScenePreviewSplitRatio(ratio);
+      mergeSetting(SCENE_PREVIEW_SPLIT_KEY, Number(clamped.toFixed(4)));
+    }
+
+    function _ratioFromPreviewDividerX(previewsEl, dividerEl, clientX) {
+      const rect = previewsEl.getBoundingClientRect();
+      const dividerWidth = dividerEl.getBoundingClientRect().width || 10;
+      const usableWidth = Math.max(1, rect.width - dividerWidth);
+      const minLeft = Math.max(0, Math.min(SCENE_PREVIEW_MIN_EXPORT_PX, usableWidth - SCENE_PREVIEW_MIN_CROP_PX));
+      const minRight = Math.max(0, Math.min(SCENE_PREVIEW_MIN_CROP_PX, usableWidth - minLeft));
+      const maxLeft = Math.max(minLeft, usableWidth - minRight);
+      const leftPxRaw = clientX - rect.left - (dividerWidth * 0.5);
+      const leftPx = Math.max(minLeft, Math.min(maxLeft, leftPxRaw));
+      return _clampScenePreviewSplitRatio(leftPx / usableWidth);
+    }
+
     async function openSceneDialog(sceneId, startIndex = 0) {
       const scene = scenes.find(s => String(s.id) === String(sceneId));
       if (!scene) return;
@@ -2822,6 +2877,7 @@
       _sceneEditMode = false;
       _sceneEditDraft = null;
       currentImageIndex = startIndex;
+      _applyScenePreviewSplit(_getScenePreviewSplitSetting());
 
       // ── Top bar: title ──
       const localNum = String(scene.id).split(':').pop();
@@ -3686,35 +3742,85 @@
       } catch (_) { }
     });
 
-    // Add draggable splitter for resizing right preview panel
-    (function setupColumnResizer() {
-      const dlg = document.getElementById('sceneDlg');
-      const divider = document.getElementById('colDivider');
-      if (!dlg || !divider) return;
+    // Scene preview divider: drag to resize Full Image vs Bird Crop panes
+    (function setupScenePreviewDivider() {
+      const previews = document.getElementById('scenePreviews');
+      const divider = document.getElementById('scenePreviewDivider');
+      if (!previews || !divider) return;
 
-      function onMouseDown(e) {
+      let dragging = false;
+      let activePointerId = null;
+
+      const applyFromClientX = (clientX) => {
+        const ratio = _ratioFromPreviewDividerX(previews, divider, clientX);
+        _applyScenePreviewSplit(ratio);
+      };
+
+      const finishDrag = (persist) => {
+        if (!dragging) return;
+        dragging = false;
+        divider.classList.remove('dragging');
+        document.body.style.cursor = '';
+        document.body.style.userSelect = '';
+        if (persist) {
+          _persistScenePreviewSplit(_scenePreviewSplitRatio);
+        }
+      };
+
+      divider.addEventListener('pointerdown', (e) => {
+        if (e.button !== 0) return;
+        dragging = true;
+        activePointerId = e.pointerId;
+        divider.classList.add('dragging');
+        document.body.style.cursor = 'col-resize';
+        document.body.style.userSelect = 'none';
+        try { divider.setPointerCapture(activePointerId); } catch (_) { }
+        applyFromClientX(e.clientX);
         e.preventDefault();
-        const modal = divider.closest('.modal');
-        if (!modal) return;
-        const rect = modal.getBoundingClientRect();
-        const onMove = (ev) => {
-          const newW = Math.round(rect.right - ev.clientX); // distance from cursor to right edge
-          const min = 260; // min width of right panel
-          const max = Math.max(320, Math.floor(rect.width * 0.8));
-          const clamped = Math.min(Math.max(newW, min), max);
-          modal.style.setProperty('--right-w', clamped + 'px');
-        };
-        const onUp = () => {
-          window.removeEventListener('mousemove', onMove);
-          window.removeEventListener('mouseup', onUp);
-        };
-        window.addEventListener('mousemove', onMove);
-        window.addEventListener('mouseup', onUp);
-      }
-      divider.addEventListener('mousedown', onMouseDown);
+      });
+
+      divider.addEventListener('pointermove', (e) => {
+        if (!dragging) return;
+        if (activePointerId !== null && e.pointerId !== activePointerId) return;
+        applyFromClientX(e.clientX);
+        e.preventDefault();
+      });
+
+      divider.addEventListener('pointerup', (e) => {
+        if (!dragging) return;
+        if (activePointerId !== null && e.pointerId !== activePointerId) return;
+        try { divider.releasePointerCapture(e.pointerId); } catch (_) { }
+        activePointerId = null;
+        finishDrag(true);
+      });
+
+      divider.addEventListener('pointercancel', () => {
+        activePointerId = null;
+        finishDrag(true);
+      });
+
       divider.addEventListener('dblclick', () => {
-        const modal = divider.closest('.modal');
-        if (modal) modal.style.setProperty('--right-w', '510px');
+        _applyScenePreviewSplit(SCENE_PREVIEW_SPLIT_DEFAULT);
+        _persistScenePreviewSplit(_scenePreviewSplitRatio);
+      });
+
+      divider.addEventListener('keydown', (e) => {
+        let next = _scenePreviewSplitRatio;
+        const step = e.shiftKey ? 0.05 : 0.02;
+        if (e.key === 'ArrowLeft') next -= step;
+        else if (e.key === 'ArrowRight') next += step;
+        else if (e.key === 'Home') next = SCENE_PREVIEW_SPLIT_MIN;
+        else if (e.key === 'End') next = SCENE_PREVIEW_SPLIT_MAX;
+        else return;
+        e.preventDefault();
+        _applyScenePreviewSplit(next);
+        _persistScenePreviewSplit(_scenePreviewSplitRatio);
+      });
+
+      _applyScenePreviewSplit(_getScenePreviewSplitSetting());
+      window.addEventListener('resize', () => {
+        if (!sceneDlg?.open) return;
+        _applyScenePreviewSplit(_scenePreviewSplitRatio);
       });
     })();
 
@@ -3759,6 +3865,7 @@
         const incoming = (data && data.settings && typeof data.settings === 'object') ? data.settings : null;
         if (!incoming) return;
         saveSettings(incoming);
+        _applyScenePreviewSplit(_clampScenePreviewSplitRatio(incoming[SCENE_PREVIEW_SPLIT_KEY]));
         _autoSaveEnabled = incoming.auto_save_enabled !== false;
         if (!_autoSaveEnabled) {
           clearTimeout(_autoSaveTimer);
