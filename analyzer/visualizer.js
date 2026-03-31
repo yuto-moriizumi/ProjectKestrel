@@ -3818,8 +3818,8 @@
       // Exposure compensation profile
       const expProfileEl = document.getElementById('exposureCompensationProfile');
       if (expProfileEl) {
-        const savedExpProfile = String(getSetting('exposure_compensation_profile', 'normal') || 'normal').toLowerCase();
-        expProfileEl.value = ['lenient', 'normal', 'aggressive'].includes(savedExpProfile) ? savedExpProfile : 'normal';
+        const savedExpProfile = String(getSetting('exposure_compensation_profile', 'aggressive') || 'aggressive').toLowerCase();
+        expProfileEl.value = ['lenient', 'normal', 'aggressive'].includes(savedExpProfile) ? savedExpProfile : 'aggressive';
       }
       // RAW preview cache
       const rawCacheCb = document.getElementById('rawPreviewCacheEnabled');
@@ -3864,10 +3864,10 @@
       const maskThEl2 = document.getElementById('maskThreshold');
       const maskThreshold = maskThEl2 ? Math.max(0.5, Math.min(0.95, parseFloat(maskThEl2.value) || 0.5)) : 0.5;
       const expProfileEl2 = document.getElementById('exposureCompensationProfile');
-      const exposureCompensationProfile = (expProfileEl2 ? String(expProfileEl2.value || 'normal') : 'normal').toLowerCase();
+      const exposureCompensationProfile = (expProfileEl2 ? String(expProfileEl2.value || 'aggressive') : 'aggressive').toLowerCase();
       const exposureCompensationProfileSafe = ['lenient', 'normal', 'aggressive'].includes(exposureCompensationProfile)
         ? exposureCompensationProfile
-        : 'normal';
+        : 'aggressive';
       const rawCacheCb2 = document.getElementById('rawPreviewCacheEnabled');
       const rawPreviewCacheEnabled = rawCacheCb2 ? rawCacheCb2.checked : true;
       const autoSaveCb = document.getElementById('settingsAutoSave');

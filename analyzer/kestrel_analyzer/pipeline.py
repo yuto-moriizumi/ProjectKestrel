@@ -88,7 +88,7 @@ class AnalysisPipeline:
         return overlay
 
     @staticmethod
-    def _compute_exposure_stops(img: np.ndarray, mask: np.ndarray, profile: str = "normal") -> float:
+    def _compute_exposure_stops(img: np.ndarray, mask: np.ndarray, profile: str = "aggressive") -> float:
         return ec_compute_exposure_stops(img, mask, profile)
 
     @staticmethod
@@ -120,6 +120,7 @@ class AnalysisPipeline:
         *,
         base_scale: float = 1.0,
         no_auto_bright: bool = False,
+        profile: str = "aggressive",
     ) -> np.ndarray:
         return ec_apply_exposure_correction(
             img,
@@ -127,6 +128,7 @@ class AnalysisPipeline:
             raw_obj,
             base_scale=base_scale,
             no_auto_bright=no_auto_bright,
+            profile=profile,
         )
 
     @staticmethod
@@ -183,13 +185,13 @@ class AnalysisPipeline:
         error_cb = callbacks.get("on_error")
 
         rating_thresholds = None
-        exposure_profile = "normal"
+        exposure_profile = "aggressive"
         if callable(load_persisted_settings):
             try:
                 sett = load_persisted_settings() or {}
                 profile = sett.get('rating_profile', 'balanced')
                 rating_thresholds = get_profile_thresholds(profile)
-                raw_exp_profile = str(sett.get('exposure_compensation_profile', 'normal') or 'normal').strip().lower()
+                raw_exp_profile = str(sett.get('exposure_compensation_profile', 'aggressive') or 'aggressive').strip().lower()
                 if raw_exp_profile in {'lenient', 'normal', 'aggressive'}:
                     exposure_profile = raw_exp_profile
             except Exception:
@@ -359,7 +361,10 @@ class AnalysisPipeline:
 
                     if raw_obj is not None:
                         entry["exposure_pipeline"] = "no_auto_bright_metered_v1"
-                        metered_img, raw_meter_scale, meter_debug = build_metered_detection_image(raw_obj)
+                        metered_img, raw_meter_scale, meter_debug = build_metered_detection_image(
+                            raw_obj,
+                            profile=exposure_profile,
+                        )
                         entry["exposure_meter_scale"] = float(raw_meter_scale)
                         if metered_img is not None:
                             img = metered_img
@@ -571,6 +576,7 @@ class AnalysisPipeline:
                             raw_obj,
                             base_scale=raw_meter_scale,
                             no_auto_bright=raw_obj is not None,
+                            profile=exposure_profile,
                         )
                         total_stops = (
                             ec_compose_total_stops(stops, raw_meter_scale)
@@ -627,6 +633,7 @@ class AnalysisPipeline:
                                 raw_obj,
                                 base_scale=raw_meter_scale,
                                 no_auto_bright=raw_obj is not None,
+                                profile=exposure_profile,
                             )
                             total_stops = (
                                 ec_compose_total_stops(stops, raw_meter_scale)

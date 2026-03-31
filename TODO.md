@@ -9,7 +9,7 @@ Bugs
 * Known issue where exposure compensation still tends to be slightly too dark, particularly for noisy images. Root cause unknown. [DONE]
 * Auto-save may save all folders rather than just the ones that have been modified. [DONE]
 * Bug where un-loading a folder that has recently been analyzed sometimes causes it to auto-check itself. Uncertain why. In this situation, hitting the next arrow to skip to the next scene sometimes goes to the next scene of a different folder, if it is loaded with a similar capture time. We need to make sure that the next scene is consistent with the way that the scenes are displayed in the main view. 
-* PIPELINE CHANGE New ML model is needed to correctly handle the exposure shift adjustements.
+* PIPELINE CHANGE New ML model is needed to correctly handle the exposure shift adjustements. [TEMP-DONE]
 * Delete cache files after folder unloaded or software closed. [DONE]
 * Fix bad UI problem when splitting a scene. [DONE]
 * Tweak exposure compensation algorithm to be slightly more aggressive in correcting exposure changes; making sure that highlights are not blown out while also making sure that shadows or highly underexposed birds are properly adjusted and lifted. Potentially exclude some of the boundary pixel layers during exposure compensation calculation as they my reflect mask-rcnn boundary inconsistencies. [DONE]
@@ -36,7 +36,7 @@ Features under consideration
 
 Test before release:
 * Fix to Mask-RCNN Region Proposal System [DONE]
-* Quality classifier performance on revised pipeline
+* Quality classifier performance on revised pipeline [DONE]
 * RAW+JPG co-movement fix in Culing Assistant + test restore capability persists after Kestrel re-opens. [DONE, FIXED]
 * Improvement to crash handling and error logging. [DONE]
 * Test rawpy decode issue. [DONE, FIXED]
@@ -126,3 +126,6 @@ Test before release:
     - Improved handling of auto-generated ratings and auto-generated culling decisions to enhance consistency and decouple the two features.
     - Show pipeline version in addition to standard version control.
 * Substantial number of bug fixes, particularly around the user interface, settings menu, and culling assistant.
+
+
+# Version Kentucky Warbler Changelog

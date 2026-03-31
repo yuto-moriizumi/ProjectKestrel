@@ -9,21 +9,67 @@ import numpy as np
 _ALLOWED_PROFILES = {"lenient", "normal", "aggressive"}
 
 
+_METER_PROFILE_CFG: Dict[str, Dict[str, float]] = {
+    "lenient": {
+        "target_p50": 0.30,
+        "target_p90": 0.68,
+        "target_p98": 0.92,
+        "meter_min": 0.30,
+        "meter_max": 3.30,
+    },
+    "normal": {
+        "target_p50": 0.33,
+        "target_p90": 0.72,
+        "target_p98": 0.90,
+        "meter_min": 0.35,
+        "meter_max": 3.50,
+    },
+    "aggressive": {
+        "target_p50": 0.36,
+        "target_p90": 0.74,
+        "target_p98": 0.88,
+        "meter_min": 0.35,
+        "meter_max": 3.60,
+    },
+}
+
+
+_PRESERVE_HIGHLIGHTS_CFG: Dict[str, Dict[str, float]] = {
+    "lenient": {
+        "gt_1_0": 0.90,
+        "gt_0_4": 0.85,
+        "gt_0_0": 0.75,
+    },
+    "normal": {
+        "gt_1_0": 0.95,
+        "gt_0_4": 0.90,
+        "gt_0_0": 0.85,
+    },
+    "aggressive": {
+        "gt_1_0": 0.98,
+        "gt_0_4": 0.94,
+        "gt_0_0": 0.90,
+    },
+}
+
+
 def normalize_profile_name(profile: str) -> str:
-    profile_name = str(profile or "normal").strip().lower()
+    profile_name = str(profile or "aggressive").strip().lower()
     if profile_name not in _ALLOWED_PROFILES:
-        profile_name = "normal"
+        profile_name = "aggressive"
     return profile_name
 
 
-def preserve_highlights_for_stops(stops: float) -> float:
+def preserve_highlights_for_stops(stops: float, profile: str = "aggressive") -> float:
     stops = float(stops)
+    profile_name = normalize_profile_name(profile)
+    cfg = _PRESERVE_HIGHLIGHTS_CFG.get(profile_name, _PRESERVE_HIGHLIGHTS_CFG["aggressive"])
     if stops > 1.0:
-        return 0.95
+        return float(cfg["gt_1_0"])
     if stops > 0.4:
-        return 0.9
+        return float(cfg["gt_0_4"])
     if stops > 0.0:
-        return 0.85
+        return float(cfg["gt_0_0"])
     return 0.0
 
 
@@ -32,7 +78,12 @@ def _preview_from_linear(norm_rgb: np.ndarray) -> np.ndarray:
     return (np.power(v, 1.0 / 2.2) * 255.0 + 0.5).astype(np.uint8)
 
 
-def compute_global_meter_scale(noauto_linear_rgb: np.ndarray) -> Tuple[float, Dict[str, float]]:
+def compute_global_meter_scale(
+    noauto_linear_rgb: np.ndarray,
+    profile: str = "aggressive",
+) -> Tuple[float, Dict[str, float]]:
+    profile_name = normalize_profile_name(profile)
+    meter_cfg = _METER_PROFILE_CFG.get(profile_name, _METER_PROFILE_CFG["aggressive"])
     lum = (
         0.2126 * noauto_linear_rgb[..., 0]
         + 0.7152 * noauto_linear_rgb[..., 1]
@@ -40,15 +91,16 @@ def compute_global_meter_scale(noauto_linear_rgb: np.ndarray) -> Tuple[float, Di
     )
     p50, p90, p98 = [float(x) for x in np.percentile(lum, [50, 90, 98])]
     eps = 1e-4
-    target_p50 = 0.33
-    target_p90 = 0.72
-    target_p98 = 0.90
+    target_p50 = float(meter_cfg["target_p50"])
+    target_p90 = float(meter_cfg["target_p90"])
+    target_p98 = float(meter_cfg["target_p98"])
     g50 = target_p50 / max(p50, eps)
     g90 = target_p90 / max(p90, eps)
     g98 = target_p98 / max(p98, eps)
     meter_scale = min(g50, g90, g98)
-    meter_scale = float(np.clip(meter_scale, 0.35, 3.5))
+    meter_scale = float(np.clip(meter_scale, float(meter_cfg["meter_min"]), float(meter_cfg["meter_max"])))
     meter_debug = {
+        "profile": profile_name,
         "p50": p50,
         "p90": p90,
         "p98": p98,
@@ -58,17 +110,22 @@ def compute_global_meter_scale(noauto_linear_rgb: np.ndarray) -> Tuple[float, Di
         "g50": float(g50),
         "g90": float(g90),
         "g98": float(g98),
+        "meter_min": float(meter_cfg["meter_min"]),
+        "meter_max": float(meter_cfg["meter_max"]),
         "meter_scale": meter_scale,
     }
     return meter_scale, meter_debug
 
 
-def build_metered_detection_image(raw_obj) -> Tuple[Optional[np.ndarray], float, Dict[str, Any]]:
+def build_metered_detection_image(
+    raw_obj,
+    profile: str = "aggressive",
+) -> Tuple[Optional[np.ndarray], float, Dict[str, Any]]:
     """Build the detection image from RAW using no_auto_bright + global metering."""
     try:
         noauto16 = raw_obj.postprocess(no_auto_bright=True, output_bps=16)
         noauto_norm = np.clip(noauto16.astype(np.float32) / 65535.0, 0.0, 1.0)
-        meter_scale, meter_debug = compute_global_meter_scale(noauto_norm)
+        meter_scale, meter_debug = compute_global_meter_scale(noauto_norm, profile=profile)
         metered_norm = np.clip(noauto_norm * meter_scale, 0.0, 1.0)
         metered8 = _preview_from_linear(metered_norm)
         return metered8, meter_scale, meter_debug
@@ -81,7 +138,7 @@ def compose_total_stops(subject_stops: float, meter_scale: float) -> float:
     return float(np.log2(meter_scale) + float(subject_stops))
 
 
-def compute_exposure_stops(img: np.ndarray, mask: np.ndarray, profile: str = "normal") -> float:
+def compute_exposure_stops(img: np.ndarray, mask: np.ndarray, profile: str = "aggressive") -> float:
     """Estimate exposure correction in stops for the masked subject region."""
     EPS = 1e-3
     profile_name = normalize_profile_name(profile)
@@ -225,28 +282,35 @@ def refine_exposure_stops(
     base_scale: float = 1.0,
     no_auto_bright: bool = False,
 ) -> float:
-    """Iteratively refine aggressive profile darkening for residual highlights."""
+    """Iteratively refine aggressive profile for residual over/under-exposure."""
     total = float(initial_stops)
     profile_name = normalize_profile_name(profile)
     if profile_name != "aggressive":
         return total
-    if total >= -0.05:
+    residual_tolerance = 0.02
+    if abs(total) <= residual_tolerance:
         return total
 
-    for _ in range(2):
+    for _ in range(3):
         corrected = apply_exposure_correction(
             img,
             total,
             raw_obj,
             base_scale=base_scale,
             no_auto_bright=no_auto_bright,
+            profile=profile_name,
         )
         residual = compute_exposure_stops(corrected, mask, profile_name)
-        if not np.isfinite(residual) or residual >= -0.03:
+        if not np.isfinite(residual):
             break
-        total += residual * 0.85
+        if abs(float(residual)) <= residual_tolerance:
+            break
+        if residual > 0.0:
+            total += residual * 0.75
+        else:
+            total += residual * 0.90
         total = float(np.clip(total, -2.0, 3.0))
-        if total <= -1.95:
+        if total <= -1.95 or total >= 2.95:
             break
     return total
 
@@ -258,6 +322,7 @@ def apply_exposure_correction(
     *,
     base_scale: float = 1.0,
     no_auto_bright: bool = False,
+    profile: str = "aggressive",
 ) -> np.ndarray:
     """Return a copy of *img* with exposure shifted by *stops* stops."""
     if raw_obj is not None:
@@ -267,7 +332,7 @@ def apply_exposure_correction(
                 return img
             pp_kwargs = {
                 "exp_shift": total_scale,
-                "exp_preserve_highlights": preserve_highlights_for_stops(stops),
+                "exp_preserve_highlights": preserve_highlights_for_stops(stops, profile=profile),
             }
             if no_auto_bright:
                 pp_kwargs["no_auto_bright"] = True

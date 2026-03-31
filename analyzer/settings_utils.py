@@ -295,7 +295,7 @@ def _sanitize_settings_payload(data: dict, emit_log: bool = False) -> dict:
         out['exposure_compensation_profile'] = _coerce_enum(
             data.get('exposure_compensation_profile'),
             _ALLOWED_EXPOSURE_PROFILES,
-            default='normal',
+            default='aggressive',
         )
 
     _set_bool('raw_preview_cache_enabled', default=True)
