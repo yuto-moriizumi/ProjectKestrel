@@ -268,16 +268,6 @@
       <!-- ═══ CENTER: Dual preview panels ═══ -->
       <div class="scene-main">
         <div class="scene-previews">
-          <div class="scene-preview-panel" id="scenePreviewCrop">
-            <div class="scene-preview-label">Bird Crop</div>
-            <div class="scene-preview-img" id="previewCropBox">
-              <span class="muted">Select an image…</span>
-              <button class="scene-preview-copy-btn" id="sceneCopyCropBtn" type="button" title="Copy bird crop to clipboard" aria-label="Copy bird crop to clipboard" disabled>
-                <span class="copy-icon">📋</span>
-                <span>Copy</span>
-              </button>
-            </div>
-          </div>
           <div class="scene-preview-panel" id="scenePreviewExport">
             <div class="scene-preview-label">Full Image</div>
             <div class="scene-preview-img" id="previewBox" data-raw-label="RAW">
@@ -291,6 +281,16 @@
               <span class="muted" style="font-size:11px">RAW Zoom</span>
               <input type="range" id="sceneZoomSlider" min="2" max="12" value="5" step="0.5" style="width:90px">
             </label>
+          </div>
+          <div class="scene-preview-panel" id="scenePreviewCrop">
+            <div class="scene-preview-label">Bird Crop</div>
+            <div class="scene-preview-img" id="previewCropBox">
+              <span class="muted">Select an image…</span>
+              <button class="scene-preview-copy-btn" id="sceneCopyCropBtn" type="button" title="Copy bird crop to clipboard" aria-label="Copy bird crop to clipboard" disabled>
+                <span class="copy-icon">📋</span>
+                <span>Copy</span>
+              </button>
+            </div>
           </div>
         </div>
         <!-- Info bar between previews and filmstrip -->
