@@ -6089,9 +6089,10 @@
       const dets = item.current_detections || [];
       const quality = item.current_quality_results || [];
       const species = item.current_species_results || [];
+      const cardCount = Math.max(crops.length, dets.length, quality.length, species.length, 1);
 
-      // Ensure exactly 5 card elements exist
-      while (row.children.length < 5) {
+      // Keep card count in sync with current live detections.
+      while (row.children.length < cardCount) {
         const card = document.createElement('div');
         card.className = 'live-dlg-crop-card';
         card.innerHTML = `
@@ -6103,8 +6104,11 @@
         <div class="ldc-family">–</div>`;
         row.appendChild(card);
       }
+      while (row.children.length > cardCount) {
+        row.removeChild(row.lastChild);
+      }
 
-      for (let i = 0; i < 5; i++) {
+      for (let i = 0; i < cardCount; i++) {
         const card = row.children[i];
         const imgEl = card.querySelector('.live-dlg-crop-img');
         const confEl = card.querySelector('.ldc-conf');
@@ -6168,6 +6172,8 @@
           fmEl.textContent = '–'; fmEl.className = 'ldc-family';
         }
       }
+
+      _liveLastCropKeys.length = cardCount;
     }
 
     // ── End Live Analysis Dialog ─────────────────────────────────────────────────

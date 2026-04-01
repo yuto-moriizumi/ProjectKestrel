@@ -547,7 +547,7 @@ class QueueManager:
                         os.makedirs(export_dir, exist_ok=True)
                     except Exception:
                         pass
-                    for idx, crop in enumerate(crops[:5]):
+                    for idx, crop in enumerate(crops):
                         if crop is None:
                             continue
                         cp = os.path.join(export_dir, f'__live_crop_{idx}.jpg')
@@ -562,7 +562,7 @@ class QueueManager:
                     with self._lock:
                         _it.current_crops_rel = saved_rels
                         _it.current_detections = [
-                            {'confidence': float(c)} for c in confidences[:5]]
+                            {'confidence': float(c)} for c in confidences]
 
                 def _on_quality(data, _it=item):
                     incoming = list(data.get('results') or [])

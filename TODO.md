@@ -142,10 +142,13 @@ Major update featuring significant corrections to exposure compensation algorith
     * New "Suggested Species" tags make it easier to add tags based on machine learning model outputs.
     * Improved split scene behavior to make it substantially more intuitive (use Shift+Click to split scenes)
     * "Only manually reviewed scenes" toggle now reflects culling decisions, scenes with reviewed tags, and renamed scenes in addition to manually applied star ratings.
-* Substantial improvements to Kestrel's handling of multiple subjects within the same image.
-    * Kestrel will now detect, analyze, and save results of multiple birds within the same image (up to 5 by default)
+* Substantial improvements to Kestrel's handling of multiple birds within the same image.
+    * Kestrel will now detect, analyze, and save results of multiple birds within the same image (up to 5 by default, with user customizable settings)
+    * Browse through all of the birds that Kestrel detects using the up/down arrow keys! Hit "Enter" to assign a specific bird as primary (default: highest-quality bird). 
 * Upgraded quality classification model to reflect the latest pipeline. Quality ranking performance is substantially improved based on current tests.
-* Improved performance on scenes with a large amount of subjects.
+* Improved performance on scenes with a large amount of subjects via backend machine learning model parameter tweaks.
+* Made several changes to improve security (reduced sensitive HTTP endpoint exposure, enforced settings schema validation, etc.)
+* Improved crash handling mechanism. 
 
 
 
