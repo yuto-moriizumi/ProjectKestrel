@@ -5441,6 +5441,8 @@
       if (_startupRecoveryHandled) return;
       _startupRecoveryHandled = true;
 
+      if (!hasPywebviewApi) { const ready = await waitForPywebview(); if (!ready) return; }
+
       let recovery = null;
       try {
         recovery = await apiGetRecoveryStatus();
