@@ -131,3 +131,8 @@ Test before release:
 
 
 # Version Kentucky Warbler Changelog
+Major update featuring significant corrections to exposure compensation algorithm, improved quality scoring model, UI tweaks, bug fixes, and more.
+## Major Changes
+* New Exposure compensation solver algorithm ensures that the bird in the image is always properly exposed. This improves quality ranking accuracy, species detection accuracy, and makes it easier to review your photos!
+    * New setting to tweak exposure compensation solver performance to your needs.
+* Upgraded 

@@ -2346,6 +2346,11 @@
     async function selectFilmstripImage(idx, scene, isHover = false, overlayActiveCrop = false) {
       if (!scene || !scene.images || idx < 0 || idx >= scene.images.length) return;
       if (!isHover) {
+        // Clear temporary crop selection for the image we're leaving so that
+        // returning to it later shows the primary crop, not a stale temp pick.
+        if (idx !== currentImageIndex && scene.images[currentImageIndex]) {
+          _sceneActiveCropIndexByImage.delete(_cropStateKey(scene.images[currentImageIndex]));
+        }
         currentImageIndex = idx;
       }
       const r = scene.images[idx];
@@ -6185,6 +6190,13 @@
 
         if (changed) {
           ensureSceneNameColumn();        ensureRatingColumns();        await renderScenes();
+          // If a scene dialog is open, its filmstrip is stale after renderScenes
+          // rebuilt the scenes array with fresh row objects — re-render it now.
+          if (_currentScene) {
+            renderFilmstrip(_currentScene);
+            const safeIdx = Math.max(0, Math.min(currentImageIndex, _currentScene.images.length - 1));
+            await selectFilmstripImage(safeIdx, _currentScene);
+          }
           setStatus(`Auto-refreshed ${toRefresh.length} newly-analyzed folder(s)`);
         }
       } finally {
