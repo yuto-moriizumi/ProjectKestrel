@@ -455,6 +455,13 @@
         inclusive. Requires re-analysis to take effect.</div>
 
       <div class="row">
+        <label for="maxBirdCrops">Max Bird Crops Saved Per Image</label>
+        <input id="maxBirdCrops" type="number" min="1" max="20" step="1" value="5"
+          style="width:80px" title="Maximum number of bird crops Kestrel saves per image (1-20)." />
+      </div>
+      <div class="muted" style="font-size:12px;margin-top:-6px;margin-bottom:8px">Controls how many top bird detections Kestrel saves per image. Mask R-CNN proposal and detection caps are automatically set to 2x this value. <b style="color:#e0a34a">Warning: increasing this value (for example to 20) can substantially increase compute time and memory overhead.</b> Requires re-analysis to take effect.</div>
+
+      <div class="row">
         <label for="exposureCompensationProfile">Exposure Compensation Profile</label>
         <select id="exposureCompensationProfile">
           <option value="lenient">Lenient &mdash; tolerates brighter highlights and applies gentler shadow lift</option>

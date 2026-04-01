@@ -172,6 +172,7 @@ class QueueManager:
         self._detection_threshold = 0.75
         self._scene_time_threshold = 1.0
         self._mask_threshold = 0.5
+        self._max_bird_crops = 5
 
     def _collect_restore_paths_locked(self) -> list:
         restore_statuses = {'pending', 'running', 'cancelled'}
@@ -199,6 +200,7 @@ class QueueManager:
                 'detection_threshold': float(self._detection_threshold),
                 'scene_time_threshold': float(self._scene_time_threshold),
                 'mask_threshold': float(self._mask_threshold),
+                'max_bird_crops': int(self._max_bird_crops),
             },
             'items': [
                 {
@@ -243,6 +245,17 @@ class QueueManager:
             except (TypeError, ValueError):
                 return float(default)
 
+        def _safe_int(val, default, min_value=1, max_value=20):
+            try:
+                num = int(float(val))
+            except (TypeError, ValueError):
+                num = int(default)
+            if num < min_value:
+                return min_value
+            if num > max_value:
+                return max_value
+            return num
+
         state = self.get_persisted_recovery_state()
         if not state:
             return {'success': False, 'error': 'No persisted queue recovery state found'}
@@ -279,6 +292,7 @@ class QueueManager:
             detection_threshold=_safe_float(options.get('detection_threshold', 0.75), 0.75),
             scene_time_threshold=_safe_float(options.get('scene_time_threshold', 1.0), 1.0),
             mask_threshold=_safe_float(options.get('mask_threshold', 0.5), 0.5),
+            max_bird_crops=_safe_int(options.get('max_bird_crops', 5), 5),
         )
         if result.get('success'):
             result['restored'] = len(restore_paths)
@@ -317,7 +331,16 @@ class QueueManager:
 
     # ---- control ----
 
-    def enqueue(self, paths: list, use_gpu: bool = True, wildlife_enabled: bool = True, detection_threshold: float = 0.75, scene_time_threshold: float = 1.0, mask_threshold: float = 0.5) -> dict:
+    def enqueue(
+        self,
+        paths: list,
+        use_gpu: bool = True,
+        wildlife_enabled: bool = True,
+        detection_threshold: float = 0.75,
+        scene_time_threshold: float = 1.0,
+        mask_threshold: float = 0.5,
+        max_bird_crops: int = 5,
+    ) -> dict:
         if not _PIPELINE_AVAILABLE:
             return {'success': False, 'error': f'Analyzer unavailable: {_pipeline_import_error}'}
         with self._lock:
@@ -360,6 +383,11 @@ class QueueManager:
             self._detection_threshold = float(detection_threshold)
             self._scene_time_threshold = float(scene_time_threshold)
             self._mask_threshold = float(mask_threshold)
+            try:
+                max_bird_crops_num = int(float(max_bird_crops))
+            except (TypeError, ValueError):
+                max_bird_crops_num = 5
+            self._max_bird_crops = max(1, min(20, max_bird_crops_num))
             self._thread = threading.Thread(target=self._run, daemon=True, name='kestrel-queue')
             self._thread.start()
         self._persist_recovery_state()
@@ -579,6 +607,7 @@ class QueueManager:
                     detection_threshold=self._detection_threshold,
                     scene_time_threshold=self._scene_time_threshold,
                     mask_threshold=self._mask_threshold,
+                    max_bird_crops=self._max_bird_crops,
                 )
                 with self._lock:
                     if self._cancel_event.is_set():

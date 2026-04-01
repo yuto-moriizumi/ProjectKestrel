@@ -1432,11 +1432,17 @@ class Api:
             scene_time_threshold = max(0.0, scene_time_threshold)
             mask_threshold = float(sett.get('mask_threshold', 0.5))
             mask_threshold = max(0.5, min(0.95, mask_threshold))
+            try:
+                max_bird_crops = int(float(sett.get('max_bird_crops', 5)))
+            except (TypeError, ValueError):
+                max_bird_crops = 5
+            max_bird_crops = max(1, min(20, max_bird_crops))
             return _queue_manager.enqueue(validated_paths, use_gpu=bool(use_gpu),
                                           wildlife_enabled=bool(wildlife_enabled),
                                           detection_threshold=detection_threshold,
                                           scene_time_threshold=scene_time_threshold,
-                                          mask_threshold=mask_threshold)
+                                          mask_threshold=mask_threshold,
+                                          max_bird_crops=max_bird_crops)
         except Exception as e:
             print(f'[API] start_analysis_queue() -> Error: {e}', flush=True)
             return {'success': False, 'error': str(e)}

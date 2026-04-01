@@ -38,10 +38,11 @@ Features under consideration
 
 Test before release:
 * Fix to Mask-RCNN Region Proposal System [DONE]
-* Quality classifier performance on revised pipeline [DONE]
+* Quality classifier performance on revised pipeline [DONE - WORKS WELL ENOUGH]
 * RAW+JPG co-movement fix in Culing Assistant + test restore capability persists after Kestrel re-opens. [DONE, FIXED]
 * Improvement to crash handling and error logging. [DONE]
 * Test rawpy decode issue. [DONE, FIXED]
+* Test Queue restore fixes [DONE]
 
 
 
@@ -135,4 +136,18 @@ Major update featuring significant corrections to exposure compensation algorith
 ## Major Changes
 * New Exposure compensation solver algorithm ensures that the bird in the image is always properly exposed. This improves quality ranking accuracy, species detection accuracy, and makes it easier to review your photos!
     * New setting to tweak exposure compensation solver performance to your needs.
-* Upgraded 
+* Substantial user experience improvements
+    * New "Quick Copy" buttons let you directly share bird crops or whole image exports.
+    * New adjustable divider lets you resize the bird crop to full image preview space.
+    * New "Suggested Species" tags make it easier to add tags based on machine learning model outputs.
+    * Improved split scene behavior to make it substantially more intuitive (use Shift+Click to split scenes)
+    * "Only manually reviewed scenes" toggle now reflects culling decisions, scenes with reviewed tags, and renamed scenes in addition to manually applied star ratings.
+* Substantial improvements to Kestrel's handling of multiple subjects within the same image.
+    * Kestrel will now detect, analyze, and save results of multiple birds within the same image (up to 5 by default)
+* Upgraded quality classification model to reflect the latest pipeline. Quality ranking performance is substantially improved based on current tests.
+* Improved performance on scenes with a large amount of subjects.
+
+
+
+## Known Issues
+* With the implementation of the new exposure compensation algorithm, analysis time may be slightly slower. Set the exposure compensation profile to "Normal" or "Lenient" to reduce this overhead.

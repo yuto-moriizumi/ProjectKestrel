@@ -3960,6 +3960,8 @@
       // Mask threshold
       const maskThEl = document.getElementById('maskThreshold');
       if (maskThEl) maskThEl.value = getSetting('mask_threshold', 0.5);
+      const maxBirdCropsEl = document.getElementById('maxBirdCrops');
+      if (maxBirdCropsEl) maxBirdCropsEl.value = getSetting('max_bird_crops', 5);
       // Exposure compensation profile
       const expProfileEl = document.getElementById('exposureCompensationProfile');
       if (expProfileEl) {
@@ -4008,6 +4010,13 @@
       const sceneTimeThreshold = sttEl2 ? Math.max(0, parseFloat(sttEl2.value) || 1.0) : 1.0;
       const maskThEl2 = document.getElementById('maskThreshold');
       const maskThreshold = maskThEl2 ? Math.max(0.5, Math.min(0.95, parseFloat(maskThEl2.value) || 0.5)) : 0.5;
+      const maxBirdCropsEl2 = document.getElementById('maxBirdCrops');
+      let maxBirdCrops = 5;
+      if (maxBirdCropsEl2) {
+        const parsedMaxBirdCrops = parseInt(maxBirdCropsEl2.value, 10);
+        maxBirdCrops = Number.isFinite(parsedMaxBirdCrops) ? parsedMaxBirdCrops : 5;
+      }
+      maxBirdCrops = Math.max(1, Math.min(20, maxBirdCrops));
       const expProfileEl2 = document.getElementById('exposureCompensationProfile');
       const exposureCompensationProfile = (expProfileEl2 ? String(expProfileEl2.value || 'aggressive') : 'aggressive').toLowerCase();
       const exposureCompensationProfileSafe = ['lenient', 'normal', 'aggressive'].includes(exposureCompensationProfile)
@@ -4020,6 +4029,16 @@
       // Merge into existing settings so keys like machine_id / analytics_consent_shown are preserved
       const existing = loadSettings();
       const prevProfile = existing.rating_profile || 'balanced';
+      const prevMaxBirdCropsRaw = parseInt(existing.max_bird_crops, 10);
+      const prevMaxBirdCrops = Number.isFinite(prevMaxBirdCropsRaw)
+        ? Math.max(1, Math.min(20, prevMaxBirdCropsRaw))
+        : 5;
+      if (maxBirdCrops > 10 && maxBirdCrops !== prevMaxBirdCrops) {
+        const confirmed = confirm(
+          'Raising "Max Bird Crops Saved Per Image" above 10 can substantially increase compute time and memory overhead. Continue?'
+        );
+        if (!confirmed) return;
+      }
       const settings = {
         ...existing, editor, customEditorPath, treeScanDepth,
         analytics_opted_in: analyticsOptIn, analytics_consent_shown: true,
@@ -4027,6 +4046,7 @@
         detection_threshold: detectionThreshold,
         scene_time_threshold: sceneTimeThreshold,
         mask_threshold: maskThreshold,
+        max_bird_crops: maxBirdCrops,
         exposure_compensation_profile: exposureCompensationProfileSafe,
         raw_preview_cache_enabled: rawPreviewCacheEnabled,
         auto_save_enabled: autoSaveEnabled,

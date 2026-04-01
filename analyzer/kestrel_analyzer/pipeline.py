@@ -142,22 +142,39 @@ class AnalysisPipeline:
             return "landscape"
         return "square"
 
-    def load_models(self, status_cb: Optional[Callable[[str], None]] = None) -> None:
-        if self.mask_rcnn and self.species_clf and self.quality_clf:
+    def load_models(
+        self,
+        status_cb: Optional[Callable[[str], None]] = None,
+        max_bird_crops: int = 5,
+    ) -> None:
+        try:
+            max_bird_crops = int(max_bird_crops)
+        except (TypeError, ValueError):
+            max_bird_crops = 5
+        max_bird_crops = max(1, min(20, max_bird_crops))
+
+        mask_ready_for_cap = bool(
+            self.mask_rcnn
+            and int(getattr(self.mask_rcnn, "max_bird_crops", 5)) == max_bird_crops
+        )
+        if mask_ready_for_cap and self.species_clf and self.quality_clf:
             return
         if status_cb:
             status_cb("Loading models... This may take a while on first run.")
-        self.mask_rcnn = MaskRCNNWrapper()
-        self.species_clf = BirdSpeciesClassifier(
-            str(SPECIESCLASSIFIER_PATH),
-            str(SPECIESCLASSIFIER_LABELS),
-            self.use_gpu,
-            models_dir=str(MODELS_DIR),
-        )
-        self.quality_clf = QualityClassifier(
-            str(QUALITYCLASSIFIER_PATH),
-            normalization_data_path=str(QUALITY_NORMALIZATION_DATA_PATH),
-        )
+        if not mask_ready_for_cap:
+            self.mask_rcnn = MaskRCNNWrapper(max_bird_crops=max_bird_crops)
+        if not self.species_clf:
+            self.species_clf = BirdSpeciesClassifier(
+                str(SPECIESCLASSIFIER_PATH),
+                str(SPECIESCLASSIFIER_LABELS),
+                self.use_gpu,
+                models_dir=str(MODELS_DIR),
+            )
+        if not self.quality_clf:
+            self.quality_clf = QualityClassifier(
+                str(QUALITYCLASSIFIER_PATH),
+                normalization_data_path=str(QUALITY_NORMALIZATION_DATA_PATH),
+            )
         if status_cb:
             status_cb("Models loaded. Processing started.")
 
@@ -172,6 +189,7 @@ class AnalysisPipeline:
         detection_threshold: float = 0.75,
         scene_time_threshold: float = 1.0,
         mask_threshold: float = 0.5,
+        max_bird_crops: int = 5,
     ) -> None:
         callbacks = callbacks or {}
         status_cb = callbacks.get("on_status")
@@ -183,6 +201,12 @@ class AnalysisPipeline:
         quality_cb = callbacks.get("on_quality")
         species_cb = callbacks.get("on_species")
         error_cb = callbacks.get("on_error")
+
+        try:
+            max_bird_crops = int(max_bird_crops)
+        except (TypeError, ValueError):
+            max_bird_crops = 5
+        max_bird_crops = max(1, min(20, max_bird_crops))
 
         rating_thresholds = None
         exposure_profile = "aggressive"
@@ -286,7 +310,7 @@ class AnalysisPipeline:
                 return
 
             stage_ctx["stage"] = "load_models"
-            self.load_models(status_cb=status_cb)
+            self.load_models(status_cb=status_cb, max_bird_crops=max_bird_crops)
 
             previous_image = None
             previous_image_path = None
@@ -546,7 +570,7 @@ class AnalysisPipeline:
 
                     wildlife_indices = [i for i, c in enumerate(pred_class) if c in active_wildlife_categories]
                     bird_indices = [i for i, c in enumerate(pred_class) if c == "bird"]
-                    bird_indices = sorted(bird_indices, key=lambda i: pred_score[i], reverse=True)[:5]
+                    bird_indices = sorted(bird_indices, key=lambda i: pred_score[i], reverse=True)[:max_bird_crops]
 
                     overlay_indices = bird_indices if bird_indices else wildlife_indices[:1]
                     if detection_cb:

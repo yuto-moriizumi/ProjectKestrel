@@ -9,15 +9,24 @@ import torchvision.transforms as T
 
 from ..config import MASK_RCNN_WEIGHTS_PATH
 
-# Full-resolution RAW inference is memory-heavy; cap RPN proposals so the RoI / mask
-# heads never see more than this many regions per image (defaults are ~1000+).
-_MASK_RCNN_RPN_PRE_NMS_TOP_N_TEST = 10
-_MASK_RCNN_RPN_POST_NMS_TOP_N_TEST = 10
-_MASK_RCNN_BOX_DETECTIONS_PER_IMG = 10
+# Full-resolution RAW inference is memory-heavy. Keep a conservative baseline,
+# but allow scaling proposal caps alongside the configured per-image bird limit.
+_DEFAULT_MAX_BIRD_CROPS = 5
+_MIN_MAX_BIRD_CROPS = 1
+_MAX_MAX_BIRD_CROPS = 20
+_MASK_RCNN_BASE_CAP = 10
+
+
+def _coerce_max_bird_crops(value) -> int:
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        n = _DEFAULT_MAX_BIRD_CROPS
+    return max(_MIN_MAX_BIRD_CROPS, min(_MAX_MAX_BIRD_CROPS, n))
 
 
 class MaskRCNNWrapper:
-    def __init__(self):
+    def __init__(self, max_bird_crops: int = _DEFAULT_MAX_BIRD_CROPS):
         self.COCO_INSTANCE_CATEGORY_NAMES = [
             "__background__", "person", "bicycle", "car", "motorcycle", "airplane", "bus",
             "train", "truck", "boat", "traffic light", "fire hydrant", "N/A", "stop sign",
@@ -39,11 +48,19 @@ class MaskRCNNWrapper:
                 "The weights file should be bundled with the application."
             )
 
+        self.max_bird_crops = _coerce_max_bird_crops(max_bird_crops)
+        # Keep enough proposal headroom for non-bird detections while allowing
+        # users to request more saved bird crops per image.
+        proposal_cap = max(_MASK_RCNN_BASE_CAP, self.max_bird_crops * 2)
+        self.rpn_pre_nms_top_n_test = proposal_cap
+        self.rpn_post_nms_top_n_test = proposal_cap
+        self.box_detections_per_img = proposal_cap
+
         self.model = detection_models.maskrcnn_resnet50_fpn_v2(
             weights=None,
-            rpn_pre_nms_top_n_test=_MASK_RCNN_RPN_PRE_NMS_TOP_N_TEST,
-            rpn_post_nms_top_n_test=_MASK_RCNN_RPN_POST_NMS_TOP_N_TEST,
-            box_detections_per_img=_MASK_RCNN_BOX_DETECTIONS_PER_IMG,
+            rpn_pre_nms_top_n_test=self.rpn_pre_nms_top_n_test,
+            rpn_post_nms_top_n_test=self.rpn_post_nms_top_n_test,
+            box_detections_per_img=self.box_detections_per_img,
         )
         state_dict = torch.load(weights_path, map_location="cpu", weights_only=True)
         self.model.load_state_dict(state_dict)
