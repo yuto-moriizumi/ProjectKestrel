@@ -2782,8 +2782,38 @@
     let rawCache = new Map();    // filename -> base64 data URL
     let rawLoading = new Set();  // filename currently loading
 
+    function getRowExposurePipelineMode(row) {
+      const mode = String(row?.exposure_pipeline || '').trim().toLowerCase();
+      if (mode === 'no_auto_bright_metered_v1') return mode;
+      return 'legacy_auto_bright_v1';
+    }
+
+    function getRowRawPreviewRequestStops(row) {
+      const requested = parseFloat(row?.exposure_correction) || 0;
+      return Math.max(-2.0, Math.min(3.0, requested));
+    }
+
+    function getRowRawPreviewMeterScale(row) {
+      if (getRowExposurePipelineMode(row) !== 'no_auto_bright_metered_v1') return 1.0;
+      const meter = _cropNum(row?.exposure_meter_scale, 1);
+      if (!Number.isFinite(meter) || meter <= 0) return 1.0;
+      return Math.max(0.25, Math.min(8.0, meter));
+    }
+
+    function getRowRawPreviewEffectiveStops(row) {
+      const requested = getRowRawPreviewRequestStops(row);
+      if (getRowExposurePipelineMode(row) !== 'no_auto_bright_metered_v1') return requested;
+      if (Math.abs(requested) > 0.0001) return requested;
+      const meterStops = Math.log2(getRowRawPreviewMeterScale(row));
+      if (Math.abs(meterStops) <= 0.001) return requested;
+      return Math.max(-2.0, Math.min(3.0, meterStops));
+    }
+
     function getRawPreviewKey(row) {
-      return row.filename || '';
+      const mode = getRowExposurePipelineMode(row);
+      const expCorr = getRowRawPreviewEffectiveStops(row);
+      const expKey = Number.isFinite(expCorr) ? expCorr.toFixed(4) : '0.0000';
+      return [row.filename || '', `mode=${mode}`, `exp=${expKey}`].join('|');
     }
 
     // Wire click-drag zoom directly on the export preview image (right-side preview pane).
@@ -2889,11 +2919,19 @@
     }
 
     async function loadRawAsync(row) {
-      const expCorr = parseFloat(row.exposure_correction) || 0;
+      const expCorrRequested = getRowRawPreviewRequestStops(row);
+      const expMode = getRowExposurePipelineMode(row);
+      const meterScale = getRowRawPreviewMeterScale(row);
       const cacheKey = getRawPreviewKey(row);
       rawLoading.add(cacheKey);
       try {
-        const res = await window.pywebview.api.read_raw_full(row.filename, rootPath, expCorr);
+        const res = await window.pywebview.api.read_raw_full(
+          row.filename,
+          rootPath,
+          expCorrRequested,
+          expMode,
+          meterScale
+        );
         if (res && res.success && res.data) {
           const url = `data:image/jpeg;base64,${res.data}`;
           rawCache.set(cacheKey, url);

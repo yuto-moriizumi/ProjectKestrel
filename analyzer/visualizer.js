@@ -1834,9 +1834,34 @@
       return 'legacy_auto_bright_v1';
     }
 
+    function getRowRawPreviewRequestStops(row, disabled = false) {
+      const requested = disabled ? 0.0 : (parseFloat(row?.exposure_correction) || 0);
+      return Math.max(-2.0, Math.min(3.0, requested));
+    }
+
+    function getRowRawPreviewMeterScale(row, disabled = false) {
+      if (disabled) return 1.0;
+      if (getRowExposurePipelineMode(row) !== 'no_auto_bright_metered_v1') return 1.0;
+      const meter = _numberOr(row?.exposure_meter_scale, 1);
+      if (!Number.isFinite(meter) || meter <= 0) return 1.0;
+      return Math.max(0.25, Math.min(8.0, meter));
+    }
+
+    function getRowRawPreviewEffectiveStops(row, disabled = false) {
+      const requested = getRowRawPreviewRequestStops(row, disabled);
+      if (disabled) return requested;
+      if (getRowExposurePipelineMode(row) !== 'no_auto_bright_metered_v1') return requested;
+      if (Math.abs(requested) > 0.0001) return requested;
+
+      const meterScale = getRowRawPreviewMeterScale(row, false);
+      const meterStops = Math.log2(meterScale);
+      if (Math.abs(meterStops) <= 0.001) return requested;
+      return Math.max(-2.0, Math.min(3.0, meterStops));
+    }
+
     function getSceneRawCacheKey(row) {
       const disabled = getSetting('raw_exposure_correction_disabled', false);
-      const expCorr = disabled ? 0.0 : (parseFloat(row.exposure_correction) || 0);
+      const expCorr = getRowRawPreviewEffectiveStops(row, disabled);
       const expKey = Number.isFinite(expCorr) ? expCorr.toFixed(4) : '0.0000';
       const mode = getRowExposurePipelineMode(row);
       return [
@@ -1908,13 +1933,15 @@
 
     async function loadSceneRawAsync(row) {
       const disabled = getSetting('raw_exposure_correction_disabled', false);
-      const expCorr = disabled ? 0.0 : (parseFloat(row.exposure_correction) || 0);
+      const expCorrRequested = getRowRawPreviewRequestStops(row, disabled);
+      const expCorrEffective = getRowRawPreviewEffectiveStops(row, disabled);
       const expMode = getRowExposurePipelineMode(row);
+      const meterScale = getRowRawPreviewMeterScale(row, disabled);
       const key = getSceneRawCacheKey(row);
       sceneRawLoading.add(key);
       try {
         const res = await window.pywebview.api.read_raw_full(
-          row.filename, row.__rootPath || '', expCorr, expMode
+          row.filename, row.__rootPath || '', expCorrRequested, expMode, meterScale
         );
         if (res && res.debug) {
           console.info('[raw-debug][scene]', row.filename, res.debug);
@@ -1934,7 +1961,7 @@
                   applySceneZoomTransform(curImg, sceneZoomThumbEl, zoomLastX, zoomLastY, sceneZoomScale);
                 }
               };
-              if (box) box.dataset.rawLabel = `RAW (${formatExposureEv(expCorr)} EV)`;
+              if (box) box.dataset.rawLabel = `RAW (${formatExposureEv(expCorrEffective)} EV)`;
               box.classList.add('raw-loaded');
               if (sceneZoomThumbEl) {
                 applySceneZoomTransform(curImg, sceneZoomThumbEl, zoomLastX, zoomLastY, sceneZoomScale);
@@ -1956,7 +1983,7 @@
       const key = getSceneRawCacheKey(row);
       const previewBox = el('#previewBox');
       const disabled = getSetting('raw_exposure_correction_disabled', false);
-      const expCorr = disabled ? 0.0 : (parseFloat(row.exposure_correction) || 0);
+      const expCorr = getRowRawPreviewEffectiveStops(row, disabled);
       previewBox.classList.add('zoom-active');
       previewBox.dataset.rawLabel = `RAW Zoom (${formatExposureEv(expCorr)} EV) (Scroll to zoom in/out)`;
       zoomLastX = mouseEv.clientX;

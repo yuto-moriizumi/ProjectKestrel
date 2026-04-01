@@ -23,7 +23,7 @@ Bugs
 * Security Fixes: remove browser mode fallback, tighten exposed API endpoints, enforce schema validation for settings files, tighten path normalization escapes, and reduce blast radius of auth token breach. [DONE]
 * Some exposure compensation adjustment failures for overexposed images persists [DONE]
 * Swapped position of the bird crop and full image thumbnail. [DONE]
-* Added slider to control size of the two UI elements.
+* Added slider to control size of the two UI elements. [DONE]
 
 
 Features under consideration
@@ -137,7 +137,7 @@ Major update featuring significant corrections to exposure compensation algorith
 * New Exposure compensation solver algorithm ensures that the bird in the image is always properly exposed. This improves quality ranking accuracy, species detection accuracy, and makes it easier to review your photos!
     * New setting to tweak exposure compensation solver performance to your needs.
 * Substantial user experience improvements
-    * New "Quick Copy" buttons let you directly share bird crops or whole image exports.
+    * New "Quick Copy" buttons let you directly copy bird crops or whole image exports to your clipboard for instant sharing without even going through an editor.
     * New adjustable divider lets you resize the bird crop to full image preview space.
     * New "Suggested Species" tags make it easier to add tags based on machine learning model outputs.
     * Improved split scene behavior to make it substantially more intuitive (use Shift+Click to split scenes)
@@ -148,7 +148,15 @@ Major update featuring significant corrections to exposure compensation algorith
 * Upgraded quality classification model to reflect the latest pipeline. Quality ranking performance is substantially improved based on current tests.
 * Improved performance on scenes with a large amount of subjects via backend machine learning model parameter tweaks.
 * Made several changes to improve security (reduced sensitive HTTP endpoint exposure, enforced settings schema validation, etc.)
-* Improved crash handling mechanism. 
+* Improved crash handling/crash recovery system, with automatic restoration of the queue.
+
+## Minor Changes
+* Fixed bugs on Canon EOS R5 Mk II by upgrading rawpy dependency
+* Upgraded tensorflow, torch, and other dependencies to latest versions
+* Improved auto-save performance and consistency across all changes
+* Fixed bugs related to loading/unloading folders while analysis is in progress.
+* Fixed a bug where JPG files would not be co-moved via the culling assistant.
+
 
 
 

@@ -9,6 +9,7 @@ from __future__ import annotations
 import base64
 import hashlib
 import json
+import math
 import os
 import shutil
 import subprocess
@@ -2017,6 +2018,7 @@ class Api:
         root_path: str,
         exp_correction: float = 0.0,
         exposure_mode: str = '',
+        exposure_meter_scale: float = 1.0,
     ):
         """Process a RAW file and return full-resolution JPEG as base64.
         Results are cached in {root}/.kestrel/culling_TMP/ for fast subsequent loads.
@@ -2028,6 +2030,11 @@ class Api:
 
         exposure_mode: optional per-row render mode from CSV. When omitted,
             mode falls back to folder metadata.
+
+        exposure_meter_scale: optional per-row global metering scale. When
+            mode is no_auto_bright_metered_v1 and exp_correction is ~0, this
+            value is used as a fallback correction (log2 scale) so no-detection
+            rows still receive baseline metering in RAW preview.
         """
         from io import BytesIO
 
@@ -2059,7 +2066,15 @@ class Api:
                 exp_correction = float(exp_correction)
             except (TypeError, ValueError):
                 exp_correction = 0.0
-            exp_correction = max(-2.0, min(3.0, exp_correction))
+            requested_exp_correction = max(-2.0, min(3.0, exp_correction))
+
+            try:
+                exposure_meter_scale = float(exposure_meter_scale)
+            except (TypeError, ValueError):
+                exposure_meter_scale = 1.0
+            if not math.isfinite(exposure_meter_scale) or exposure_meter_scale <= 0.0:
+                exposure_meter_scale = 1.0
+            exposure_meter_scale = max(0.25, min(8.0, exposure_meter_scale))
 
             mode_override = str(exposure_mode or '').strip().lower()
             if mode_override in {'legacy_auto_bright_v1', 'no_auto_bright_metered_v1'}:
@@ -2067,6 +2082,17 @@ class Api:
             else:
                 render_mode = self._get_exposure_render_mode(root_path_real)
             use_no_auto_bright = render_mode == 'no_auto_bright_metered_v1'
+
+            exp_correction = requested_exp_correction
+            used_meter_fallback = False
+            if use_no_auto_bright and abs(exp_correction) <= 1e-4:
+                # No-bird rows typically carry zero EV but still have a global
+                # metering scale. Recover that baseline correction for RAW preview.
+                meter_stops = math.log2(exposure_meter_scale)
+                if abs(meter_stops) > 1e-3:
+                    exp_correction = meter_stops
+                    used_meter_fallback = True
+            exp_correction = max(-2.0, min(3.0, exp_correction))
 
             settings = load_persisted_settings()
             use_cache = bool(settings.get('raw_preview_cache_enabled', True))
@@ -2091,7 +2117,10 @@ class Api:
                 'filename': filename,
                 'full_path': full_path,
                 'platform': sys.platform,
-                'exp_correction': round(float(exp_correction), 4),
+                'exp_correction_requested': round(float(requested_exp_correction), 4),
+                'exp_correction_effective': round(float(exp_correction), 4),
+                'exposure_meter_scale': round(float(exposure_meter_scale), 6),
+                'used_meter_fallback': bool(used_meter_fallback),
                 'requested_mode': mode_override,
                 'render_mode': render_mode,
                 'use_no_auto_bright': bool(use_no_auto_bright),
