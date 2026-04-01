@@ -90,6 +90,39 @@
 
     let hasPywebviewApi = !!(window.pywebview && window.pywebview.api);
 
+    // ── Global error handlers ─────────────────────────────────────────────────
+    // Catch unhandled synchronous exceptions and unhandled promise rejections.
+    // Forward them to the Python log via report_js_error so they appear in the
+    // runtime log file even when DevTools isn't open.
+    window.onerror = function (msg, source, line, col, err) {
+      const payload = {
+        type: 'uncaught_exception',
+        msg: String(msg || '').slice(0, 500),
+        source: String(source || '').slice(0, 200),
+        line,
+        col,
+        stack: err?.stack ? String(err.stack).slice(0, 1500) : '',
+      };
+      console.error('[Kestrel] Uncaught JS exception:', payload);
+      try {
+        window.pywebview?.api?.report_js_error?.(payload)?.catch?.(() => {});
+      } catch (_) {}
+      return false; // don't suppress — let DevTools still see it
+    };
+    window.addEventListener('unhandledrejection', function (ev) {
+      const reason = ev.reason;
+      const payload = {
+        type: 'unhandled_rejection',
+        msg: String(reason?.message || reason || '').slice(0, 500),
+        stack: reason?.stack ? String(reason.stack).slice(0, 1500) : '',
+      };
+      console.error('[Kestrel] Unhandled promise rejection:', payload);
+      try {
+        window.pywebview?.api?.report_js_error?.(payload)?.catch?.(() => {});
+      } catch (_) {}
+    });
+    // ─────────────────────────────────────────────────────────────────────────
+
     // Debug: Log what APIs are available (initial check)
     console.log('[DEBUG] Initial API Detection:');
     console.log('  - Pywebview API (window.pywebview):', hasPywebviewApi);

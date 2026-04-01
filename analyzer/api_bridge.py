@@ -150,6 +150,23 @@ class Api:
         self._has_unsaved_changes = bool(is_dirty)
         return {'success': True}
 
+    def report_js_error(self, error_data: dict) -> dict:
+        """Receive an unhandled JS exception or promise rejection and write it
+        to the runtime log so it appears in crash reports even without DevTools.
+        """
+        try:
+            err_type = str(error_data.get('type', 'js_error'))
+            msg = str(error_data.get('msg', ''))[:500]
+            stack = str(error_data.get('stack', ''))[:1500]
+            source = str(error_data.get('source', ''))
+            line = error_data.get('line', '')
+            log(f'[JS {err_type}] {msg}' + (f' @ {source}:{line}' if source else ''))
+            if stack:
+                log(f'[JS {err_type} stack]\n{stack}')
+        except Exception:
+            pass
+        return {'success': True}
+
     def _root_realpath(self, root_path: str) -> str:
         """Return os.path.realpath(root_path), cached for the lifetime of this Api."""
         if root_path not in self._realpath_cache:

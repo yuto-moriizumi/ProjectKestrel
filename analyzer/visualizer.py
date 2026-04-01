@@ -707,6 +707,42 @@ def main():
     log('Legacy HTTP control API enabled =', LEGACY_HTTP_API_ENABLED, '| legacy /open enabled =', LEGACY_OPEN_ENDPOINT_ENABLED)
     _mark_session_start()
 
+    # ── Crash hardening ───────────────────────────────────────────────────────
+    # faulthandler dumps a Python traceback to stderr (which is tee-streamed to
+    # the runtime log file) on SIGSEGV / SIGABRT / hard crashes from native libs
+    # (OpenCV, ONNX Runtime, etc.).
+    try:
+        import faulthandler
+        faulthandler.enable()
+    except Exception:
+        pass
+
+    # threading.excepthook catches unhandled exceptions on daemon threads (e.g.
+    # the analysis worker) that would otherwise die silently with no log output.
+    def _thread_excepthook(args):
+        try:
+            import traceback as _tb
+            thread_name = getattr(args.thread, 'name', 'unknown')
+            tb_str = ''.join(_tb.format_exception(args.exc_type, args.exc_value, args.exc_traceback))
+            log(f'[Thread {thread_name!r}] Uncaught exception: {args.exc_type.__name__}: {args.exc_value}')
+            log(f'[Thread {thread_name!r}] Traceback:\n{tb_str}')
+            if _telemetry is not None:
+                try:
+                    _telemetry.send_crash_report(
+                        exc=args.exc_value,
+                        tb_str=tb_str,
+                        machine_id=_telemetry.get_machine_id(load_persisted_settings()),
+                        version=_telemetry._read_version(),
+                    )
+                except Exception:
+                    pass
+        except Exception:
+            pass
+
+    import threading as _threading_mod
+    _threading_mod.excepthook = _thread_excepthook
+    # ─────────────────────────────────────────────────────────────────────────
+
     # When visualizer.py is run from inside analyzer/ (merged layout) set
     # the working directory to the repository root so assets and shared
     # files (assets/, visualizer files) are served correctly.
@@ -902,11 +938,15 @@ def main():
                 api.cleanup_tracked_culling_caches()
         except Exception as e:
             log('Cache cleanup during shutdown failed:', e)
-        server.shutdown()
-        server.server_close()
+        try:
+            server.shutdown()
+            server.server_close()
+        except Exception as e:
+            log('Server shutdown error:', e)
         log('Server stopped.')
-
-    _mark_session_clean_exit()
+        # Mark clean exit here (inside finally) so it runs even if server
+        # shutdown raises, preventing a false "unclean shutdown" on next launch.
+        _mark_session_clean_exit()
 
 
 if __name__ == '__main__':
