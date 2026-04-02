@@ -10,6 +10,7 @@ _ALLOWED_PROFILES = {"lenient", "normal", "aggressive"}
 _ALLOWED_SOLVERS = {
     "legacy_iterative",
     "convergent_two_pass",
+    "metered_refine_one_pass",
     "lifted_two_pass",
     "two_pass",
     "single_pass",
@@ -70,9 +71,9 @@ def normalize_profile_name(profile: str) -> str:
 
 
 def normalize_solver_name(solver: str) -> str:
-    solver_name = str(solver or "convergent_two_pass").strip().lower()
+    solver_name = str(solver or "metered_refine_one_pass").strip().lower()
     if solver_name not in _ALLOWED_SOLVERS:
-        solver_name = "convergent_two_pass"
+        solver_name = "metered_refine_one_pass"
     return solver_name
 
 
@@ -293,7 +294,7 @@ def refine_exposure_stops(
     mask: np.ndarray,
     initial_stops: float,
     profile: str,
-    solver: str = "convergent_two_pass",
+    solver: str = "metered_refine_one_pass",
     raw_obj=None,
     *,
     base_scale: float = 1.0,
@@ -304,6 +305,7 @@ def refine_exposure_stops(
     Solver modes:
     - legacy_iterative: 3-pass residual refinement (highest quality, slowest).
     - convergent_two_pass: 2-pass refinement with convergence-tail extrapolation.
+    - metered_refine_one_pass: one RAW residual refinement pass from metered output.
     - lifted_two_pass: 2-pass refinement with bounded positive-seed lift.
     - two_pass: up to 2 passes.
     - single_pass: up to 1 pass.
@@ -347,18 +349,82 @@ def refine_exposure_stops(
 
     def _predictive_fast(stops_val: float) -> float:
         # Fast path with no extra RAW postprocess calls. The mapping applies a
-        # bounded profile bias so results remain close to iterative refinement.
+        # bounded profile bias with slightly brighter hard-coded targets to
+        # reduce underexposure drift in fast mode.
         s = float(stops_val)
         mag = abs(s)
         if mag <= 0.10:
+            if s > 0.0:
+                s += 0.22
             return float(np.clip(s, -2.0, 3.0))
         if s > 0.0:
-            boost = min(0.28, 0.10 + 0.18 * min(1.0, mag / 2.0))
-            s = s + boost * min(1.0, mag / 2.2)
+            boost = min(0.42, 0.14 + 0.28 * min(1.0, mag / 1.8))
+            s = s * 1.22 + 0.48 + boost * min(1.0, mag / 2.0)
         else:
-            boost = min(0.22, 0.06 + 0.16 * min(1.0, mag / 2.0))
-            s = s - boost * min(1.0, mag / 2.0)
+            # Soften negative correction in Fast mode to avoid extra dullness.
+            s = s * 0.88 + 0.06
         return float(np.clip(s, -2.0, 3.0))
+
+    def _metered_refine_one_pass(start_stops: float) -> float:
+        """Refine from metered preview with a single lightweight residual pass.
+
+        Starts from the metered crop estimate, performs one residual refinement
+        iteration, then returns stops for one final RAW application.
+        """
+        seed = float(start_stops)
+        if seed > 0.15:
+            seed += 0.55 + min(0.26, 0.10 + 0.12 * min(1.0, seed / 1.8))
+        elif seed < -0.5:
+            seed *= 0.90
+
+        probe_img = apply_exposure_correction(
+            img,
+            seed,
+            raw_obj,
+            base_scale=base_scale,
+            no_auto_bright=no_auto_bright,
+            profile=profile_name,
+        )
+        residual = compute_exposure_stops(probe_img, mask, profile_name)
+        if not np.isfinite(residual):
+            return float(np.clip(seed, -2.0, 3.0))
+
+        residual = float(residual)
+        if abs(residual) <= residual_tolerance:
+            return float(np.clip(seed, -2.0, 3.0))
+
+        gain = float(0.95 if residual > 0.0 else 0.90)
+        candidate = float(np.clip(seed + residual * gain, -2.0, 3.0))
+
+        # Keep one-pass lift under preview-derived highlight headroom.
+        if candidate > seed:
+            try:
+                img_f = probe_img.astype(np.float32) / 255.0
+                mask_bool = np.asarray(mask, dtype=bool)
+                if (
+                    mask_bool.ndim == 2
+                    and img_f.ndim == 3
+                    and mask_bool.shape == img_f.shape[:2]
+                    and np.any(mask_bool)
+                ):
+                    pixels = img_f[mask_bool]
+                else:
+                    pixels = img_f.reshape(-1, 3)
+
+                if pixels.shape[0] > 0:
+                    lum = 0.2126 * pixels[:, 0] + 0.7152 * pixels[:, 1] + 0.0722 * pixels[:, 2]
+                    finite_lum = lum[np.isfinite(lum)]
+                    if finite_lum.size:
+                        p98 = float(np.percentile(finite_lum, 98))
+                        if p98 > 0.0:
+                            headroom = float(np.log2(0.84 / max(p98, 1e-3)))
+                            if np.isfinite(headroom):
+                                lift_cap = float(np.clip(0.98 * headroom, 0.10, 0.70))
+                                candidate = min(candidate, seed + lift_cap)
+            except Exception:
+                pass
+
+        return float(np.clip(candidate, -2.0, 3.0))
 
     def _convergent_two_pass(start_stops: float) -> float:
         """Run two RAW refinement passes, then estimate the remaining tail.
@@ -463,6 +529,9 @@ def refine_exposure_stops(
 
     if solver_name == "legacy_iterative":
         return _refine_loop(total, max_iters=3, residual_tolerance=residual_tolerance, gain_positive=0.75, gain_negative=0.90)
+
+    if solver_name == "metered_refine_one_pass":
+        return _metered_refine_one_pass(total)
 
     if solver_name == "convergent_two_pass":
         seed = float(total)

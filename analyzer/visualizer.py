@@ -778,7 +778,7 @@ def main():
             _init_settings['version'] = _current_version
             _init_settings.setdefault('raw_preview_cache_enabled', True)
             _init_settings.setdefault('exposure_compensation_profile', 'aggressive')
-            _init_settings.setdefault('exposure_compensation_solver', 'convergent_two_pass')
+            _init_settings.setdefault('exposure_compensation_solver', 'metered_refine_one_pass')
             _init_settings.setdefault('auto_save_enabled', True)
 
             _apply_legal_upgrade_self_heal(_init_settings, _prev_version, _current_version)

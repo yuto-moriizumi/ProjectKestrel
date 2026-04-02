@@ -474,16 +474,12 @@
       <div class="row">
         <label for="exposureCompensationSolver">Exposure Solver Speed / Accuracy</label>
         <select id="exposureCompensationSolver">
-          <option value="convergent_two_pass" selected>Convergent Two Pass &mdash; two-pass solver with accelerated tail correction</option>
-          <option value="lifted_two_pass">Lifted Two Pass &mdash; near-legacy output with reduced passes</option>
-          <option value="adaptive_fast">Adaptive Fast &mdash; usually 1 pass, uses 2 on harder cases</option>
-          <option value="single_pass">Single Pass &mdash; fastest residual refinement (1 pass max)</option>
-          <option value="two_pass">Two Pass &mdash; closer to iterative with reduced compute</option>
-          <option value="predictive_fast">Predictive Fast &mdash; no refinement postprocess calls</option>
-          <option value="legacy_iterative">Legacy Iterative &mdash; highest quality, slowest (up to 3 passes)</option>
+          <option value="metered_refine_one_pass" selected>Default &mdash; metered refined one pass (recommended)</option>
+          <option value="predictive_fast">Fast &mdash; Predictive Fast</option>
+          <option value="convergent_two_pass">Accurate &mdash; Convergent two-pass</option>
         </select>
       </div>
-      <div class="muted" style="font-size:12px;margin-top:-6px;margin-bottom:8px">Controls how many refinement passes are used by the exposure compensation solver. Faster modes reduce RAW postprocess calls per crop and can significantly lower analysis time with small quality tradeoffs. Requires re-analysis to take effect.</div>
+      <div class="muted" style="font-size:12px;margin-top:-6px;margin-bottom:8px">Default uses metered refined one pass for stronger speed with quality safeguards. Fast uses Predictive Fast for highest throughput with larger exposure drift risk. Accurate uses Convergent two-pass for best consistency at higher compute cost. Requires re-analysis to take effect.</div>
 
       <h4 style="margin:12px 0 8px;padding-top:8px;border-top:1px solid #1d2230;color:#a0a8b8;font-size:13px;text-transform:uppercase;letter-spacing:0.5px">Data &amp; Preview</h4>
 
