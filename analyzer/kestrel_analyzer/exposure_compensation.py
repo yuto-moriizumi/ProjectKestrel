@@ -190,7 +190,7 @@ def compute_exposure_stops(img: np.ndarray, mask: np.ndarray, profile: str = "ag
             "TARGET_HI_P98": 0.84,
             "TARGET_SHADOW_P10": 0.19,
             "CLIP_THRESH": 0.965,
-            "MAX_CLIP_RATIO": 0.0015,
+            "MAX_CLIP_RATIO": 0.008,
             "BRIGHTEN_STRENGTH": 1.0,
             "DARKEN_STRENGTH": 1.0,
             "MAX_DARKEN": -2.0,
@@ -372,7 +372,7 @@ def refine_exposure_stops(
         iteration, then returns stops for one final RAW application.
         """
         seed = float(start_stops)
-        if seed > 0.15:
+        if seed > 0.08:
             seed += 0.55 + min(0.26, 0.10 + 0.12 * min(1.0, seed / 1.8))
         elif seed < -0.5:
             seed *= 0.90
@@ -419,7 +419,7 @@ def refine_exposure_stops(
                         if p98 > 0.0:
                             headroom = float(np.log2(0.84 / max(p98, 1e-3)))
                             if np.isfinite(headroom):
-                                lift_cap = float(np.clip(0.98 * headroom, 0.10, 0.70))
+                                lift_cap = float(np.clip(0.98 * headroom, 0.15, 1.20))
                                 candidate = min(candidate, seed + lift_cap)
             except Exception:
                 pass
@@ -454,7 +454,7 @@ def refine_exposure_stops(
             if abs(residual) <= residual_tolerance:
                 break
 
-            gain = float(0.75 if residual > 0.0 else 0.90)
+            gain = float(0.82 if residual > 0.0 else 0.90)
             updated = float(np.clip(total_local + residual * gain, -2.0, 3.0))
             if abs(updated - total_local) <= 0.01:
                 total_local = updated
@@ -504,7 +504,7 @@ def refine_exposure_stops(
                     if p98 > 0.0:
                         p98_headroom_stops = float(np.log2(0.84 / max(p98, 1e-3)))
                         if np.isfinite(p98_headroom_stops):
-                            tail_cap = min(tail_cap, float(np.clip(0.85 * p98_headroom_stops, 0.04, 0.24)))
+                            tail_cap = min(tail_cap, float(np.clip(0.85 * p98_headroom_stops, 0.06, 0.36)))
             except Exception:
                 pass
 
@@ -528,14 +528,14 @@ def refine_exposure_stops(
         return _predictive_fast(total)
 
     if solver_name == "legacy_iterative":
-        return _refine_loop(total, max_iters=3, residual_tolerance=residual_tolerance, gain_positive=0.75, gain_negative=0.90)
+        return _refine_loop(total, max_iters=3, residual_tolerance=residual_tolerance, gain_positive=0.82, gain_negative=0.90)
 
     if solver_name == "metered_refine_one_pass":
         return _metered_refine_one_pass(total)
 
     if solver_name == "convergent_two_pass":
         seed = float(total)
-        if seed > 0.25:
+        if seed > 0.08:
             seed += min(0.16, 0.06 + 0.08 * min(1.0, seed / 2.0))
         elif seed < -0.6:
             seed -= min(0.10, 0.03 + 0.05 * min(1.0, abs(seed) / 1.8))
@@ -543,27 +543,27 @@ def refine_exposure_stops(
 
     if solver_name == "lifted_two_pass":
         seed = float(total)
-        if seed > 0.25:
+        if seed > 0.08:
             seed += min(0.20, 0.08 + 0.10 * min(1.0, seed / 2.0))
         elif seed < -0.6:
             seed -= min(0.10, 0.03 + 0.05 * min(1.0, abs(seed) / 1.8))
-        return _refine_loop(seed, max_iters=2, residual_tolerance=residual_tolerance, gain_positive=0.74, gain_negative=0.89)
+        return _refine_loop(seed, max_iters=2, residual_tolerance=residual_tolerance, gain_positive=0.82, gain_negative=0.89)
 
     if solver_name == "two_pass":
-        return _refine_loop(total, max_iters=2, residual_tolerance=residual_tolerance, gain_positive=0.74, gain_negative=0.88)
+        return _refine_loop(total, max_iters=2, residual_tolerance=residual_tolerance, gain_positive=0.82, gain_negative=0.88)
 
     if solver_name == "single_pass":
-        return _refine_loop(total, max_iters=1, residual_tolerance=residual_tolerance, gain_positive=0.72, gain_negative=0.86)
+        return _refine_loop(total, max_iters=1, residual_tolerance=residual_tolerance, gain_positive=0.80, gain_negative=0.86)
 
     # adaptive_fast (default): aggressively reduce postprocess calls while
     # preserving behavior on hard cases with a bounded second pass.
     if abs(total) < 0.45:
         return total
     if raw_obj is None:
-        return _refine_loop(total, max_iters=1, residual_tolerance=residual_tolerance, gain_positive=0.70, gain_negative=0.84)
+        return _refine_loop(total, max_iters=1, residual_tolerance=residual_tolerance, gain_positive=0.78, gain_negative=0.84)
     if abs(total) < 1.20:
-        return _refine_loop(total, max_iters=1, residual_tolerance=residual_tolerance, gain_positive=0.72, gain_negative=0.86)
-    return _refine_loop(total, max_iters=2, residual_tolerance=residual_tolerance, gain_positive=0.74, gain_negative=0.88)
+        return _refine_loop(total, max_iters=1, residual_tolerance=residual_tolerance, gain_positive=0.80, gain_negative=0.86)
+    return _refine_loop(total, max_iters=2, residual_tolerance=residual_tolerance, gain_positive=0.82, gain_negative=0.88)
 
 
 def apply_exposure_correction(

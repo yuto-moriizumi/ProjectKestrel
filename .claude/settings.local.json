@@ -3,7 +3,11 @@
     "allow": [
       "Bash(grep -E '\\\\.py$')",
       "Bash(ls \"c:/Data/Code/Project Kestrel/ProjectKestrel\"/tmp*)",
-      "Bash(python tmp_exposure_underexposure_diag.py)"
+      "Bash(python tmp_exposure_underexposure_diag.py)",
+      "Bash(.venv/Scripts/python.exe -c \"import rawpy; print\\('ok'\\)\")",
+      "Bash(conda run:*)",
+      "Bash(.venv/Scripts/python.exe tmp_exposure_underexposure_diag.py)",
+      "Bash(tasklist)"
     ]
   }
 }
