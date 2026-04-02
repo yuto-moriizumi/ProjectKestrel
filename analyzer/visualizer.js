@@ -3101,17 +3101,19 @@
       const images = _currentScene.images;
       const len = images.length;
 
-      // Tab skips to next scene; Ctrl+Tab skips to previous
+      const hasSceneModifier = e.ctrlKey || e.metaKey;
+
+      // Tab skips to next scene; Ctrl/Cmd+Tab (or Shift+Tab) skips to previous
       if (e.key === 'Tab') {
         e.preventDefault();
-        navigateToScene(e.ctrlKey ? -1 : 1, 0);
+        navigateToScene((hasSceneModifier || e.shiftKey) ? -1 : 1, 0);
         return;
       }
 
       switch (e.key) {
         case 'ArrowRight':
           e.preventDefault();
-          if (e.ctrlKey) {
+          if (hasSceneModifier) {
             // Jump to end of scene, or next scene's start if already at end
             if (currentImageIndex < len - 1) {
               selectFilmstripImage(len - 1, _currentScene);
@@ -3126,9 +3128,18 @@
             }
           }
           break;
+        case 'End':
+          e.preventDefault();
+          // Same behavior as Ctrl/Cmd+ArrowRight.
+          if (currentImageIndex < len - 1) {
+            selectFilmstripImage(len - 1, _currentScene);
+          } else {
+            navigateToScene(1, 0);
+          }
+          break;
         case 'ArrowLeft':
           e.preventDefault();
-          if (e.ctrlKey) {
+          if (hasSceneModifier) {
             // Jump to start of scene, or prev scene's start if already at start
             if (currentImageIndex > 0) {
               selectFilmstripImage(0, _currentScene);
@@ -3146,6 +3157,15 @@
                 navigateToScene(-1, prevScene.images.length - 1);
               }
             }
+          }
+          break;
+        case 'Home':
+          e.preventDefault();
+          // Same behavior as Ctrl/Cmd+ArrowLeft.
+          if (currentImageIndex > 0) {
+            selectFilmstripImage(0, _currentScene);
+          } else {
+            navigateToScene(-1, 0);
           }
           break;
         case 'ArrowUp':
@@ -7838,7 +7858,7 @@
       },
       {
         title: 'Merging Scenes',
-        body: 'The two highlighted scenes above were actually one continuous burst that Kestrel split in two. Hold <kbd>Ctrl</kbd> and click both cards to select them, then click <b>Merge selected scenes</b> to combine them back into one.<br><br>You can also <kbd>Shift+Click</kbd> to range-select a group of scenes at once.',
+        body: 'The two highlighted scenes above were actually one continuous burst that Kestrel split in two. Hold <kbd>Ctrl</kbd>/<kbd>Cmd</kbd> and click both cards to select them, then click <b>Merge selected scenes</b> to combine them back into one.<br><br>You can also <kbd>Shift+Click</kbd> to range-select a group of scenes at once.',
         target: '#sceneGrid .card:nth-child(2)',
         highlightFirst: '#sceneGrid .card:nth-child(1)',
         position: 'bottom',
