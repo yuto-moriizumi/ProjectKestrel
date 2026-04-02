@@ -23,7 +23,7 @@ Bugs
 * Security Fixes: remove browser mode fallback, tighten exposed API endpoints, enforce schema validation for settings files, tighten path normalization escapes, and reduce blast radius of auth token breach. [DONE]
 * Some exposure compensation adjustment failures for overexposed images persists [DONE]
 * Swapped position of the bird crop and full image thumbnail. [DONE]
-* Added slider to control size of the two UI elements. [DONE]
+* Added adjustable divider to control size of the two UI elements. [DONE]
 
 
 Features under consideration
@@ -34,7 +34,7 @@ Features under consideration
 * Investigate GPU support from recent pull request #14
 * Alter search "show only manually reviewed photos" to include those with manual culling decisions or species selections. [DONE]
 * Add restore capability that persists after closing/reopening Culling Assistant/Kestrel [DONE]
-* eBird integration: After integrating Clerk (log-in system), add ability to connect eBird account. Then add ability to attach a particular checklist to an outing. Add ability to hit "T" to enter tagging mode, and add capability to turn the text box into a text+combobox which fetches from the current checklist. Then, add ability to upload photos to eBird/Malaculay library from in-app.
+* eBird integration: After integrating Clerk (log-in system), add ability to connect eBird account. Then add ability to attach a particular checklist to an outing. Add ability to hit "T" to enter tagging mode, and add capability to turn the text box into a text+combobox which fetches from the current checklist. Then, add ability to upload photos to eBird/Malaculay library from in-app. [DEFERRED]
 
 Test before release:
 * Fix to Mask-RCNN Region Proposal System [DONE]
@@ -156,9 +156,11 @@ Major update featuring significant corrections to exposure compensation algorith
 * Improved auto-save performance and consistency across all changes
 * Fixed bugs related to loading/unloading folders while analysis is in progress.
 * Fixed a bug where JPG files would not be co-moved via the culling assistant.
-
-
-
+* Fixed bugs with scene navigation.
 
 ## Known Issues
 * With the implementation of the new exposure compensation algorithm, analysis time may be slightly slower. Set the exposure compensation profile to "Normal" or "Lenient" to reduce this overhead.
+* Default star rating normalization algorithm may be somewhat sub-optimal; improvements are planned but will require some thinking.
+
+## Coming soon
+* Website will be updated to reflect new test sets. 

@@ -7,6 +7,13 @@ import numpy as np
 
 
 _ALLOWED_PROFILES = {"lenient", "normal", "aggressive"}
+_ALLOWED_SOLVERS = {
+    "legacy_iterative",
+    "two_pass",
+    "single_pass",
+    "predictive_fast",
+    "adaptive_fast",
+}
 
 
 _METER_PROFILE_CFG: Dict[str, Dict[str, float]] = {
@@ -58,6 +65,13 @@ def normalize_profile_name(profile: str) -> str:
     if profile_name not in _ALLOWED_PROFILES:
         profile_name = "aggressive"
     return profile_name
+
+
+def normalize_solver_name(solver: str) -> str:
+    solver_name = str(solver or "adaptive_fast").strip().lower()
+    if solver_name not in _ALLOWED_SOLVERS:
+        solver_name = "adaptive_fast"
+    return solver_name
 
 
 def preserve_highlights_for_stops(stops: float, profile: str = "aggressive") -> float:
@@ -277,42 +291,102 @@ def refine_exposure_stops(
     mask: np.ndarray,
     initial_stops: float,
     profile: str,
+    solver: str = "adaptive_fast",
     raw_obj=None,
     *,
     base_scale: float = 1.0,
     no_auto_bright: bool = False,
 ) -> float:
-    """Iteratively refine aggressive profile for residual over/under-exposure."""
+    """Refine aggressive exposure stops using one of several solver strategies.
+
+    Solver modes:
+    - legacy_iterative: 3-pass residual refinement (highest quality, slowest).
+    - two_pass: up to 2 passes.
+    - single_pass: up to 1 pass.
+    - predictive_fast: no refinement postprocess calls; applies a bounded analytic bias.
+    - adaptive_fast: chooses one- or two-pass refinement based on stop magnitude.
+    """
+
+    def _refine_loop(
+        start_stops: float,
+        max_iters: int,
+        residual_tolerance: float,
+        gain_positive: float,
+        gain_negative: float,
+    ) -> float:
+        total_local = float(start_stops)
+        for _ in range(int(max(0, max_iters))):
+            corrected = apply_exposure_correction(
+                img,
+                total_local,
+                raw_obj,
+                base_scale=base_scale,
+                no_auto_bright=no_auto_bright,
+                profile=profile_name,
+            )
+            residual = compute_exposure_stops(corrected, mask, profile_name)
+            if not np.isfinite(residual):
+                break
+            residual = float(residual)
+            if abs(residual) <= residual_tolerance:
+                break
+
+            gain = float(gain_positive if residual > 0.0 else gain_negative)
+            updated = float(np.clip(total_local + residual * gain, -2.0, 3.0))
+            if abs(updated - total_local) <= 0.01:
+                total_local = updated
+                break
+            total_local = updated
+            if total_local <= -1.95 or total_local >= 2.95:
+                break
+        return total_local
+
+    def _predictive_fast(stops_val: float) -> float:
+        # Fast path with no extra RAW postprocess calls. The mapping applies a
+        # bounded profile bias so results remain close to iterative refinement.
+        s = float(stops_val)
+        mag = abs(s)
+        if mag <= 0.10:
+            return float(np.clip(s, -2.0, 3.0))
+        if s > 0.0:
+            boost = min(0.28, 0.10 + 0.18 * min(1.0, mag / 2.0))
+            s = s + boost * min(1.0, mag / 2.2)
+        else:
+            boost = min(0.22, 0.06 + 0.16 * min(1.0, mag / 2.0))
+            s = s - boost * min(1.0, mag / 2.0)
+        return float(np.clip(s, -2.0, 3.0))
+
     total = float(initial_stops)
     profile_name = normalize_profile_name(profile)
+    solver_name = normalize_solver_name(solver)
     if profile_name != "aggressive":
         return total
+
     residual_tolerance = 0.02
     if abs(total) <= residual_tolerance:
         return total
 
-    for _ in range(3):
-        corrected = apply_exposure_correction(
-            img,
-            total,
-            raw_obj,
-            base_scale=base_scale,
-            no_auto_bright=no_auto_bright,
-            profile=profile_name,
-        )
-        residual = compute_exposure_stops(corrected, mask, profile_name)
-        if not np.isfinite(residual):
-            break
-        if abs(float(residual)) <= residual_tolerance:
-            break
-        if residual > 0.0:
-            total += residual * 0.75
-        else:
-            total += residual * 0.90
-        total = float(np.clip(total, -2.0, 3.0))
-        if total <= -1.95 or total >= 2.95:
-            break
-    return total
+    if solver_name == "predictive_fast":
+        return _predictive_fast(total)
+
+    if solver_name == "legacy_iterative":
+        return _refine_loop(total, max_iters=3, residual_tolerance=residual_tolerance, gain_positive=0.75, gain_negative=0.90)
+
+    if solver_name == "two_pass":
+        return _refine_loop(total, max_iters=2, residual_tolerance=residual_tolerance, gain_positive=0.74, gain_negative=0.88)
+
+    if solver_name == "single_pass":
+        return _refine_loop(total, max_iters=1, residual_tolerance=residual_tolerance, gain_positive=0.72, gain_negative=0.86)
+
+    # adaptive_fast (default): aggressively reduce postprocess calls while
+    # preserving behavior on hard cases with a bounded second pass.
+    if abs(total) < 0.45:
+        return total
+    if raw_obj is None:
+        return _refine_loop(total, max_iters=1, residual_tolerance=residual_tolerance, gain_positive=0.70, gain_negative=0.84)
+    if abs(total) < 1.20:
+        return _refine_loop(total, max_iters=1, residual_tolerance=residual_tolerance, gain_positive=0.72, gain_negative=0.86)
+    return _refine_loop(total, max_iters=2, residual_tolerance=residual_tolerance, gain_positive=0.74, gain_negative=0.88)
 
 
 def apply_exposure_correction(

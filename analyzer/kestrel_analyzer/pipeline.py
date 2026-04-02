@@ -97,6 +97,7 @@ class AnalysisPipeline:
         mask: np.ndarray,
         initial_stops: float,
         profile: str,
+        solver: str = "adaptive_fast",
         raw_obj=None,
         *,
         base_scale: float = 1.0,
@@ -107,6 +108,7 @@ class AnalysisPipeline:
             mask,
             initial_stops,
             profile,
+            solver=solver,
             raw_obj=raw_obj,
             base_scale=base_scale,
             no_auto_bright=no_auto_bright,
@@ -210,6 +212,7 @@ class AnalysisPipeline:
 
         rating_thresholds = None
         exposure_profile = "aggressive"
+        exposure_solver = "adaptive_fast"
         if callable(load_persisted_settings):
             try:
                 sett = load_persisted_settings() or {}
@@ -218,6 +221,9 @@ class AnalysisPipeline:
                 raw_exp_profile = str(sett.get('exposure_compensation_profile', 'aggressive') or 'aggressive').strip().lower()
                 if raw_exp_profile in {'lenient', 'normal', 'aggressive'}:
                     exposure_profile = raw_exp_profile
+                raw_exp_solver = str(sett.get('exposure_compensation_solver', 'adaptive_fast') or 'adaptive_fast').strip().lower()
+                if raw_exp_solver in {'legacy_iterative', 'two_pass', 'single_pass', 'predictive_fast', 'adaptive_fast'}:
+                    exposure_solver = raw_exp_solver
             except Exception:
                 rating_thresholds = None
 
@@ -590,6 +596,7 @@ class AnalysisPipeline:
                             masks[primary_mask_i],
                             stops,
                             exposure_profile,
+                            solver=exposure_solver,
                             raw_obj=raw_obj,
                             base_scale=raw_meter_scale,
                             no_auto_bright=raw_obj is not None,
@@ -647,6 +654,7 @@ class AnalysisPipeline:
                                 masks[i],
                                 stops,
                                 exposure_profile,
+                                solver=exposure_solver,
                                 raw_obj=raw_obj,
                                 base_scale=raw_meter_scale,
                                 no_auto_bright=raw_obj is not None,

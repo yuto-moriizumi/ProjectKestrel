@@ -3995,6 +3995,13 @@
         const savedExpProfile = String(getSetting('exposure_compensation_profile', 'aggressive') || 'aggressive').toLowerCase();
         expProfileEl.value = ['lenient', 'normal', 'aggressive'].includes(savedExpProfile) ? savedExpProfile : 'aggressive';
       }
+      const expSolverEl = document.getElementById('exposureCompensationSolver');
+      if (expSolverEl) {
+        const savedExpSolver = String(getSetting('exposure_compensation_solver', 'adaptive_fast') || 'adaptive_fast').toLowerCase();
+        expSolverEl.value = ['adaptive_fast', 'single_pass', 'two_pass', 'predictive_fast', 'legacy_iterative'].includes(savedExpSolver)
+          ? savedExpSolver
+          : 'adaptive_fast';
+      }
       // RAW preview cache
       const rawCacheCb = document.getElementById('rawPreviewCacheEnabled');
       if (rawCacheCb) rawCacheCb.checked = getSetting('raw_preview_cache_enabled', true);
@@ -4049,6 +4056,11 @@
       const exposureCompensationProfileSafe = ['lenient', 'normal', 'aggressive'].includes(exposureCompensationProfile)
         ? exposureCompensationProfile
         : 'aggressive';
+      const expSolverEl2 = document.getElementById('exposureCompensationSolver');
+      const exposureCompensationSolver = (expSolverEl2 ? String(expSolverEl2.value || 'adaptive_fast') : 'adaptive_fast').toLowerCase();
+      const exposureCompensationSolverSafe = ['adaptive_fast', 'single_pass', 'two_pass', 'predictive_fast', 'legacy_iterative'].includes(exposureCompensationSolver)
+        ? exposureCompensationSolver
+        : 'adaptive_fast';
       const rawCacheCb2 = document.getElementById('rawPreviewCacheEnabled');
       const rawPreviewCacheEnabled = rawCacheCb2 ? rawCacheCb2.checked : true;
       const autoSaveCb = document.getElementById('settingsAutoSave');
@@ -4075,6 +4087,7 @@
         mask_threshold: maskThreshold,
         max_bird_crops: maxBirdCrops,
         exposure_compensation_profile: exposureCompensationProfileSafe,
+        exposure_compensation_solver: exposureCompensationSolverSafe,
         raw_preview_cache_enabled: rawPreviewCacheEnabled,
         auto_save_enabled: autoSaveEnabled,
         raw_exposure_correction_disabled: document.getElementById('rawExposureCorrectionDisabled').checked,
