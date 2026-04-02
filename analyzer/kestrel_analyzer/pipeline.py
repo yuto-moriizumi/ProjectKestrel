@@ -97,7 +97,7 @@ class AnalysisPipeline:
         mask: np.ndarray,
         initial_stops: float,
         profile: str,
-        solver: str = "adaptive_fast",
+        solver: str = "convergent_two_pass",
         raw_obj=None,
         *,
         base_scale: float = 1.0,
@@ -212,7 +212,7 @@ class AnalysisPipeline:
 
         rating_thresholds = None
         exposure_profile = "aggressive"
-        exposure_solver = "adaptive_fast"
+        exposure_solver = "convergent_two_pass"
         if callable(load_persisted_settings):
             try:
                 sett = load_persisted_settings() or {}
@@ -221,8 +221,8 @@ class AnalysisPipeline:
                 raw_exp_profile = str(sett.get('exposure_compensation_profile', 'aggressive') or 'aggressive').strip().lower()
                 if raw_exp_profile in {'lenient', 'normal', 'aggressive'}:
                     exposure_profile = raw_exp_profile
-                raw_exp_solver = str(sett.get('exposure_compensation_solver', 'adaptive_fast') or 'adaptive_fast').strip().lower()
-                if raw_exp_solver in {'legacy_iterative', 'two_pass', 'single_pass', 'predictive_fast', 'adaptive_fast'}:
+                raw_exp_solver = str(sett.get('exposure_compensation_solver', 'convergent_two_pass') or 'convergent_two_pass').strip().lower()
+                if raw_exp_solver in {'legacy_iterative', 'convergent_two_pass', 'lifted_two_pass', 'two_pass', 'single_pass', 'predictive_fast', 'adaptive_fast'}:
                     exposure_solver = raw_exp_solver
             except Exception:
                 rating_thresholds = None

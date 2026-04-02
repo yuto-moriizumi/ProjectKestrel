@@ -18,7 +18,7 @@ _ALLOWED_EDITORS = {
 }
 _ALLOWED_RATING_PROFILES = {'very_strict', 'strict', 'balanced', 'lenient', 'very_lenient'}
 _ALLOWED_EXPOSURE_PROFILES = {'lenient', 'normal', 'aggressive'}
-_ALLOWED_EXPOSURE_SOLVERS = {'legacy_iterative', 'two_pass', 'single_pass', 'predictive_fast', 'adaptive_fast'}
+_ALLOWED_EXPOSURE_SOLVERS = {'legacy_iterative', 'convergent_two_pass', 'lifted_two_pass', 'two_pass', 'single_pass', 'predictive_fast', 'adaptive_fast'}
 _ALLOWED_QUEUE_ITEM_STATUSES = {'pending', 'running', 'done', 'error', 'cancelled'}
 
 # Telemetry — failsafe import (never blocks startup)
@@ -305,7 +305,7 @@ def _sanitize_settings_payload(data: dict, emit_log: bool = False) -> dict:
         out['exposure_compensation_solver'] = _coerce_enum(
             data.get('exposure_compensation_solver'),
             _ALLOWED_EXPOSURE_SOLVERS,
-            default='adaptive_fast',
+            default='convergent_two_pass',
         )
 
     _set_bool('raw_preview_cache_enabled', default=True)

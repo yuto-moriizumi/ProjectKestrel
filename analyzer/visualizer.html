@@ -474,7 +474,9 @@
       <div class="row">
         <label for="exposureCompensationSolver">Exposure Solver Speed / Accuracy</label>
         <select id="exposureCompensationSolver">
-          <option value="adaptive_fast" selected>Adaptive Fast &mdash; usually 1 pass, uses 2 on harder cases</option>
+          <option value="convergent_two_pass" selected>Convergent Two Pass &mdash; two-pass solver with accelerated tail correction</option>
+          <option value="lifted_two_pass">Lifted Two Pass &mdash; near-legacy output with reduced passes</option>
+          <option value="adaptive_fast">Adaptive Fast &mdash; usually 1 pass, uses 2 on harder cases</option>
           <option value="single_pass">Single Pass &mdash; fastest residual refinement (1 pass max)</option>
           <option value="two_pass">Two Pass &mdash; closer to iterative with reduced compute</option>
           <option value="predictive_fast">Predictive Fast &mdash; no refinement postprocess calls</option>

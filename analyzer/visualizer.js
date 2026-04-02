@@ -3997,10 +3997,10 @@
       }
       const expSolverEl = document.getElementById('exposureCompensationSolver');
       if (expSolverEl) {
-        const savedExpSolver = String(getSetting('exposure_compensation_solver', 'adaptive_fast') || 'adaptive_fast').toLowerCase();
-        expSolverEl.value = ['adaptive_fast', 'single_pass', 'two_pass', 'predictive_fast', 'legacy_iterative'].includes(savedExpSolver)
+        const savedExpSolver = String(getSetting('exposure_compensation_solver', 'convergent_two_pass') || 'convergent_two_pass').toLowerCase();
+        expSolverEl.value = ['convergent_two_pass', 'lifted_two_pass', 'adaptive_fast', 'single_pass', 'two_pass', 'predictive_fast', 'legacy_iterative'].includes(savedExpSolver)
           ? savedExpSolver
-          : 'adaptive_fast';
+          : 'convergent_two_pass';
       }
       // RAW preview cache
       const rawCacheCb = document.getElementById('rawPreviewCacheEnabled');
@@ -4057,10 +4057,10 @@
         ? exposureCompensationProfile
         : 'aggressive';
       const expSolverEl2 = document.getElementById('exposureCompensationSolver');
-      const exposureCompensationSolver = (expSolverEl2 ? String(expSolverEl2.value || 'adaptive_fast') : 'adaptive_fast').toLowerCase();
-      const exposureCompensationSolverSafe = ['adaptive_fast', 'single_pass', 'two_pass', 'predictive_fast', 'legacy_iterative'].includes(exposureCompensationSolver)
+      const exposureCompensationSolver = (expSolverEl2 ? String(expSolverEl2.value || 'convergent_two_pass') : 'convergent_two_pass').toLowerCase();
+      const exposureCompensationSolverSafe = ['convergent_two_pass', 'lifted_two_pass', 'adaptive_fast', 'single_pass', 'two_pass', 'predictive_fast', 'legacy_iterative'].includes(exposureCompensationSolver)
         ? exposureCompensationSolver
-        : 'adaptive_fast';
+        : 'convergent_two_pass';
       const rawCacheCb2 = document.getElementById('rawPreviewCacheEnabled');
       const rawPreviewCacheEnabled = rawCacheCb2 ? rawCacheCb2.checked : true;
       const autoSaveCb = document.getElementById('settingsAutoSave');
