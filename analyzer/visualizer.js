@@ -1,20 +1,69 @@
-    // State
-    // NOTE: Two modes for file access:
-    // 1. Python API mode (desktop app): Uses rootPath + Python backend API calls
-    // 2. File System Access API mode (browser): Uses rootDirHandle for direct file access
-    // The getBlobUrlForPath function automatically chooses the best available method
-    let rootDirHandle = null;      // Top-level photo folder (contains .kestrel) - for File System Access API
-    let rootIsKestrel = false;     // True if user selected the .kestrel folder itself
-    let rootPath = '';             // Absolute path to root folder (for Python API)
-    let csvFileHandle = null;      // .kestrel/kestrel_database.csv
+    // State (desktop mode only)
+    let rootPath = '';             // Absolute path to root folder (desktop pywebview mode)
     let rows = [];                 // CSV rows (objects)
     let _scenedata = {};           // Map of rootPath → kestrel_scenedata.json contents
     let header = [];               // CSV header fields
     let scenes = [];               // Aggregated scene objects
     let dirty = false;             // Track unsaved edits
+    let _dirtyRoots = new Set();   // In desktop mode, tracks which folder roots have unsaved edits
+    let _dirtyRootsUnknown = false; // True when an edit can't be scoped to a specific root
     // Notify Python backend whenever dirty state changes (for close-prompt)
     function _notifyDirty(val) {
       try { if (window.pywebview?.api?.notify_dirty) window.pywebview.api.notify_dirty(!!val); } catch (_) {}
+    }
+    function _normalizeRootPath(v) {
+      return String(v || '').trim();
+    }
+    function _addDirtyRoot(rootCandidate) {
+      const rp = _normalizeRootPath(rootCandidate);
+      if (!rp) return false;
+      _dirtyRoots.add(rp);
+      return true;
+    }
+    function _markDirtyRoots(rootHint) {
+      let marked = false;
+      const collect = (value) => {
+        if (!value) return;
+        if (typeof value === 'string') {
+          marked = _addDirtyRoot(value) || marked;
+          return;
+        }
+        if (Array.isArray(value)) {
+          for (const entry of value) collect(entry);
+          return;
+        }
+        if (value instanceof Set) {
+          for (const entry of value) collect(entry);
+          return;
+        }
+        if (typeof value !== 'object') return;
+        if (Object.prototype.hasOwnProperty.call(value, '__rootPath')) {
+          marked = _addDirtyRoot(value.__rootPath) || marked;
+        }
+        if (Object.prototype.hasOwnProperty.call(value, 'rootPath')) {
+          marked = _addDirtyRoot(value.rootPath) || marked;
+        }
+        if (value.representative && typeof value.representative === 'object') {
+          marked = _addDirtyRoot(value.representative.__rootPath) || marked;
+        }
+        if (Array.isArray(value.images)) {
+          for (const img of value.images) collect(img);
+        }
+      };
+      collect(rootHint);
+      return marked;
+    }
+    function _clearDirtyRoots() {
+      _dirtyRoots.clear();
+      _dirtyRootsUnknown = false;
+    }
+    function _setDirtyUi(isDirty) {
+      dirty = !!isDirty;
+      _notifyDirty(dirty);
+      const saveBtn = document.getElementById('saveCsv');
+      if (saveBtn) saveBtn.disabled = !dirty;
+      const revertBtn = document.getElementById('revertCsv');
+      if (revertBtn) revertBtn.disabled = !dirty;
     }
     let _cleanSnapshot = null;      // Snapshot of rows+header at last clean state (load or save)
     let selectedSceneIds = new Set(); // Multi-select: selected scene IDs ("slot:count")
@@ -24,6 +73,13 @@
     let _focusedCardId = null;         // Scene ID of the keyboard-focused card in the grid
     // Track which scene dialog is open for refreshing filters
     let currentSceneId = null;
+    const SCENE_PREVIEW_SPLIT_KEY = 'scene_preview_split_ratio';
+    const SCENE_PREVIEW_SPLIT_DEFAULT = 0.68;
+    const SCENE_PREVIEW_SPLIT_MIN = 0.25;
+    const SCENE_PREVIEW_SPLIT_MAX = 0.85;
+    const SCENE_PREVIEW_MIN_EXPORT_PX = 180;
+    const SCENE_PREVIEW_MIN_CROP_PX = 140;
+    let _scenePreviewSplitRatio = SCENE_PREVIEW_SPLIT_DEFAULT;
 
     const el = (sel) => document.querySelector(sel);
     const sceneGrid = el('#sceneGrid');
@@ -32,12 +88,43 @@
     const sceneDlg = el('#sceneDlg');
     const versionBadge = el('#versionBadge');
 
-    const supportsFS = 'showDirectoryPicker' in window;
-    let hasPywebviewApi = typeof window.pywebview !== 'undefined';
+    let hasPywebviewApi = !!(window.pywebview && window.pywebview.api);
+
+    // ── Global error handlers ─────────────────────────────────────────────────
+    // Catch unhandled synchronous exceptions and unhandled promise rejections.
+    // Forward them to the Python log via report_js_error so they appear in the
+    // runtime log file even when DevTools isn't open.
+    window.onerror = function (msg, source, line, col, err) {
+      const payload = {
+        type: 'uncaught_exception',
+        msg: String(msg || '').slice(0, 500),
+        source: String(source || '').slice(0, 200),
+        line,
+        col,
+        stack: err?.stack ? String(err.stack).slice(0, 1500) : '',
+      };
+      console.error('[Kestrel] Uncaught JS exception:', payload);
+      try {
+        window.pywebview?.api?.report_js_error?.(payload)?.catch?.(() => {});
+      } catch (_) {}
+      return false; // don't suppress — let DevTools still see it
+    };
+    window.addEventListener('unhandledrejection', function (ev) {
+      const reason = ev.reason;
+      const payload = {
+        type: 'unhandled_rejection',
+        msg: String(reason?.message || reason || '').slice(0, 500),
+        stack: reason?.stack ? String(reason.stack).slice(0, 1500) : '',
+      };
+      console.error('[Kestrel] Unhandled promise rejection:', payload);
+      try {
+        window.pywebview?.api?.report_js_error?.(payload)?.catch?.(() => {});
+      } catch (_) {}
+    });
+    // ─────────────────────────────────────────────────────────────────────────
 
     // Debug: Log what APIs are available (initial check)
     console.log('[DEBUG] Initial API Detection:');
-    console.log('  - File System Access API (showDirectoryPicker):', supportsFS);
     console.log('  - Pywebview API (window.pywebview):', hasPywebviewApi);
     if (hasPywebviewApi) {
       console.log('  - window.pywebview object:', window.pywebview);
@@ -71,17 +158,19 @@
       return false;
     }
 
-    // Start checking for pywebview immediately and update UI when ready
+    // Desktop mode requires pywebview API at startup.
     (async function() {
       const apiReady = !hasPywebviewApi ? await waitForPywebview() : true;
+      if (!apiReady) {
+        setStatus('Error: Desktop API unavailable. Please relaunch Project Kestrel.');
+        const compat = el('#compat');
+        if (compat) compat.classList.remove('hidden');
+        return;
+      }
+      hasPywebviewApi = true;
       // After API is ready, check legal agreement
       checkLegalAgreement();
-      // Show/hide compatibility warning
-      if (!supportsFS && !apiReady) {
-        el('#compat').classList.remove('hidden');
-      } else if (apiReady) {
-        el('#compat').classList.add('hidden');
-      }
+      el('#compat').classList.add('hidden');
       // After API is confirmed ready, wait for settings to be hydrated, then check donation threshold
       await new Promise(function(r) { setTimeout(r, 500); });
       // Hydrate settings from server to ensure localStorage has the latest data
@@ -513,52 +602,11 @@
       return a.replace(/\/$/, '') + '/' + b.replace(/^\//, '');
     }
 
-    async function getHandleFromRelativePath(dirHandle, relPath) {
-      relPath = sanitizePath(relPath);
-      if (rootIsKestrel && relPath.toLowerCase().startsWith('.kestrel/')) {
-        relPath = relPath.substring('.kestrel/'.length);
+    function parseCsvText(text) {
+      if (!window.KestrelCsv || typeof window.KestrelCsv.parse !== 'function') {
+        throw new Error('CSV parser unavailable (csv_parser.js not loaded)');
       }
-      const parts = relPath.split('/').filter(Boolean);
-      let handle = dirHandle;
-      for (let i = 0; i < parts.length; i++) {
-        const isLast = i === parts.length - 1;
-        try {
-          handle = await handle.getDirectoryHandle(parts[i]);
-        } catch (e) {
-          if (isLast) {
-            // maybe file
-            try { return await handle.getFileHandle(parts[i]); } catch (_) { throw e; }
-          } else {
-            throw e;
-          }
-        }
-      }
-      return handle;
-    }
-
-    // Try to turn an absolute Windows path into a path relative to the selected root
-    // Also handles paths that are already relative (from new relative roots format)
-    function toRootRelative(absPath) {
-      if (!absPath || !rootDirHandle) return null;
-      const p = sanitizePath(absPath);
-
-      // Check if path is ALREADY relative (new format)
-      // Relative paths start with .kestrel/ or kestrel/ and don't have drive letters or leading /
-      if (p.toLowerCase().startsWith('.kestrel/') || p.toLowerCase().startsWith('kestrel/')) {
-        // Already relative - return as-is, but strip .kestrel/ prefix if rootIsKestrel
-        return rootIsKestrel ? p.replace(/^\.?kestrel\//i, '') : p;
-      }
-
-      // Check for absolute path with embedded .kestrel folder (old format)
-      const idx = p.toLowerCase().lastIndexOf('/.kestrel/');
-      if (idx >= 0) {
-        const rel = p.substring(idx + 1); // include .kestrel/…
-        return rootIsKestrel ? rel.replace(/^\.kestrel\//i, '') : rel;
-      }
-
-      // fallback: if only filename, return that
-      const base = p.split('/').pop();
-      return base || null;
+      return window.KestrelCsv.parse(text, { header: true, skipEmptyLines: true });
     }
 
 
@@ -601,19 +649,6 @@
           }
         } catch (e) {
           console.error('Python API image read failed:', e);
-          return null;
-        }
-      }
-
-      // PRIORITY 2: File System Access API (browser mode only)
-      if (!rootPath && rootDirHandle) {
-        try {
-          const fileHandle = await getHandleFromRelativePath(rootDirHandle, rel);
-          const file = await fileHandle.getFile();
-          const url = URL.createObjectURL(file);
-          blobUrlCache.set(cacheKey, url);
-          return url;
-        } catch (e) {
           return null;
         }
       }
@@ -734,17 +769,252 @@
       return result;
     }
 
+    const _sceneActiveCropIndexByImage = new Map();
+
+    function _cropStateKey(row) {
+      return `${row?.__rootPath || rootPath || ''}|${row?.filename || ''}`;
+    }
+
+    function _numberOr(value, fallback = 0) {
+      const n = parseFloat(value);
+      return Number.isFinite(n) ? n : fallback;
+    }
+
+    function _intOr(value, fallback = 0) {
+      const n = parseInt(value, 10);
+      return Number.isFinite(n) ? n : fallback;
+    }
+
+    function _clamp01(value, fallback) {
+      const n = parseFloat(value);
+      if (!Number.isFinite(n)) return fallback;
+      return Math.max(0, Math.min(1, n));
+    }
+
+    function _fullFrameBbox() {
+      return {
+        x_min_norm: 0,
+        x_max_norm: 1,
+        y_min_norm: 0,
+        y_max_norm: 1,
+        x_center_norm: 0.5,
+        y_center_norm: 0.5,
+      };
+    }
+
+    function _normalizeCropBbox(rawBbox) {
+      const b = rawBbox && typeof rawBbox === 'object' ? rawBbox : {};
+      const norm = {
+        x_min_norm: _clamp01(b.x_min_norm, 0),
+        x_max_norm: _clamp01(b.x_max_norm, 1),
+        y_min_norm: _clamp01(b.y_min_norm, 0),
+        y_max_norm: _clamp01(b.y_max_norm, 1),
+        x_center_norm: _clamp01(b.x_center_norm, 0.5),
+        y_center_norm: _clamp01(b.y_center_norm, 0.5),
+      };
+      if (norm.x_max_norm <= norm.x_min_norm) norm.x_max_norm = Math.min(1, norm.x_min_norm + 0.01);
+      if (norm.y_max_norm <= norm.y_min_norm) norm.y_max_norm = Math.min(1, norm.y_min_norm + 0.01);
+      norm.x_center_norm = Math.max(norm.x_min_norm, Math.min(norm.x_max_norm, norm.x_center_norm));
+      norm.y_center_norm = Math.max(norm.y_min_norm, Math.min(norm.y_max_norm, norm.y_center_norm));
+      return norm;
+    }
+
+    function _invalidateRowCropCache(row) {
+      if (!row) return;
+      delete row.__cropRecordsCache;
+    }
+
+    function _serializeCropRecords(crops) {
+      return (Array.isArray(crops) ? crops : []).map((crop, idx) => ({
+        crop_index: _intOr(crop?.crop_index, idx),
+        crop_path: String(crop?.crop_path || ''),
+        detection_index: _intOr(crop?.detection_index, -1),
+        detection_confidence: _numberOr(crop?.detection_confidence, 0),
+        species: String(crop?.species || 'Unknown'),
+        species_confidence: _numberOr(crop?.species_confidence, 0),
+        family: String(crop?.family || 'Unknown'),
+        family_confidence: _numberOr(crop?.family_confidence, 0),
+        quality: _numberOr(crop?.quality, -1),
+        rating: Math.max(0, Math.min(5, _intOr(crop?.rating, 0))),
+        exposure_correction: _numberOr(crop?.exposure_correction, 0),
+        exposure_pipeline: getRowExposurePipelineMode(crop),
+        exposure_subject_stops: _numberOr(crop?.exposure_subject_stops, 0),
+        exposure_meter_scale: _numberOr(crop?.exposure_meter_scale, 1),
+        bbox: _normalizeCropBbox(crop?.bbox),
+      }));
+    }
+
+    function getRowCropRecords(row) {
+      if (!row) return [];
+      if (row.__cropRecordsCache) return row.__cropRecordsCache;
+
+      let parsed = [];
+      const raw = String(row.crops_json || '').trim();
+      if (raw) {
+        try {
+          const maybeArray = JSON.parse(raw);
+          if (Array.isArray(maybeArray)) parsed = maybeArray;
+        } catch (_) {
+          parsed = [];
+        }
+      }
+
+      const normalized = [];
+      for (let i = 0; i < parsed.length; i++) {
+        const src = parsed[i];
+        if (!src || typeof src !== 'object') continue;
+        const fallbackPath = i === 0 ? String(row.crop_path || '') : '';
+        const cropPath = String(src.crop_path || fallbackPath || '').trim();
+        if (!cropPath && i > 0) continue;
+        normalized.push({
+          crop_index: _intOr(src.crop_index, i),
+          crop_path: cropPath,
+          detection_index: _intOr(src.detection_index, -1),
+          detection_confidence: _numberOr(src.detection_confidence, 0),
+          species: String(src.species || row.species || 'Unknown'),
+          species_confidence: _numberOr(src.species_confidence, _numberOr(row.species_confidence, 0)),
+          family: String(src.family || row.family || 'Unknown'),
+          family_confidence: _numberOr(src.family_confidence, _numberOr(row.family_confidence, 0)),
+          quality: _numberOr(src.quality, _numberOr(row.quality, -1)),
+          rating: Math.max(0, Math.min(5, _intOr(src.rating, 0))),
+          exposure_correction: _numberOr(src.exposure_correction, _numberOr(row.exposure_correction, 0)),
+          exposure_pipeline: String(src.exposure_pipeline || row.exposure_pipeline || 'legacy_auto_bright_v1').trim().toLowerCase() === 'no_auto_bright_metered_v1'
+            ? 'no_auto_bright_metered_v1'
+            : 'legacy_auto_bright_v1',
+          exposure_subject_stops: _numberOr(src.exposure_subject_stops, _numberOr(row.exposure_subject_stops, 0)),
+          exposure_meter_scale: _numberOr(src.exposure_meter_scale, _numberOr(row.exposure_meter_scale, 1)),
+          bbox: _normalizeCropBbox(src.bbox),
+        });
+      }
+
+      if (!normalized.length && row.crop_path) {
+        normalized.push({
+          crop_index: 0,
+          crop_path: String(row.crop_path || ''),
+          detection_index: -1,
+          detection_confidence: 0,
+          species: String(row.species || 'Unknown'),
+          species_confidence: _numberOr(row.species_confidence, 0),
+          family: String(row.family || 'Unknown'),
+          family_confidence: _numberOr(row.family_confidence, 0),
+          quality: _numberOr(row.quality, -1),
+          rating: Math.max(0, Math.min(5, _intOr(row.normalized_rating, 0))),
+          exposure_correction: _numberOr(row.exposure_correction, 0),
+          exposure_pipeline: getRowExposurePipelineMode(row),
+          exposure_subject_stops: _numberOr(row.exposure_subject_stops, 0),
+          exposure_meter_scale: _numberOr(row.exposure_meter_scale, 1),
+          bbox: _fullFrameBbox(),
+        });
+      }
+
+      row.__cropRecordsCache = normalized;
+      return normalized;
+    }
+
+    function getRowPrimaryCropIndex(row, crops = null) {
+      const list = Array.isArray(crops) ? crops : getRowCropRecords(row);
+      if (!list.length) return 0;
+      const explicit = _intOr(row?.primary_crop_index, -1);
+      if (explicit >= 0 && explicit < list.length) return explicit;
+      const path = String(row?.crop_path || '').trim();
+      if (path) {
+        const idx = list.findIndex(c => String(c.crop_path || '') === path);
+        if (idx >= 0) return idx;
+      }
+      return 0;
+    }
+
+    function getRowActiveCropIndex(row, crops = null) {
+      const list = Array.isArray(crops) ? crops : getRowCropRecords(row);
+      if (!list.length) return 0;
+      const key = _cropStateKey(row);
+      const stored = _sceneActiveCropIndexByImage.get(key);
+      if (Number.isFinite(stored) && stored >= 0 && stored < list.length) return stored;
+      const primary = getRowPrimaryCropIndex(row, list);
+      _sceneActiveCropIndexByImage.set(key, primary);
+      return primary;
+    }
+
+    function setRowActiveCropIndex(row, nextIndex, crops = null) {
+      const list = Array.isArray(crops) ? crops : getRowCropRecords(row);
+      if (!list.length) return 0;
+      const clamped = Math.max(0, Math.min(list.length - 1, _intOr(nextIndex, 0)));
+      _sceneActiveCropIndexByImage.set(_cropStateKey(row), clamped);
+      return clamped;
+    }
+
+    function getRowActiveCropState(row) {
+      const crops = getRowCropRecords(row);
+      const activeIndex = getRowActiveCropIndex(row, crops);
+      return {
+        crops,
+        activeIndex,
+        activeCrop: crops[activeIndex] || null,
+        primaryIndex: getRowPrimaryCropIndex(row, crops),
+      };
+    }
+
+    function promoteActiveCropToPrimary(row) {
+      const crops = getRowCropRecords(row);
+      if (!crops.length) return false;
+      const nextPrimary = getRowActiveCropIndex(row, crops);
+      const prevPrimary = getRowPrimaryCropIndex(row, crops);
+      const crop = crops[nextPrimary];
+      if (!crop) return false;
+
+      const changed = prevPrimary !== nextPrimary || String(row.crop_path || '') !== String(crop.crop_path || '');
+      row.primary_crop_index = String(nextPrimary);
+      row.crop_path = crop.crop_path || row.crop_path || '';
+      row.species = crop.species || row.species || 'Unknown';
+      row.species_confidence = _numberOr(crop.species_confidence, _numberOr(row.species_confidence, 0));
+      row.family = crop.family || row.family || 'Unknown';
+      row.family_confidence = _numberOr(crop.family_confidence, _numberOr(row.family_confidence, 0));
+      row.quality = _numberOr(crop.quality, _numberOr(row.quality, -1));
+      row.exposure_correction = _numberOr(crop.exposure_correction, _numberOr(row.exposure_correction, 0));
+      row.exposure_pipeline = getRowExposurePipelineMode(crop);
+      row.exposure_subject_stops = _numberOr(crop.exposure_subject_stops, _numberOr(row.exposure_subject_stops, 0));
+      row.exposure_meter_scale = _numberOr(crop.exposure_meter_scale, _numberOr(row.exposure_meter_scale, 1));
+
+      const origin = String(getOrigin(row) || '').toLowerCase();
+      if (origin !== 'manual') {
+        const autoRating = Math.max(0, Math.min(5, _intOr(crop.rating, 0)));
+        row.normalized_rating = String(autoRating);
+        row.__normalized_rating = autoRating;
+        row.rating_origin = 'auto';
+      }
+
+      row.crops_json = JSON.stringify(_serializeCropRecords(crops));
+      _invalidateRowCropCache(row);
+      setRowActiveCropIndex(row, nextPrimary, crops);
+
+      if (changed) markDirty(row);
+      return changed;
+    }
+
     function ensureSceneNameColumn() {
       if (!header.includes('scene_name')) { header.push('scene_name'); }
       for (const r of rows) if (!('scene_name' in r)) r.scene_name = '';
     }
 
+    function ensureCropColumns() {
+      if (!header.includes('crops_json')) header.push('crops_json');
+      if (!header.includes('primary_crop_index')) header.push('primary_crop_index');
+      for (const r of rows) {
+        if (!('crops_json' in r)) r.crops_json = '';
+        if (!('primary_crop_index' in r) || r.primary_crop_index === '') r.primary_crop_index = '0';
+      }
+    }
+
     // Ensure rating columns exist and default values are set
     function ensureRatingColumns() {
+      ensureCropColumns();
       if (!header.includes('rating')) header.push('rating');
       if (!header.includes('rating_origin')) header.push('rating_origin');
       if (!header.includes('normalized_rating')) header.push('normalized_rating');
       if (!header.includes('exposure_correction')) header.push('exposure_correction');
+      if (!header.includes('exposure_pipeline')) header.push('exposure_pipeline');
+      if (!header.includes('exposure_subject_stops')) header.push('exposure_subject_stops');
+      if (!header.includes('exposure_meter_scale')) header.push('exposure_meter_scale');
       if (!header.includes('detection_scores')) header.push('detection_scores');
       if (!header.includes('culled')) header.push('culled');
       if (!header.includes('culled_origin')) header.push('culled_origin');
@@ -753,9 +1023,13 @@
         if (!('rating_origin' in r)) r.rating_origin = '';
         if (!('normalized_rating' in r)) r.normalized_rating = '';
         if (!('exposure_correction' in r)) r.exposure_correction = '0';
+        if (!('exposure_pipeline' in r)) r.exposure_pipeline = 'legacy_auto_bright_v1';
+        if (!('exposure_subject_stops' in r)) r.exposure_subject_stops = '0';
+        if (!('exposure_meter_scale' in r)) r.exposure_meter_scale = '1';
         if (!('detection_scores' in r)) r.detection_scores = '';
         if (!('culled' in r)) r.culled = '';
         if (!('culled_origin' in r)) r.culled_origin = '';
+        r.exposure_pipeline = getRowExposurePipelineMode(r);
         r.culled_origin = normalizeCullOrigin(r);
       }
     }
@@ -874,6 +1148,24 @@
     // Helper: is this image manually rated (>0 stars)?
     function isManualRated(r) { return getRating(r) > 0 && getOrigin(r) === 'manual'; }
 
+    function isManualCullDecision(r) {
+      const status = getCullStatus(r);
+      return status === 'accept' || status === 'reject';
+    }
+
+    function hasReviewedSceneMetadata(scene) {
+      if (!scene) return false;
+      if (scene.isApproved) return true;
+      return String(scene.sceneName || '').trim().length > 0;
+    }
+
+    function isManuallyReviewedScene(scene) {
+      if (!scene) return false;
+      if (hasReviewedSceneMetadata(scene)) return true;
+      return Array.isArray(scene.images)
+        && scene.images.some(r => isManualRated(r) || isManualCullDecision(r));
+    }
+
     function aggregateScenes(minSpeciesConf, searchTerm, sortBy, includeSecondary, includeFamilies) {
       const groups = new Map();
       for (const r of rows) {
@@ -988,7 +1280,7 @@
         row.rating = vs;
         row.rating_origin = origin;
       }
-      markDirty();
+      markDirty(row);
       if (typeof window.refreshSceneFilter === 'function') window.refreshSceneFilter();
     }
     function createStarBar(row) {
@@ -1045,7 +1337,7 @@
       const minC = parseFloat(el('#speciesConf').value) || 0;
       const search = el('#search').value;
       const sortBy = el('#sortBy').value;
-      const onlyRatedScenes = !!document.getElementById('filterScenesManualRated')?.checked;
+      const onlyReviewedScenes = !!document.getElementById('filterScenesManualRated')?.checked;
       const groupByFolder = document.getElementById('groupByFolder')?.checked ?? getSetting('groupByFolder', true);
       const groupByTime = document.getElementById('groupByTime')?.checked ?? getSetting('groupByTime', true);
       const includeSecondaryCheckbox = document.getElementById('includeSecondarySpecies');
@@ -1061,8 +1353,12 @@
         if (refreshed) _currentScene = refreshed;
       }
 
-      // Apply scene-level manual-rated filter without mutating global scenes
-      const visibleScenes = onlyRatedScenes ? scenes.filter(s => s.images.some(isManualRated)) : scenes;
+      // Apply scene-level manual-reviewed filter without mutating global scenes.
+      // Reviewed means any of:
+      //  - scene tags finalized by user, or scene renamed by user
+      //  - manual/verified accept-reject culling decision on any image
+      //  - manual star rating on any image
+      const visibleScenes = onlyReviewedScenes ? scenes.filter(isManuallyReviewedScene) : scenes;
 
       updateStatusBar(visibleScenes);
       sceneGrid.innerHTML = '';
@@ -1489,9 +1785,9 @@
           r.scene_count = targetCount; changed++;
         }
       }
+      const rpForMerge = rows.find(r => (r.__folderSlot ?? 0) === slot)?.__rootPath || rootPath || '';
       // Update scenedata: move filenames from non-target scenes into target scene
       if (hasPywebviewApi) {
-        const rpForMerge = rows.find(r => (r.__folderSlot ?? 0) === slot)?.__rootPath || rootPath || '';
         if (rpForMerge) {
           const sd = _initScenedata(rpForMerge);
           const allMovedFiles = new Set();
@@ -1510,9 +1806,7 @@
         }
       }
       if (changed) {
-        dirty = true; _notifyDirty(true);
-        el('#saveCsv').disabled = false;
-        el('#revertCsv').disabled = false;
+        markDirty(rpForMerge);
         setStatus(`Merged ${ids.length} scenes into #${targetCount}. ${changed} rows updated.`);
       }
       selectedSceneIds.clear();
@@ -1534,14 +1828,49 @@
     const sceneRawCache = new Map();   // unique row key -> blob URL
     const sceneRawLoading = new Set(); // (rootPath|filename) currently being fetched
 
+    function getRowExposurePipelineMode(row) {
+      const mode = String(row?.exposure_pipeline || '').trim().toLowerCase();
+      if (mode === 'no_auto_bright_metered_v1') return mode;
+      return 'legacy_auto_bright_v1';
+    }
+
+    function getRowRawPreviewRequestStops(row, disabled = false) {
+      const requested = disabled ? 0.0 : (parseFloat(row?.exposure_correction) || 0);
+      return Math.max(-2.0, Math.min(3.0, requested));
+    }
+
+    function getRowRawPreviewMeterScale(row, disabled = false) {
+      if (disabled) return 1.0;
+      if (getRowExposurePipelineMode(row) !== 'no_auto_bright_metered_v1') return 1.0;
+      const meter = _numberOr(row?.exposure_meter_scale, 1);
+      if (!Number.isFinite(meter) || meter <= 0) return 1.0;
+      return Math.max(0.25, Math.min(8.0, meter));
+    }
+
+    function getRowRawPreviewEffectiveStops(row, disabled = false) {
+      const requested = getRowRawPreviewRequestStops(row, disabled);
+      if (disabled) return requested;
+      if (getRowExposurePipelineMode(row) !== 'no_auto_bright_metered_v1') return requested;
+      if (Math.abs(requested) > 0.0001) return requested;
+
+      const meterScale = getRowRawPreviewMeterScale(row, false);
+      const meterStops = Math.log2(meterScale);
+      if (Math.abs(meterStops) <= 0.001) return requested;
+      return Math.max(-2.0, Math.min(3.0, meterStops));
+    }
+
     function getSceneRawCacheKey(row) {
       const disabled = getSetting('raw_exposure_correction_disabled', false);
+      const expCorr = getRowRawPreviewEffectiveStops(row, disabled);
+      const expKey = Number.isFinite(expCorr) ? expCorr.toFixed(4) : '0.0000';
+      const mode = getRowExposurePipelineMode(row);
       return [
         row.__rootPath || '',
         row.filename || '',
         row.export_path || '',
         row.crop_path || '',
-        disabled ? 'noexp' : 'exp'
+        `mode=${mode}`,
+        `exp=${expKey}`
       ].join('|');
     }
 
@@ -1604,12 +1933,15 @@
 
     async function loadSceneRawAsync(row) {
       const disabled = getSetting('raw_exposure_correction_disabled', false);
-      const expCorr = disabled ? 0.0 : (parseFloat(row.exposure_correction) || 0);
+      const expCorrRequested = getRowRawPreviewRequestStops(row, disabled);
+      const expCorrEffective = getRowRawPreviewEffectiveStops(row, disabled);
+      const expMode = getRowExposurePipelineMode(row);
+      const meterScale = getRowRawPreviewMeterScale(row, disabled);
       const key = getSceneRawCacheKey(row);
       sceneRawLoading.add(key);
       try {
         const res = await window.pywebview.api.read_raw_full(
-          row.filename, row.__rootPath || '', expCorr
+          row.filename, row.__rootPath || '', expCorrRequested, expMode, meterScale
         );
         if (res && res.debug) {
           console.info('[raw-debug][scene]', row.filename, res.debug);
@@ -1629,7 +1961,7 @@
                   applySceneZoomTransform(curImg, sceneZoomThumbEl, zoomLastX, zoomLastY, sceneZoomScale);
                 }
               };
-              if (box) box.dataset.rawLabel = `RAW (${formatExposureEv(expCorr)} EV)`;
+              if (box) box.dataset.rawLabel = `RAW (${formatExposureEv(expCorrEffective)} EV)`;
               box.classList.add('raw-loaded');
               if (sceneZoomThumbEl) {
                 applySceneZoomTransform(curImg, sceneZoomThumbEl, zoomLastX, zoomLastY, sceneZoomScale);
@@ -1651,7 +1983,7 @@
       const key = getSceneRawCacheKey(row);
       const previewBox = el('#previewBox');
       const disabled = getSetting('raw_exposure_correction_disabled', false);
-      const expCorr = disabled ? 0.0 : (parseFloat(row.exposure_correction) || 0);
+      const expCorr = getRowRawPreviewEffectiveStops(row, disabled);
       previewBox.classList.add('zoom-active');
       previewBox.dataset.rawLabel = `RAW Zoom (${formatExposureEv(expCorr)} EV) (Scroll to zoom in/out)`;
       zoomLastX = mouseEv.clientX;
@@ -1660,7 +1992,7 @@
       // Step 1: Immediately show the already-loaded thumbnail as a placeholder
       const thumbImgSrc = thumbEl.querySelector('img')?.src;
       if (thumbImgSrc) {
-        previewBox.innerHTML = '';
+        _clearScenePreviewBox(previewBox);
         const stub = document.createElement('img');
         stub.src = thumbImgSrc;
         stub.style.imageRendering = 'crisp-edges';
@@ -1678,7 +2010,7 @@
         if (!sceneZoomActive || sceneZoomRow !== row) return;
         const cachedRaw = sceneRawCache.get(key);
         if (cachedRaw) {
-          previewBox.innerHTML = '';
+          _clearScenePreviewBox(previewBox);
           const imgEl = document.createElement('img');
           imgEl.src = cachedRaw;
           imgEl.dataset.isRaw = '1';
@@ -1695,7 +2027,7 @@
           const url = await getBlobUrlForPath(row.export_path || row.crop_path, row.__rootPath);
           if (!sceneZoomActive || sceneZoomRow !== row) return;
           if (url && url !== thumbImgSrc) {
-            previewBox.innerHTML = '';
+            _clearScenePreviewBox(previewBox);
             const imgEl = document.createElement('img');
             imgEl.src = url;
             imgEl.style.imageRendering = 'crisp-edges';
@@ -1798,7 +2130,163 @@
       ensureRatingColumns();
       row.culled = status || ''; // 'accept', 'reject', or ''
       row.culled_origin = status ? 'manual' : '';
-      markDirty();
+      markDirty(row);
+    }
+
+    async function _blobUrlToBlob(url) {
+      const resp = await fetch(url);
+      if (!resp.ok) throw new Error(`Failed to fetch image blob (${resp.status})`);
+      return await resp.blob();
+    }
+
+    async function _convertImageBlobToPng(blob) {
+      if (blob.type === 'image/png') return blob;
+      return await new Promise((resolve, reject) => {
+        const srcUrl = URL.createObjectURL(blob);
+        const img = new Image();
+        img.onload = () => {
+          try {
+            const w = img.naturalWidth || img.width;
+            const h = img.naturalHeight || img.height;
+            if (!w || !h) throw new Error('Invalid image dimensions');
+            const canvas = document.createElement('canvas');
+            canvas.width = w;
+            canvas.height = h;
+            const ctx = canvas.getContext('2d');
+            if (!ctx) throw new Error('Canvas context unavailable');
+            ctx.drawImage(img, 0, 0, w, h);
+            canvas.toBlob((pngBlob) => {
+              URL.revokeObjectURL(srcUrl);
+              if (!pngBlob) {
+                reject(new Error('PNG conversion failed'));
+                return;
+              }
+              resolve(pngBlob);
+            }, 'image/png');
+          } catch (e) {
+            URL.revokeObjectURL(srcUrl);
+            reject(e);
+          }
+        };
+        img.onerror = () => {
+          URL.revokeObjectURL(srcUrl);
+          reject(new Error('Image decode failed'));
+        };
+        img.src = srcUrl;
+      });
+    }
+
+    function _clearScenePreviewBox(box) {
+      if (!box) return;
+      try {
+        if (box.__sceneCropOverlayTimer) {
+          clearTimeout(box.__sceneCropOverlayTimer);
+          box.__sceneCropOverlayTimer = null;
+        }
+      } catch (_) {}
+      for (const child of Array.from(box.children)) {
+        if (child.classList && child.classList.contains('scene-preview-copy-btn')) continue;
+        child.remove();
+      }
+    }
+
+    function _showSceneCropOverlay(row, activeIndex = 0, durationMs = 1000) {
+      const box = el('#previewBox');
+      if (!box || !row) return;
+      const img = box.querySelector('img');
+      if (!img) return;
+
+      const cropState = getRowActiveCropState(row);
+      if (!cropState.crops.length) return;
+
+      const boxRect = box.getBoundingClientRect();
+      const imgRect = img.getBoundingClientRect();
+      if (imgRect.width <= 0 || imgRect.height <= 0 || boxRect.width <= 0 || boxRect.height <= 0) return;
+
+      try {
+        if (box.__sceneCropOverlayTimer) {
+          clearTimeout(box.__sceneCropOverlayTimer);
+          box.__sceneCropOverlayTimer = null;
+        }
+      } catch (_) {}
+
+      box.querySelectorAll('.scene-crop-overlay-layer').forEach(n => n.remove());
+
+      const layer = document.createElement('div');
+      layer.className = 'scene-crop-overlay-layer';
+
+      const originX = imgRect.left - boxRect.left;
+      const originY = imgRect.top - boxRect.top;
+      const drawW = imgRect.width;
+      const drawH = imgRect.height;
+
+      cropState.crops.forEach((crop, idx) => {
+        const bbox = crop?.bbox || _fullFrameBbox();
+        const x0 = Math.max(0, Math.min(1, _numberOr(bbox.x_min_norm, 0)));
+        const x1 = Math.max(0, Math.min(1, _numberOr(bbox.x_max_norm, 1)));
+        const y0 = Math.max(0, Math.min(1, _numberOr(bbox.y_min_norm, 0)));
+        const y1 = Math.max(0, Math.min(1, _numberOr(bbox.y_max_norm, 1)));
+        const left = originX + drawW * Math.min(x0, x1);
+        const top = originY + drawH * Math.min(y0, y1);
+        const width = Math.max(2, drawW * Math.abs(x1 - x0));
+        const height = Math.max(2, drawH * Math.abs(y1 - y0));
+
+        const boxEl = document.createElement('div');
+        boxEl.className = `scene-crop-overlay-box ${idx === activeIndex ? 'active' : 'inactive'}`;
+        boxEl.style.left = `${left}px`;
+        boxEl.style.top = `${top}px`;
+        boxEl.style.width = `${width}px`;
+        boxEl.style.height = `${height}px`;
+
+        const label = document.createElement('div');
+        label.className = 'scene-crop-overlay-label';
+        label.textContent = `#${idx + 1}`;
+        boxEl.appendChild(label);
+        layer.appendChild(boxEl);
+      });
+
+      box.appendChild(layer);
+      requestAnimationFrame(() => layer.classList.add('visible'));
+      box.__sceneCropOverlayTimer = setTimeout(() => {
+        layer.classList.remove('visible');
+        setTimeout(() => {
+          if (layer.parentNode) layer.parentNode.removeChild(layer);
+        }, 140);
+      }, Math.max(250, durationMs || 1000));
+    }
+
+    async function copyRowImageToClipboard(row, relPathOverride, copyLabel = 'image') {
+      const relPath = relPathOverride || row?.export_path || row?.crop_path;
+      if (!relPath) {
+        showToast('No image available to copy', 2500);
+        return;
+      }
+      if (!navigator.clipboard || typeof navigator.clipboard.write !== 'function' || typeof window.ClipboardItem === 'undefined') {
+        setStatus('Clipboard image copy is not supported on this system');
+        showToast('Clipboard image copy is not supported on this system', 3500);
+        return;
+      }
+      try {
+        // Keep clipboard.write close to the user gesture for better compatibility.
+        const pngBlobPromise = (async () => {
+          const blobUrl = await getBlobUrlForPath(relPath, row.__rootPath);
+          if (!blobUrl) throw new Error('Image unavailable');
+          const blob = await _blobUrlToBlob(blobUrl);
+          if (!blob || !blob.size) throw new Error('Empty image payload');
+          return await _convertImageBlobToPng(blob);
+        })();
+        await navigator.clipboard.write([
+          new window.ClipboardItem({ 'image/png': pngBlobPromise })
+        ]);
+
+        const label = row.filename ? `Copied ${copyLabel} (${row.filename})` : `Copied ${copyLabel}`;
+        setStatus('Image copied to clipboard');
+        showToast(`${label} to clipboard`, 2200);
+      } catch (e) {
+        console.error('copyRowImageToClipboard failed:', e);
+        setStatus('Failed to copy image to clipboard');
+        showToast('Failed to copy image to clipboard', 3500);
+      }
     }
 
     function renderFilmstrip(scene) {
@@ -1915,12 +2403,25 @@
       grid.scrollTo({ left: targetScrollLeft, behavior: 'smooth' });
     }
 
-    async function selectFilmstripImage(idx, scene, isHover = false) {
+    async function selectFilmstripImage(idx, scene, isHover = false, overlayActiveCrop = false) {
       if (!scene || !scene.images || idx < 0 || idx >= scene.images.length) return;
       if (!isHover) {
+        // Clear temporary crop selection for the image we're leaving so that
+        // returning to it later shows the primary crop, not a stale temp pick.
+        if (idx !== currentImageIndex && scene.images[currentImageIndex]) {
+          _sceneActiveCropIndexByImage.delete(_cropStateKey(scene.images[currentImageIndex]));
+        }
         currentImageIndex = idx;
       }
       const r = scene.images[idx];
+      const cropState = getRowActiveCropState(r);
+      const activeCrop = cropState.activeCrop;
+      const activeCropPath = activeCrop?.crop_path || r.crop_path;
+      const activeSpecies = activeCrop?.species || r.species || 'Unknown';
+      const activeSpeciesConf = activeCrop?.species_confidence ?? r.species_confidence;
+      const activeFamily = activeCrop?.family || r.family || 'Unknown';
+      const activeFamilyConf = activeCrop?.family_confidence ?? r.family_confidence;
+      const activeQuality = activeCrop?.quality ?? r.quality;
 
       // Update filmstrip card active state and center if not just hovering
       const grid = el('#imageGrid');
@@ -1934,25 +2435,72 @@
       // Load export preview
       const exportBox = el('#previewBox');
       if (exportBox) {
-        exportBox.innerHTML = '';
+        _clearScenePreviewBox(exportBox);
         const eurl = await getBlobUrlForPath(r.export_path, r.__rootPath);
         if (eurl) {
           const eimg = document.createElement('img');
           eimg.src = eurl;
           exportBox.appendChild(eimg);
-        } else { exportBox.innerHTML = '<span class="muted">No export preview</span>'; }
+        } else {
+          const muted = document.createElement('span');
+          muted.className = 'muted';
+          muted.textContent = 'No export preview';
+          exportBox.appendChild(muted);
+        }
       }
 
       // Load crop preview
       const cropBox = el('#previewCropBox');
       if (cropBox) {
-        cropBox.innerHTML = '';
-        const curl = await getBlobUrlForPath(r.crop_path, r.__rootPath);
+        _clearScenePreviewBox(cropBox);
+        const curl = await getBlobUrlForPath(activeCropPath, r.__rootPath);
         if (curl) {
           const cimg = document.createElement('img');
           cimg.src = curl;
           cropBox.appendChild(cimg);
-        } else { cropBox.innerHTML = '<span class="muted">No crop preview</span>'; }
+        } else {
+          const muted = document.createElement('span');
+          muted.className = 'muted';
+          muted.textContent = 'No crop preview';
+          cropBox.appendChild(muted);
+        }
+      }
+
+      // Wire preview copy actions for the currently displayed row.
+      const copyExportBtn = el('#sceneCopyExportBtn');
+      if (copyExportBtn) {
+        copyExportBtn.disabled = !r.export_path;
+        copyExportBtn.onmousedown = (ev) => {
+          ev.stopPropagation();
+          ev.preventDefault();
+        };
+        copyExportBtn.ondblclick = (ev) => {
+          ev.stopPropagation();
+          ev.preventDefault();
+        };
+        copyExportBtn.onclick = async (ev) => {
+          ev.stopPropagation();
+          ev.preventDefault();
+          await copyRowImageToClipboard(r, r.export_path, 'full image');
+        };
+      }
+
+      const copyCropBtn = el('#sceneCopyCropBtn');
+      if (copyCropBtn) {
+        copyCropBtn.disabled = !activeCropPath;
+        copyCropBtn.onmousedown = (ev) => {
+          ev.stopPropagation();
+          ev.preventDefault();
+        };
+        copyCropBtn.ondblclick = (ev) => {
+          ev.stopPropagation();
+          ev.preventDefault();
+        };
+        copyCropBtn.onclick = async (ev) => {
+          ev.stopPropagation();
+          ev.preventDefault();
+          await copyRowImageToClipboard(r, activeCropPath, 'bird crop');
+        };
       }
 
       // Update preview panel accept/reject glow
@@ -1971,7 +2519,7 @@
       if (fnEl) { fnEl.textContent = r.filename || '—'; fnEl.title = r.filename || ''; }
 
       const qEl = el('#sceneInfoQuality');
-      if (qEl) qEl.textContent = `Quality: ${fmt3(r.quality)}`;
+      if (qEl) qEl.textContent = `Quality: ${fmt3(activeQuality)}`;
 
       const cullToggle = el('#sceneCullToggle');
       if (cullToggle) {
@@ -1995,11 +2543,14 @@
 
       const metaEl = el('#sceneInfoMeta');
       if (metaEl) {
-        const sp = decodeEntities(r.species || 'Unknown');
-        const spConf = fmt3(r.species_confidence);
-        const fam = decodeEntities(r.family || 'Unknown');
-        const famConf = fmt3(r.family_confidence);
-        metaEl.textContent = `${sp} (${spConf}) | ${fam} (${famConf}) · Image ${idx + 1} of ${scene.images.length}`;
+        const sp = decodeEntities(activeSpecies);
+        const spConf = fmt3(activeSpeciesConf);
+        const fam = decodeEntities(activeFamily);
+        const famConf = fmt3(activeFamilyConf);
+        const cropLabel = cropState.crops.length > 0
+          ? ` · Crop ${cropState.activeIndex + 1}/${cropState.crops.length}`
+          : '';
+        metaEl.textContent = `${sp} (${spConf}) | ${fam} (${famConf}) · Image ${idx + 1} of ${scene.images.length}${cropLabel}`;
       }
 
       // Render star bar in info bar
@@ -2007,6 +2558,10 @@
       if (starsEl) {
         starsEl.innerHTML = '';
         starsEl.appendChild(createStarBar(r));
+      }
+
+      if (overlayActiveCrop) {
+        _showSceneCropOverlay(r, cropState.activeIndex, 1000);
       }
     }
 
@@ -2046,7 +2601,7 @@
       sceneEntry.user_tags.species = draft.species.slice().sort();
       sceneEntry.user_tags.families = draft.families.slice().sort();
       sceneEntry.user_tags.finalized = true;
-      markDirty();
+      markDirty(sceneRows);
       return true;
     }
 
@@ -2070,6 +2625,82 @@
       return { ...computed, approved: false };
     }
 
+    function _normalizeTagKey(tagName) {
+      return String(tagName || '').trim().toLowerCase();
+    }
+
+    function _computeConfidenceWeightedSuggestion(sceneRows, tagType) {
+      if (!Array.isArray(sceneRows) || !sceneRows.length) return null;
+      const tallies = new Map();
+      let totalWeight = 0;
+      const invalid = new Set(tagType === 'species'
+        ? ['no bird', 'unknown', 'n/a']
+        : ['unknown', 'n/a', 'no bird']);
+
+      for (const row of sceneRows) {
+        const rawName = tagType === 'species' ? row.species : row.family;
+        const name = String(rawName || '').trim();
+        if (!name) continue;
+        const key = _normalizeTagKey(name);
+        if (!key || invalid.has(key)) continue;
+
+        const rawConfidence = tagType === 'species' ? row.species_confidence : row.family_confidence;
+        const parsedConfidence = parseNumber(rawConfidence);
+        const weight = parsedConfidence >= 0 ? parsedConfidence : 1;
+        if (!(weight > 0)) continue;
+
+        const existing = tallies.get(key);
+        if (existing) {
+          existing.weight += weight;
+          existing.count += 1;
+        } else {
+          tallies.set(key, { name, weight, count: 1 });
+        }
+        totalWeight += weight;
+      }
+
+      if (!tallies.size || !(totalWeight > 0)) return null;
+
+      const ranked = Array.from(tallies.values()).sort((a, b) => {
+        if (b.weight !== a.weight) return b.weight - a.weight;
+        if (b.count !== a.count) return b.count - a.count;
+        return a.name.localeCompare(b.name);
+      });
+
+      const winner = ranked[0];
+      const share = winner.weight / totalWeight;
+      if (!(share > 0.5)) return null;
+
+      return {
+        name: winner.name,
+        share,
+      };
+    }
+
+    function _computeSceneTagSuggestions(sceneId, selectedSpecies = [], selectedFamilies = []) {
+      const sceneRows = getSceneRows(sceneId);
+      if (!sceneRows.length) return { species: null, family: null };
+
+      const speciesSuggestion = _computeConfidenceWeightedSuggestion(sceneRows, 'species');
+      const familySuggestion = _computeConfidenceWeightedSuggestion(sceneRows, 'family');
+
+      const selectedSpeciesKeys = new Set((selectedSpecies || []).map(_normalizeTagKey));
+      const selectedFamilyKeys = new Set((selectedFamilies || []).map(_normalizeTagKey));
+
+      return {
+        species: speciesSuggestion && !selectedSpeciesKeys.has(_normalizeTagKey(speciesSuggestion.name)) ? speciesSuggestion : null,
+        family: familySuggestion && !selectedFamilyKeys.has(_normalizeTagKey(familySuggestion.name)) ? familySuggestion : null,
+      };
+    }
+
+    function _buildSuggestedTagButton(tagType, suggestion) {
+      if (!suggestion || !suggestion.name) return '';
+      const escapedName = escapeHtml(suggestion.name);
+      const pct = Math.round((suggestion.share || 0) * 100);
+      const readableType = tagType === 'species' ? 'species' : 'family';
+      return `<button class="scene-chip-suggested" data-suggest-type="${readableType}" data-suggest-value="${escapedName}" title="Suggested ${readableType} (${pct}% confidence-weighted vote)">+ <em>${escapedName}</em></button>`;
+    }
+
     let _activeTagInputType = null; // 'species' or 'family'
     let _activeTagInputSceneId = null;
 
@@ -2077,6 +2708,7 @@
       const tagsEl = el('#sceneTopbarTags');
       if (!tagsEl) return;
       const { species, families, approved } = collectSceneSpecies(scene.id);
+      const suggestions = _computeSceneTagSuggestions(scene.id, species, families);
       const chipClass = approved ? 'chip manual-approved' : 'chip';
 
       let html = '';
@@ -2088,6 +2720,9 @@
         }
       } else {
         html += '<span class="muted" style="font-size:11px">—</span>';
+      }
+      if (suggestions.species) {
+        html += _buildSuggestedTagButton('species', suggestions.species);
       }
       if (_activeTagInputType === 'species' && _activeTagInputSceneId === String(scene.id)) {
         html += `<span class="chip-input-wrap"><input type="text" class="chip-input" id="inlineTagInput" placeholder="Species..." /><button class="chip-commit-btn" title="Save">✓</button></span>`;
@@ -2105,6 +2740,9 @@
         }
       } else {
         html += '<span class="muted" style="font-size:11px">—</span>';
+      }
+      if (suggestions.family) {
+        html += _buildSuggestedTagButton('family', suggestions.family);
       }
       if (_activeTagInputType === 'family' && _activeTagInputSceneId === String(scene.id)) {
         html += `<span class="chip-input-wrap"><input type="text" class="chip-input" id="inlineTagInput" placeholder="Family..." /><button class="chip-commit-btn" title="Save">✓</button></span>`;
@@ -2159,6 +2797,43 @@
         };
       });
 
+      // Wire suggested tag buttons
+      tagsEl.querySelectorAll('.scene-chip-suggested').forEach(btn => {
+        btn.onclick = () => {
+          const suggestType = btn.dataset.suggestType;
+          const suggestValue = String(btn.dataset.suggestValue || '').trim();
+          if (!suggestValue || (suggestType !== 'species' && suggestType !== 'family')) return;
+
+          if (!_sceneEditDraft) _beginSceneEditDraft(scene.id);
+          _sceneEditMode = true;
+
+          let changed = false;
+          if (suggestType === 'species') {
+            const before = _sceneEditDraft.species.length;
+            _sceneEditDraft.species = Array.from(new Set([..._sceneEditDraft.species, suggestValue])).sort();
+            changed = _sceneEditDraft.species.length !== before;
+          } else {
+            const before = _sceneEditDraft.families.length;
+            _sceneEditDraft.families = Array.from(new Set([..._sceneEditDraft.families, suggestValue])).sort();
+            changed = _sceneEditDraft.families.length !== before;
+          }
+
+          if (changed) {
+            _finalizeSceneReview(scene.id);
+            showToast(`Added suggested ${suggestType} "${suggestValue}"`, 2000);
+          }
+
+          _sceneEditMode = false;
+          _sceneEditDraft = null;
+          _activeTagInputType = null;
+          _activeTagInputSceneId = null;
+
+          const updatedScene = reloadScene(scene.id) || scene;
+          renderTopbarTags(updatedScene);
+          renderScenes();
+        };
+      });
+
       // Wire inline input
       const inp = el('#inlineTagInput');
       if (inp) {
@@ -2210,6 +2885,54 @@
       renderTopbarTags(scene);
     }
 
+    function _clampScenePreviewSplitRatio(value) {
+      const n = parseFloat(value);
+      if (!Number.isFinite(n)) return SCENE_PREVIEW_SPLIT_DEFAULT;
+      return Math.max(SCENE_PREVIEW_SPLIT_MIN, Math.min(SCENE_PREVIEW_SPLIT_MAX, n));
+    }
+
+    function _getScenePreviewSplitSetting() {
+      return _clampScenePreviewSplitRatio(getSetting(SCENE_PREVIEW_SPLIT_KEY, SCENE_PREVIEW_SPLIT_DEFAULT));
+    }
+
+    function _updateScenePreviewDividerAria(ratio) {
+      const divider = document.getElementById('scenePreviewDivider');
+      if (!divider) return;
+      const pct = Math.round(_clampScenePreviewSplitRatio(ratio) * 100);
+      divider.setAttribute('aria-valuemin', String(Math.round(SCENE_PREVIEW_SPLIT_MIN * 100)));
+      divider.setAttribute('aria-valuemax', String(Math.round(SCENE_PREVIEW_SPLIT_MAX * 100)));
+      divider.setAttribute('aria-valuenow', String(pct));
+      divider.setAttribute('aria-valuetext', `Full image width ${pct}%`);
+    }
+
+    function _applyScenePreviewSplit(ratio) {
+      const exportPanel = el('#scenePreviewExport');
+      const cropPanel = el('#scenePreviewCrop');
+      if (!exportPanel || !cropPanel) return;
+      const clamped = _clampScenePreviewSplitRatio(ratio);
+      _scenePreviewSplitRatio = clamped;
+      exportPanel.style.flex = `${clamped.toFixed(4)} 1 0px`;
+      cropPanel.style.flex = `${(1 - clamped).toFixed(4)} 1 0px`;
+      _updateScenePreviewDividerAria(clamped);
+    }
+
+    function _persistScenePreviewSplit(ratio) {
+      const clamped = _clampScenePreviewSplitRatio(ratio);
+      mergeSetting(SCENE_PREVIEW_SPLIT_KEY, Number(clamped.toFixed(4)));
+    }
+
+    function _ratioFromPreviewDividerX(previewsEl, dividerEl, clientX) {
+      const rect = previewsEl.getBoundingClientRect();
+      const dividerWidth = dividerEl.getBoundingClientRect().width || 10;
+      const usableWidth = Math.max(1, rect.width - dividerWidth);
+      const minLeft = Math.max(0, Math.min(SCENE_PREVIEW_MIN_EXPORT_PX, usableWidth - SCENE_PREVIEW_MIN_CROP_PX));
+      const minRight = Math.max(0, Math.min(SCENE_PREVIEW_MIN_CROP_PX, usableWidth - minLeft));
+      const maxLeft = Math.max(minLeft, usableWidth - minRight);
+      const leftPxRaw = clientX - rect.left - (dividerWidth * 0.5);
+      const leftPx = Math.max(minLeft, Math.min(maxLeft, leftPxRaw));
+      return _clampScenePreviewSplitRatio(leftPx / usableWidth);
+    }
+
     async function openSceneDialog(sceneId, startIndex = 0) {
       const scene = scenes.find(s => String(s.id) === String(sceneId));
       if (!scene) return;
@@ -2219,6 +2942,7 @@
       _sceneEditMode = false;
       _sceneEditDraft = null;
       currentImageIndex = startIndex;
+      _applyScenePreviewSplit(_getScenePreviewSplitSetting());
 
       // ── Top bar: title ──
       const localNum = String(scene.id).split(':').pop();
@@ -2295,6 +3019,16 @@
         };
       }
 
+      const cropImgBox = el('#previewCropBox');
+      if (cropImgBox) {
+        cropImgBox.onmouseenter = () => {
+          const r = scene.images[currentImageIndex];
+          if (!r) return;
+          const cropState = getRowActiveCropState(r);
+          _showSceneCropOverlay(r, cropState.activeIndex, 1000);
+        };
+      }
+
       // ── Close ──
       el('#closeDlg').onclick = () => {
         if (_splitMode) { exitSplitMode(); }
@@ -2310,11 +3044,16 @@
       // ── Split Scene ──
       el('#splitSceneBtn').onclick = () => {
         if (_splitMode) {
-          applySplitScene(scene);
+          if (_splitSelected.size > 0) {
+            applySplitScene(scene);
+          } else {
+            exitSplitMode();
+          }
         } else {
           enterSplitMode(scene);
         }
       };
+      _updateSplitSceneButtonLabel();
 
       // ── Scene navigation hints ──
       const hintL = el('#filmstripHintLeft');
@@ -2335,6 +3074,10 @@
     // the scenes array being regenerated by auto-refresh / renderScenes.
     function navigateToScene(direction, startIndex = 0) {
       if (!_currentScene) return;
+      if (_splitMode) {
+        _flashSplitSceneButton();
+        return;
+      }
       const curId = String(_currentScene.id);
       const idx = scenes.findIndex(s => String(s.id) === curId);
       if (idx < 0) return;
@@ -2405,6 +3148,39 @@
             }
           }
           break;
+        case 'ArrowUp':
+        case 'ArrowDown':
+          e.preventDefault();
+          if (images[currentImageIndex]) {
+            const row = images[currentImageIndex];
+            const cropState = getRowActiveCropState(row);
+            if (cropState.crops.length > 1) {
+              const step = e.key === 'ArrowDown' ? 1 : -1;
+              const next = (cropState.activeIndex + step + cropState.crops.length) % cropState.crops.length;
+              setRowActiveCropIndex(row, next, cropState.crops);
+              selectFilmstripImage(currentImageIndex, _currentScene, true, true);
+            }
+          }
+          break;
+        case 'Enter':
+          e.preventDefault();
+          if (images[currentImageIndex]) {
+            const row = images[currentImageIndex];
+            const stateBefore = getRowActiveCropState(row);
+            if (stateBefore.crops.length > 0) {
+              const changed = promoteActiveCropToPrimary(row);
+              if (changed) {
+                void (async () => {
+                  await _resortAndFocusSceneImage(row, true);
+                  await renderScenes();
+                })();
+              } else {
+                selectFilmstripImage(currentImageIndex, _currentScene, true, true);
+              }
+              showToast(`Primary crop set to ${stateBefore.activeIndex + 1}/${stateBefore.crops.length}`, 1800);
+            }
+          }
+          break;
         case 'z':
         case 'Z':
           e.preventDefault();
@@ -2456,6 +3232,31 @@
       selectFilmstripImage(currentImageIndex, _currentScene);
     }
 
+    async function _resortAndFocusSceneImage(targetRow, overlayActiveCrop = true) {
+      if (!_currentScene || !targetRow) return;
+
+      // Rebuild the scene from authoritative rows so quality changes are
+      // reflected immediately in quality-sorted filmstrip order.
+      const refreshed = reloadScene(_currentScene.id) || _currentScene;
+      _currentScene = refreshed;
+
+      const targetKey = _cropStateKey(targetRow);
+      let nextIndex = refreshed.images.findIndex(r => _cropStateKey(r) === targetKey);
+      if (nextIndex < 0) {
+        nextIndex = refreshed.images.findIndex(
+          r => String(r.filename || '') === String(targetRow.filename || '')
+            && String(r.__rootPath || '') === String(targetRow.__rootPath || '')
+        );
+      }
+      if (nextIndex < 0) {
+        nextIndex = Math.max(0, Math.min(currentImageIndex, Math.max(0, refreshed.images.length - 1)));
+      }
+
+      currentImageIndex = nextIndex;
+      renderFilmstrip(refreshed);
+      await selectFilmstripImage(nextIndex, refreshed, false, overlayActiveCrop);
+    }
+
     function applySceneName(sceneId, name) {
       const newName = String(name || '').trim();
       const { slot, sceneCount } = _getSceneIdParts(sceneId);
@@ -2480,7 +3281,7 @@
         }
       }
       if (rowChanged || sdChanged) {
-        markDirty();
+        markDirty(rp || sceneRows);
         const updatedScene = reloadScene(sceneId);
         if (updatedScene) renderSceneMetaChips(updatedScene, _sceneEditMode);
         renderScenes();
@@ -2488,7 +3289,11 @@
     }
 
     // --- Species & Family editing helpers ---
-    function markDirty() {
+    function markDirty(rootHint = null) {
+      if (hasPywebviewApi) {
+        const scoped = _markDirtyRoots(rootHint);
+        if (!scoped) _dirtyRootsUnknown = true;
+      }
       attemptAutoSave();
     }
 
@@ -2607,12 +3412,34 @@
 
     // --- Scene split helpers ---
     let _splitSelected = new Set();
+    let _splitLastSelectedIndex = -1;
+
+    function _updateSplitSceneButtonLabel() {
+      const btn = el('#splitSceneBtn');
+      if (!btn) return;
+      if (!_splitMode) {
+        btn.textContent = 'Split Scene…';
+        return;
+      }
+      btn.textContent = _splitSelected.size > 0
+        ? 'Create New Scene from Selected'
+        : 'Cancel Scene Split';
+    }
+
+    function _flashSplitSceneButton() {
+      const btn = el('#splitSceneBtn');
+      if (!btn) return;
+      btn.classList.remove('split-scene-btn-flash');
+      void btn.offsetWidth;
+      btn.classList.add('split-scene-btn-flash');
+    }
 
     function enterSplitMode(scene) {
       _splitMode = true;
       _splitSelected.clear();
-      el('#splitSceneBtn').textContent = 'Create New Scene from Selected';
-      showToast('Click images to select them for the new scene, then press "Create New Scene from Selected"', 4000);
+      _splitLastSelectedIndex = -1;
+      _updateSplitSceneButtonLabel();
+      showToast('Click images to select them for the new scene. Use Shift+Click for ranges, or click "Cancel Scene Split" to exit.', 4500);
       // Re-render images with checkboxes
       renderSceneImagesWithSplit(scene);
     }
@@ -2620,7 +3447,8 @@
     function exitSplitMode() {
       _splitMode = false;
       _splitSelected.clear();
-      el('#splitSceneBtn').textContent = 'Split Scene\u2026';
+      _splitLastSelectedIndex = -1;
+      _updateSplitSceneButtonLabel();
       // Re-render images without checkboxes
       const scene = scenes.find(s => String(s.id) === String(currentSceneId));
       if (scene) {
@@ -2640,6 +3468,40 @@
         return (a.filename || '').localeCompare(b.filename || '');
       });
       const frag = document.createDocumentFragment();
+      const splitCards = [];
+      const splitChecks = [];
+
+      const setSplitCardChecked = (idx, checked) => {
+        const cb = splitChecks[idx];
+        const card = splitCards[idx];
+        if (!cb || !card) return;
+        cb.checked = !!checked;
+        const key = cb.dataset.splitKey || '';
+        if (!key) return;
+        if (checked) {
+          _splitSelected.add(key);
+          card.classList.add('split-selected');
+        } else {
+          _splitSelected.delete(key);
+          card.classList.remove('split-selected');
+        }
+      };
+
+      const toggleSplitAtIndex = (idx, useRange = false, desiredState = null) => {
+        if (idx < 0 || idx >= splitChecks.length) return;
+        const targetChecked = desiredState == null ? !splitChecks[idx].checked : !!desiredState;
+
+        if (useRange && _splitLastSelectedIndex >= 0) {
+          const lo = Math.min(_splitLastSelectedIndex, idx);
+          const hi = Math.max(_splitLastSelectedIndex, idx);
+          for (let j = lo; j <= hi; j++) setSplitCardChecked(j, targetChecked);
+        } else {
+          setSplitCardChecked(idx, targetChecked);
+        }
+
+        _splitLastSelectedIndex = idx;
+        _updateSplitSceneButtonLabel();
+      };
 
       for (let i = 0; i < images.length; i++) {
         const r = images[i];
@@ -2653,13 +3515,18 @@
         const cb = document.createElement('input');
         cb.type = 'checkbox';
         cb.className = 'split-check';
+        cb.dataset.splitKey = key;
         cb.checked = _splitSelected.has(key);
         if (cb.checked) card.classList.add('split-selected');
-        
-        cb.onchange = () => {
-          if (cb.checked) { _splitSelected.add(key); card.classList.add('split-selected'); }
-          else { _splitSelected.delete(key); card.classList.remove('split-selected'); }
-        };
+
+        splitCards.push(card);
+        splitChecks.push(cb);
+
+        cb.addEventListener('click', (ev) => {
+          ev.preventDefault();
+          ev.stopPropagation();
+          toggleSplitAtIndex(i, !!ev.shiftKey);
+        });
         card.appendChild(cb);
 
         // Thumbnail
@@ -2688,12 +3555,16 @@
 
         // Click card to toggle selection
         card.addEventListener('click', (ev) => {
-          if (ev.target === cb) return; // checkbox handles itself
-          cb.checked = !cb.checked;
-          cb.onchange();
-          
-          // Also set as active and update preview using original index
-          selectFilmstripImage(origIdx, scene);
+          ev.preventDefault();
+          toggleSplitAtIndex(i, !!ev.shiftKey);
+        });
+
+        // Hover preview only (split mode click should not load/activate)
+        card.addEventListener('mouseenter', () => {
+          selectFilmstripImage(origIdx, scene, true);
+        });
+        card.addEventListener('mouseleave', () => {
+          selectFilmstripImage(currentImageIndex, scene, true);
         });
 
         // Tooltip with detailed metadata
@@ -2714,7 +3585,8 @@
       
       // Select the first one or current one by default to show preview
       if (images.length > 0) {
-        selectFilmstripImage(currentImageIndex < images.length ? currentImageIndex : 0, scene);
+        const previewIndex = Math.min(currentImageIndex, Math.max(0, scene.images.length - 1));
+        selectFilmstripImage(previewIndex, scene, true);
       }
     }
 
@@ -2770,10 +3642,11 @@
             user_tags: { species: [], families: [], finalized: false }
           };
         }
-        markDirty();
+        markDirty(rpForSplit || sceneRowsBefore);
         _splitMode = false;
         _splitSelected.clear();
-        el('#splitSceneBtn').textContent = 'Split Scene\u2026';
+        _splitLastSelectedIndex = -1;
+        _updateSplitSceneButtonLabel();
         renderScenes();
         // Refresh the scene dialog with the remaining images
         const updatedScene = reloadScene(scene.id);
@@ -2801,88 +3674,23 @@
     // Snapshot helpers for revert
     function takeSnapshot() {
       _cleanSnapshot = { rows: rows.map(r => ({ ...r })), header: header.slice(), scenedata: JSON.parse(JSON.stringify(_scenedata)) };
+      _clearDirtyRoots();
       const btn = el('#revertCsv');
       if (btn) btn.disabled = true;
     }
     function applySnapshot() {
       if (!_cleanSnapshot) return;
+      clearTimeout(_autoSaveTimer);
+      _autoSaveTimer = null;
       rows = _cleanSnapshot.rows.map(r => ({ ...r }));
       header = _cleanSnapshot.header.slice();
       if (_cleanSnapshot.scenedata !== undefined) _scenedata = JSON.parse(JSON.stringify(_cleanSnapshot.scenedata));
-      dirty = false; _notifyDirty(false);
-      el('#saveCsv').disabled = true;
-      el('#revertCsv').disabled = true;
+      _sceneActiveCropIndexByImage.clear();
+      _clearDirtyRoots();
+      _setDirtyUi(false);
       blobUrlCache.clear();
       renderScenes();
       setStatus('Reverted to last saved state.');
-    }
-
-    // CSV IO
-    async function loadCsvFromHandle(fileHandle) {
-      csvFileHandle = fileHandle;
-      const file = await fileHandle.getFile();
-      const text = await file.text();
-      const parsed = Papa.parse(text, { header: true, skipEmptyLines: true });
-      header = parsed.meta.fields || [];
-      rows = (parsed.data || []).map(r => ({ ...r, scene_count: r.scene_count }));
-      ensureSceneNameColumn();
-      ensureRatingColumns();
-      dirty = false; _notifyDirty(false); el('#saveCsv').disabled = true;
-      takeSnapshot();
-      await renderScenes();
-    }
-
-    // Try to find .kestrel/kestrel_database.csv in the selected folder (optionally nested)
-    async function findKestrelDatabase(dirHandle, maxDepth = 3, depth = 0) {
-      // If user selected the .kestrel folder itself, read directly
-      if (dirHandle && dirHandle.name === '.kestrel') {
-        try {
-          const csvHandle = await dirHandle.getFileHandle('kestrel_database.csv');
-          return { rootHandle: dirHandle, fileHandle: csvHandle, rootIsKestrel: true };
-        } catch (_) {
-          // fall through to normal search
-        }
-      }
-      // First, check for a .kestrel folder in this folder
-      try {
-        const kestrelDir = await dirHandle.getDirectoryHandle('.kestrel');
-        const csvHandle = await kestrelDir.getFileHandle('kestrel_database.csv');
-        return { rootHandle: dirHandle, fileHandle: csvHandle, rootIsKestrel: false };
-      } catch (_) {
-        // Not found at this level; continue
-      }
-
-      if (depth >= maxDepth) return null;
-
-      // Search subfolders (limited depth)
-      try {
-        for await (const entry of dirHandle.values()) {
-          if (entry.kind !== 'directory') continue;
-          if (entry.name === '.kestrel') continue;
-          const found = await findKestrelDatabase(entry, maxDepth, depth + 1);
-          if (found) return found;
-        }
-      } catch (_) {
-        // Ignore permission/iteration errors
-      }
-      return null;
-    }
-
-    async function tryOpenDefaultCsv(dirHandle) {
-      try {
-        const found = await findKestrelDatabase(dirHandle, 2);
-        if (!found) throw new Error('not found');
-        rootDirHandle = found.rootHandle;
-        rootIsKestrel = !!found.rootIsKestrel;
-        await loadCsvFromHandle(found.fileHandle);
-        const mergeBtn = document.getElementById('openMerge');
-        if (mergeBtn) mergeBtn.disabled = false;
-        const rootLabel = rootIsKestrel ? '.kestrel (selected folder)' : (rootDirHandle.name || 'selected folder');
-        setStatus(`Loaded .kestrel/kestrel_database.csv (root: ${rootLabel})`);
-      } catch (e) {
-        setStatus('Could not find .kestrel/kestrel_database.csv in this folder (or its subfolders). Use "Open Folder or CSV…" to try a CSV file directly.');
-        alert("Couldn't find Kestrel Analysis files. Make sure you analyze this folder with Kestrel Analyzer.");
-      }
     }
 
     function csvEscape(val) {
@@ -2893,6 +3701,8 @@
     }
 
     async function saveCsv() {
+      clearTimeout(_autoSaveTimer);
+      _autoSaveTimer = null;
       ensureSceneNameColumn();
       ensureRatingColumns();
       const allCols = header.slice();
@@ -2907,30 +3717,37 @@
         return lines.join('\r\n');
       }
 
-      // FSAPI mode (browser): single file handle
-      if (csvFileHandle) {
-        const content = rowsToCsvString(allCols, rows);
-        const writable = await csvFileHandle.createWritable();
-        await writable.write(content);
-        await writable.close();
-        dirty = false; _notifyDirty(false); el('#saveCsv').disabled = true;
-        takeSnapshot();
-        setStatus('Saved changes to kestrel_database.csv');
-        return;
-      }
-
       // Pywebview desktop mode: save both CSV row state and scenedata JSON.
       if (window.pywebview?.api) {
         const groups = new Map();
         for (const r of rows) {
-          const rp = r.__rootPath || '';
+          const rp = _normalizeRootPath(r.__rootPath || rootPath || '');
+          if (!rp) continue;
           if (!groups.has(rp)) groups.set(rp, []);
           groups.get(rp).push(r);
         }
+        const allRoots = Array.from(groups.keys());
+        let rootsToSave = allRoots;
+        if (_dirtyRootsUnknown) {
+          rootsToSave = allRoots;
+        } else if (_dirtyRoots.size > 0) {
+          rootsToSave = allRoots.filter(rp => _dirtyRoots.has(rp));
+          if (!rootsToSave.length && dirty) rootsToSave = allRoots;
+        } else if (dirty) {
+          rootsToSave = allRoots;
+        } else {
+          rootsToSave = [];
+        }
+        if (!rootsToSave.length) {
+          setStatus(dirty ? 'No folder changes to save.' : 'No unsaved changes.');
+          return;
+        }
+
         let saved = 0, failed = 0;
+        const failedRoots = new Set();
         const exportCols = allCols.filter(c => !String(c).startsWith('__'));
-        for (const [rp, groupRows] of groups) {
-          if (!rp) { failed++; continue; }
+        for (const rp of rootsToSave) {
+          const groupRows = groups.get(rp) || [];
           try {
             // Persist cull/rating columns to CSV so culling assistant and reloads see authoritative state.
             if (typeof window.pywebview.api.write_kestrel_csv === 'function') {
@@ -2942,24 +3759,32 @@
             const sd = _normalizeScenedataForSave(rp, groupRows);
             const res = await window.pywebview.api.write_kestrel_scenedata(rp, sd);
             if (res.success) saved++;
-            else { failed++; console.warn('[save scenedata] Failed for', rp, res.error); }
+            else {
+              failed++;
+              failedRoots.add(rp);
+              console.warn('[save scenedata] Failed for', rp, res.error);
+            }
           } catch (e) {
             failed++;
+            failedRoots.add(rp);
             console.warn('[save pywebview] Error for', rp, e);
           }
         }
         if (failed > 0) {
-          dirty = true; _notifyDirty(true); el('#saveCsv').disabled = false;
+          _dirtyRoots = failedRoots;
+          _dirtyRootsUnknown = false;
+          _setDirtyUi(true);
           setStatus(`Saved ${saved} folder(s), ${failed} failed`);
         } else {
-          dirty = false; _notifyDirty(false); el('#saveCsv').disabled = true;
+          _clearDirtyRoots();
+          _setDirtyUi(false);
           takeSnapshot();
           setStatus(`Saved changes to ${saved} folder(s)`);
         }
         return;
       }
 
-      alert('No CSV opened and no save method available.');
+      setStatus('Save unavailable: Desktop API not detected.');
     }
 
     // Warn user on unsaved changes when attempting to close/refresh
@@ -2975,47 +3800,92 @@
       }
     });
 
-    // Attempt to notify backend to shutdown when the page is fully unloaded
+    // Cleanup local caches when the page unloads.
     window.addEventListener('unload', () => {
       try {
-        const backendUrl = getSetting('backendUrl', window.location.origin).replace(/\/$/, '');
-        const headers = { 'Content-Type': 'application/json' };
-        if (window.__BRIDGE_TOKEN) headers['X-Bridge-Token'] = window.__BRIDGE_TOKEN;
-        navigator.sendBeacon && navigator.sendBeacon(backendUrl + '/shutdown', new Blob([JSON.stringify({ reason: 'page_unload' })], { type: 'application/json' }));
-        // Fallback (best-effort, may be ignored on some browsers)
-        fetch(backendUrl + '/shutdown', { method: 'POST', keepalive: true, headers, body: JSON.stringify({ reason: 'page_unload' }) }).catch(() => { });
+        _cleanupCachesOnAppClose();
       } catch (_) { }
     });
 
-    // Add draggable splitter for resizing right preview panel
-    (function setupColumnResizer() {
-      const dlg = document.getElementById('sceneDlg');
-      const divider = document.getElementById('colDivider');
-      if (!dlg || !divider) return;
+    // Scene preview divider: drag to resize Full Image vs Bird Crop panes
+    (function setupScenePreviewDivider() {
+      const previews = document.getElementById('scenePreviews');
+      const divider = document.getElementById('scenePreviewDivider');
+      if (!previews || !divider) return;
 
-      function onMouseDown(e) {
+      let dragging = false;
+      let activePointerId = null;
+
+      const applyFromClientX = (clientX) => {
+        const ratio = _ratioFromPreviewDividerX(previews, divider, clientX);
+        _applyScenePreviewSplit(ratio);
+      };
+
+      const finishDrag = (persist) => {
+        if (!dragging) return;
+        dragging = false;
+        divider.classList.remove('dragging');
+        document.body.style.cursor = '';
+        document.body.style.userSelect = '';
+        if (persist) {
+          _persistScenePreviewSplit(_scenePreviewSplitRatio);
+        }
+      };
+
+      divider.addEventListener('pointerdown', (e) => {
+        if (e.button !== 0) return;
+        dragging = true;
+        activePointerId = e.pointerId;
+        divider.classList.add('dragging');
+        document.body.style.cursor = 'col-resize';
+        document.body.style.userSelect = 'none';
+        try { divider.setPointerCapture(activePointerId); } catch (_) { }
+        applyFromClientX(e.clientX);
         e.preventDefault();
-        const modal = divider.closest('.modal');
-        if (!modal) return;
-        const rect = modal.getBoundingClientRect();
-        const onMove = (ev) => {
-          const newW = Math.round(rect.right - ev.clientX); // distance from cursor to right edge
-          const min = 260; // min width of right panel
-          const max = Math.max(320, Math.floor(rect.width * 0.8));
-          const clamped = Math.min(Math.max(newW, min), max);
-          modal.style.setProperty('--right-w', clamped + 'px');
-        };
-        const onUp = () => {
-          window.removeEventListener('mousemove', onMove);
-          window.removeEventListener('mouseup', onUp);
-        };
-        window.addEventListener('mousemove', onMove);
-        window.addEventListener('mouseup', onUp);
-      }
-      divider.addEventListener('mousedown', onMouseDown);
+      });
+
+      divider.addEventListener('pointermove', (e) => {
+        if (!dragging) return;
+        if (activePointerId !== null && e.pointerId !== activePointerId) return;
+        applyFromClientX(e.clientX);
+        e.preventDefault();
+      });
+
+      divider.addEventListener('pointerup', (e) => {
+        if (!dragging) return;
+        if (activePointerId !== null && e.pointerId !== activePointerId) return;
+        try { divider.releasePointerCapture(e.pointerId); } catch (_) { }
+        activePointerId = null;
+        finishDrag(true);
+      });
+
+      divider.addEventListener('pointercancel', () => {
+        activePointerId = null;
+        finishDrag(true);
+      });
+
       divider.addEventListener('dblclick', () => {
-        const modal = divider.closest('.modal');
-        if (modal) modal.style.setProperty('--right-w', '510px');
+        _applyScenePreviewSplit(SCENE_PREVIEW_SPLIT_DEFAULT);
+        _persistScenePreviewSplit(_scenePreviewSplitRatio);
+      });
+
+      divider.addEventListener('keydown', (e) => {
+        let next = _scenePreviewSplitRatio;
+        const step = e.shiftKey ? 0.05 : 0.02;
+        if (e.key === 'ArrowLeft') next -= step;
+        else if (e.key === 'ArrowRight') next += step;
+        else if (e.key === 'Home') next = SCENE_PREVIEW_SPLIT_MIN;
+        else if (e.key === 'End') next = SCENE_PREVIEW_SPLIT_MAX;
+        else return;
+        e.preventDefault();
+        _applyScenePreviewSplit(next);
+        _persistScenePreviewSplit(_scenePreviewSplitRatio);
+      });
+
+      _applyScenePreviewSplit(_getScenePreviewSplitSetting());
+      window.addEventListener('resize', () => {
+        if (!sceneDlg?.open) return;
+        _applyScenePreviewSplit(_scenePreviewSplitRatio);
       });
     })();
 
@@ -3032,18 +3902,19 @@
     
     // Auto-save logic: debounced save when auto-save is enabled
     async function attemptAutoSave() {
-      dirty = true;
-      _notifyDirty(true);
-      el('#saveCsv').disabled = false;
-      el('#revertCsv').disabled = false;
+      _setDirtyUi(true);
       
       if (!_autoSaveEnabled) {
+        clearTimeout(_autoSaveTimer);
+        _autoSaveTimer = null;
         return;  // Save/Revert workflow; user will click Save button
       }
       
       // Debounce to avoid saving on every keystroke/change (save after 2 seconds of inactivity)
       clearTimeout(_autoSaveTimer);
       _autoSaveTimer = setTimeout(async () => {
+        _autoSaveTimer = null;
+        if (!_autoSaveEnabled || !dirty) return;
         try {
           await saveCsv();
         } catch (e) {
@@ -3053,21 +3924,26 @@
     }
 
     async function hydrateSettingsFromServer() {
-      const backendUrl = (getSetting('backendUrl', window.location.origin) || window.location.origin).replace(/\/$/, '');
       try {
-        const headers = window.__BRIDGE_TOKEN ? { 'X-Bridge-Token': window.__BRIDGE_TOKEN } : {};
-        const res = await fetch(backendUrl + '/settings', { headers });
-        if (!res.ok) return;
-        const data = await res.json();
-        if (data && data.settings && typeof data.settings === 'object') {
-          saveSettings(data.settings);
-          _autoSaveEnabled = data.settings.auto_save_enabled !== false;
-          _updateSaveRevertVisibility();
+        if (!window.pywebview?.api?.get_settings) return;
+        const data = await window.pywebview.api.get_settings();
+        const incoming = (data && data.settings && typeof data.settings === 'object') ? data.settings : null;
+        if (!incoming) return;
+        saveSettings(incoming);
+        _applyScenePreviewSplit(_clampScenePreviewSplitRatio(incoming[SCENE_PREVIEW_SPLIT_KEY]));
+        _autoSaveEnabled = incoming.auto_save_enabled !== false;
+        if (!_autoSaveEnabled) {
+          clearTimeout(_autoSaveTimer);
+          _autoSaveTimer = null;
         }
+        _updateSaveRevertVisibility();
       } catch (_) { }
     }
 
-    function showSettings() {
+    async function showSettings() {
+      // Refresh local cache from persisted settings before rendering values.
+      try { await hydrateSettingsFromServer(); } catch (_) { }
+
       const dlg = document.getElementById('settingsDlg');
       const editor = getSetting('editor', 'darktable');
       const editorSelect = document.getElementById('editorChoice');
@@ -3111,6 +3987,21 @@
       // Mask threshold
       const maskThEl = document.getElementById('maskThreshold');
       if (maskThEl) maskThEl.value = getSetting('mask_threshold', 0.5);
+      const maxBirdCropsEl = document.getElementById('maxBirdCrops');
+      if (maxBirdCropsEl) maxBirdCropsEl.value = getSetting('max_bird_crops', 5);
+      // Exposure compensation profile
+      const expProfileEl = document.getElementById('exposureCompensationProfile');
+      if (expProfileEl) {
+        const savedExpProfile = String(getSetting('exposure_compensation_profile', 'aggressive') || 'aggressive').toLowerCase();
+        expProfileEl.value = ['lenient', 'normal', 'aggressive'].includes(savedExpProfile) ? savedExpProfile : 'aggressive';
+      }
+      const expSolverEl = document.getElementById('exposureCompensationSolver');
+      if (expSolverEl) {
+        const savedExpSolver = String(getSetting('exposure_compensation_solver', 'metered_refine_one_pass') || 'metered_refine_one_pass').toLowerCase();
+        expSolverEl.value = ['metered_refine_one_pass', 'predictive_fast', 'convergent_two_pass'].includes(savedExpSolver)
+          ? savedExpSolver
+          : 'metered_refine_one_pass';
+      }
       // RAW preview cache
       const rawCacheCb = document.getElementById('rawPreviewCacheEnabled');
       if (rawCacheCb) rawCacheCb.checked = getSetting('raw_preview_cache_enabled', true);
@@ -3123,7 +4014,7 @@
         ? (optedIn === true ? 'Opted in' : 'Not sharing')
         : 'Not yet decided';
       
-      // Display total impact (photos analyzed) - read from localStorage settings
+      // Display total impact (photos analyzed) from hydrated local settings.
       const totalPhotos = getSetting('kestrel_impact_total_files', 0);
       const impactEl = document.getElementById('settingsTotalImpact');
       if (impactEl) {
@@ -3153,6 +4044,23 @@
       const sceneTimeThreshold = sttEl2 ? Math.max(0, parseFloat(sttEl2.value) || 1.0) : 1.0;
       const maskThEl2 = document.getElementById('maskThreshold');
       const maskThreshold = maskThEl2 ? Math.max(0.5, Math.min(0.95, parseFloat(maskThEl2.value) || 0.5)) : 0.5;
+      const maxBirdCropsEl2 = document.getElementById('maxBirdCrops');
+      let maxBirdCrops = 5;
+      if (maxBirdCropsEl2) {
+        const parsedMaxBirdCrops = parseInt(maxBirdCropsEl2.value, 10);
+        maxBirdCrops = Number.isFinite(parsedMaxBirdCrops) ? parsedMaxBirdCrops : 5;
+      }
+      maxBirdCrops = Math.max(1, Math.min(20, maxBirdCrops));
+      const expProfileEl2 = document.getElementById('exposureCompensationProfile');
+      const exposureCompensationProfile = (expProfileEl2 ? String(expProfileEl2.value || 'aggressive') : 'aggressive').toLowerCase();
+      const exposureCompensationProfileSafe = ['lenient', 'normal', 'aggressive'].includes(exposureCompensationProfile)
+        ? exposureCompensationProfile
+        : 'aggressive';
+      const expSolverEl2 = document.getElementById('exposureCompensationSolver');
+      const exposureCompensationSolver = (expSolverEl2 ? String(expSolverEl2.value || 'metered_refine_one_pass') : 'metered_refine_one_pass').toLowerCase();
+      const exposureCompensationSolverSafe = ['metered_refine_one_pass', 'predictive_fast', 'convergent_two_pass'].includes(exposureCompensationSolver)
+        ? exposureCompensationSolver
+        : 'metered_refine_one_pass';
       const rawCacheCb2 = document.getElementById('rawPreviewCacheEnabled');
       const rawPreviewCacheEnabled = rawCacheCb2 ? rawCacheCb2.checked : true;
       const autoSaveCb = document.getElementById('settingsAutoSave');
@@ -3160,6 +4068,16 @@
       // Merge into existing settings so keys like machine_id / analytics_consent_shown are preserved
       const existing = loadSettings();
       const prevProfile = existing.rating_profile || 'balanced';
+      const prevMaxBirdCropsRaw = parseInt(existing.max_bird_crops, 10);
+      const prevMaxBirdCrops = Number.isFinite(prevMaxBirdCropsRaw)
+        ? Math.max(1, Math.min(20, prevMaxBirdCropsRaw))
+        : 5;
+      if (maxBirdCrops > 10 && maxBirdCrops !== prevMaxBirdCrops) {
+        const confirmed = confirm(
+          'Raising "Max Bird Crops Saved Per Image" above 10 can substantially increase compute time and memory overhead. Continue?'
+        );
+        if (!confirmed) return;
+      }
       const settings = {
         ...existing, editor, customEditorPath, treeScanDepth,
         analytics_opted_in: analyticsOptIn, analytics_consent_shown: true,
@@ -3167,26 +4085,24 @@
         detection_threshold: detectionThreshold,
         scene_time_threshold: sceneTimeThreshold,
         mask_threshold: maskThreshold,
+        max_bird_crops: maxBirdCrops,
+        exposure_compensation_profile: exposureCompensationProfileSafe,
+        exposure_compensation_solver: exposureCompensationSolverSafe,
         raw_preview_cache_enabled: rawPreviewCacheEnabled,
         auto_save_enabled: autoSaveEnabled,
         raw_exposure_correction_disabled: document.getElementById('rawExposureCorrectionDisabled').checked,
       };
       _autoSaveEnabled = autoSaveEnabled;
+      if (!_autoSaveEnabled) {
+        clearTimeout(_autoSaveTimer);
+        _autoSaveTimer = null;
+      }
       _updateSaveRevertVisibility();
       // Persist settings to localStorage immediately
       saveSettings(settings);
       if (hasPywebviewApi && window.pywebview?.api?.save_settings_data) {
         try { await window.pywebview.api.save_settings_data(settings); } catch (_) { }
       }
-      try {
-        const backendUrl = getSetting('backendUrl', 'http://127.0.0.1:8765');
-        const headers = { 'Content-Type': 'application/json', ...(window.__BRIDGE_TOKEN ? { 'X-Bridge-Token': window.__BRIDGE_TOKEN } : {}) };
-        await fetch(backendUrl.replace(/\/$/, '') + '/settings', {
-          method: 'POST',
-          headers,
-          body: JSON.stringify({ settings })
-        });
-      } catch (_) { }
       document.getElementById('settingsDlg').close();
       // If rating profile changed and folders are loaded, reapply immediately
       if (ratingProfile !== prevProfile && rows.length > 0) {
@@ -3240,7 +4156,7 @@
     document.getElementById('settingsDlg').addEventListener('change', () => _setSettingsDirty(true));
     document.getElementById('settingsDlg').addEventListener('input', () => _setSettingsDirty(true));
 
-    document.getElementById('openSettings').addEventListener('click', showSettings);
+    document.getElementById('openSettings').addEventListener('click', () => { void showSettings(); });
     document.getElementById('settingsSave').addEventListener('click', async () => {
       await applySettings();
       _setSettingsDirty(false);
@@ -3359,15 +4275,10 @@
         screenshot_b64: document.getElementById('feedbackSsPreview').dataset.b64 || '',
       };
       try {
-        let result;
-        if (hasPywebviewApi && window.pywebview?.api?.send_feedback) {
-          result = await window.pywebview.api.send_feedback(data);
-        } else {
-          const backendUrl = (getSetting('backendUrl', window.location.origin) || window.location.origin).replace(/\/$/, '');
-          const headers = { 'Content-Type': 'application/json', ...(window.__BRIDGE_TOKEN ? { 'X-Bridge-Token': window.__BRIDGE_TOKEN } : {}) };
-          const res = await fetch(backendUrl + '/feedback', { method: 'POST', headers, body: JSON.stringify(data) });
-          result = await res.json();
+        if (!window.pywebview?.api?.send_feedback) {
+          throw new Error('Desktop API unavailable');
         }
+        const result = await window.pywebview.api.send_feedback(data);
         if (result && result.success !== false) {
           document.getElementById('feedbackStatus').textContent = '✓ Feedback sent — thank you!';
           setTimeout(() => { try { document.getElementById('feedbackDlg').close(); } catch (_) { } }, 1200);
@@ -3449,8 +4360,12 @@
       try {
         let total = 0;
         if (hasPywebviewApi && window.pywebview?.api?.get_settings) {
-          const s = await window.pywebview.api.get_settings();
-          total = (s && s.kestrel_impact_total_files) ? s.kestrel_impact_total_files : 0;
+          const res = await window.pywebview.api.get_settings();
+          const s = (res && res.success && res.settings && typeof res.settings === 'object') ? res.settings : null;
+          if (s) {
+            saveSettings({ ...loadSettings(), ...s });
+            total = Number(s.kestrel_impact_total_files || 0);
+          }
         }
         if (total <= 0) return;
         const thresholds = [1000, 5000, 10000, 25000, 50000, 100000, 200000];
@@ -3470,8 +4385,18 @@
     /** Check donation threshold on app startup (only once). */
     async function checkDonationThresholdOnStartup() {
       try {
-        // Read from localStorage (same source as the settings dialog)
+        // Prefer persisted settings from backend, then local cache as fallback.
         let total = getSetting('kestrel_impact_total_files', 0);
+        if (hasPywebviewApi && window.pywebview?.api?.get_settings) {
+          try {
+            const res = await window.pywebview.api.get_settings();
+            const s = (res && res.success && res.settings && typeof res.settings === 'object') ? res.settings : null;
+            if (s) {
+              saveSettings({ ...loadSettings(), ...s });
+              total = Number(s.kestrel_impact_total_files || total || 0);
+            }
+          } catch (_) { }
+        }
         console.log('[donation] checkDonationThresholdOnStartup: total =', total);
         if (total < 1000) {
           console.log('[donation] Total < 1000, skipping');
@@ -3503,19 +4428,19 @@
     // because that dialog is defined after this script block and wouldn't be in the DOM yet.
     // ─── End Donation ─────────────────────────────────────────────────────
 
-    // Info dialog: load kestrel_metadata.json from opened photo folder (.kestrel)
-    async function getMetadataHandle() {
-      if (!rootDirHandle) return null;
-      try { return await getHandleFromRelativePath(rootDirHandle, '.kestrel/kestrel_metadata.json'); } catch { return null; }
-    }
     async function readMetadata() {
-      const h = await getMetadataHandle();
-      if (!h) return { error: 'kestrel_metadata.json not found. Use "Open Photo Folder…" to select your root.' };
+      if (!rootPath || !window.pywebview?.api?.read_kestrel_metadata) {
+        return { error: 'kestrel_metadata.json not found. Open a folder in desktop mode first.' };
+      }
       try {
-        const file = await h.getFile();
-        const text = await file.text();
-        try { return JSON.parse(text); } catch { return { error: 'Failed to parse JSON in kestrel_metadata.json' }; }
-      } catch { return { error: 'Unable to read kestrel_metadata.json' }; }
+        const res = await window.pywebview.api.read_kestrel_metadata(rootPath);
+        if (!res?.success || !res?.metadata || typeof res.metadata !== 'object') {
+          return { error: res?.error || 'Unable to read kestrel_metadata.json' };
+        }
+        return res.metadata;
+      } catch {
+        return { error: 'Unable to read kestrel_metadata.json' };
+      }
     }
     async function openInfo() {
       const dlg = document.getElementById('infoDlg');
@@ -3528,7 +4453,7 @@
       if (meta && !meta.error) {
         // Add derived helper fields (non-destructive)
         const enriched = { ...meta };
-        if (rootDirHandle) enriched.photo_root_name = rootDirHandle.name || '';
+        if (rootPath) enriched.photo_root_name = rootPath.replace(/.*[/\\]/, '') || rootPath;
         contentEl.textContent = JSON.stringify(enriched, null, 2);
       } else {
         contentEl.textContent = '—';
@@ -3575,25 +4500,18 @@
 
       if (!origRel) { setStatus('No filename available for this row.'); return; }
       if (!rootToSend) { setStatus('Set Local Root in Settings to enable launching originals.'); showSettings(); return; }
-      const backendUrl = getSetting('backendUrl', window.location.origin);
       const editor = getSetting('editor', 'system');
       try {
-        const res = await fetch(backendUrl.replace(/\/$/, '') + '/open', {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            ...(window.__BRIDGE_TOKEN ? { 'X-Bridge-Token': window.__BRIDGE_TOKEN } : {})
-          },
-          body: JSON.stringify({ root: rootToSend, relative: origRel, editor })
-        });
-        if (!res.ok) throw new Error('HTTP ' + res.status);
-        const data = await res.json();
-        if (data && data.ok) {
+        if (!window.pywebview?.api?.open_in_editor) {
+          throw new Error('Desktop API unavailable: open_in_editor');
+        }
+        const data = await window.pywebview.api.open_in_editor(rootToSend, origRel, editor);
+        if (data && data.success) {
           setStatus('Opened in editor');
           showToast('Opened in ' + editor, 5000, () => showSettings());
         } else throw new Error(data && data.error || 'Launch failed');
       } catch (e) {
-        setStatus('Failed to open in editor. Check Settings and server.');
+        setStatus('Failed to open in editor. Check Settings and Local Root.');
       }
     }
 
@@ -3605,6 +4523,7 @@
     let treeExpandedPaths = new Set();
     let treeActivePath = null;       // currently single-loaded folder
     let checkedFolderPaths = new Set(); // folders checked for multi-load
+    let _checkedFolderPathSnapshot = new Map(); // normalized path -> original path
     let queuedFolderPaths = new Set(); // folders queued for analysis (dialog selection)
     let _treeFlatOrder = [];           // flat ordered list of visible tree paths for range-select
     let _appVersion = '';              // current app version, fetched once
@@ -4522,34 +5441,135 @@
     const CONF_HIGH = 0.75;
     const CONF_LOW = 0.30;
 
-    /** Call the backend (pywebview API or HTTP) to start the queue. */
+    /** Call the backend queue API (desktop pywebview mode only). */
     async function apiStartQueue(paths, useGpu = true, wildlifeEnabled = true) {
-      if (hasPywebviewApi && window.pywebview?.api?.start_analysis_queue) {
-        return window.pywebview.api.start_analysis_queue(JSON.stringify(paths), useGpu, wildlifeEnabled);
+      if (!window.pywebview?.api?.start_analysis_queue) {
+        throw new Error('Desktop API unavailable: start_analysis_queue');
       }
-      // HTTP fallback (browser mode)
-      const headers = { 'Content-Type': 'application/json', ...(window.__BRIDGE_TOKEN ? { 'X-Bridge-Token': window.__BRIDGE_TOKEN } : {}) };
-      const res = await fetch('/queue/start', { method: 'POST', headers, body: JSON.stringify({ paths, use_gpu: useGpu, wildlife_enabled: wildlifeEnabled }) });
-      return res.json();
+      return window.pywebview.api.start_analysis_queue(JSON.stringify(paths), useGpu, wildlifeEnabled);
     }
 
     async function apiQueueControl(action) {
-      if (hasPywebviewApi && window.pywebview?.api) {
-        const fn = { pause: 'pause_analysis_queue', resume: 'resume_analysis_queue', cancel: 'cancel_analysis_queue', clear: 'clear_queue_done' }[action];
-        if (fn && window.pywebview.api[fn]) return window.pywebview.api[fn]();
+      if (!window.pywebview?.api) {
+        throw new Error('Desktop API unavailable: queue control');
       }
-      const headers = { 'Content-Type': 'application/json', ...(window.__BRIDGE_TOKEN ? { 'X-Bridge-Token': window.__BRIDGE_TOKEN } : {}) };
-      const res = await fetch(`/queue/${action}`, { method: 'POST', headers, body: '{}' });
-      return res.json();
+      const fn = { pause: 'pause_analysis_queue', resume: 'resume_analysis_queue', cancel: 'cancel_analysis_queue', clear: 'clear_queue_done' }[action];
+      if (!fn || typeof window.pywebview.api[fn] !== 'function') {
+        throw new Error(`Desktop API missing queue action: ${action}`);
+      }
+      return window.pywebview.api[fn]();
     }
 
     async function apiGetQueueStatus() {
-      if (hasPywebviewApi && window.pywebview?.api?.get_queue_status) {
-        return window.pywebview.api.get_queue_status();
+      if (!window.pywebview?.api?.get_queue_status) {
+        throw new Error('Desktop API unavailable: get_queue_status');
       }
-      const headers = window.__BRIDGE_TOKEN ? { 'X-Bridge-Token': window.__BRIDGE_TOKEN } : {};
-      const res = await fetch('/queue/status', { headers });
-      return res.json();
+      return window.pywebview.api.get_queue_status();
+    }
+
+    async function apiGetRecoveryStatus() {
+      if (!window.pywebview?.api?.get_recovery_status) {
+        throw new Error('Desktop API unavailable: get_recovery_status');
+      }
+      return window.pywebview.api.get_recovery_status();
+    }
+
+    async function apiRestoreRecoveryQueue() {
+      if (!window.pywebview?.api?.restore_analysis_queue) {
+        throw new Error('Desktop API unavailable: restore_analysis_queue');
+      }
+      return window.pywebview.api.restore_analysis_queue();
+    }
+
+    async function apiClearRecoveryState(clearQueueState = true) {
+      if (!window.pywebview?.api?.clear_recovery_state) {
+        throw new Error('Desktop API unavailable: clear_recovery_state');
+      }
+      return window.pywebview.api.clear_recovery_state(!!clearQueueState);
+    }
+
+    async function apiSendRecoveryCrashReport() {
+      if (!window.pywebview?.api?.send_recovery_crash_report) {
+        throw new Error('Desktop API unavailable: send_recovery_crash_report');
+      }
+      return window.pywebview.api.send_recovery_crash_report();
+    }
+
+    let _startupRecoveryHandled = false;
+
+    async function maybeHandleStartupRecovery() {
+      if (_startupRecoveryHandled) return;
+      _startupRecoveryHandled = true;
+
+      if (!hasPywebviewApi) { const ready = await waitForPywebview(); if (!ready) return; }
+
+      let recovery = null;
+      try {
+        recovery = await apiGetRecoveryStatus();
+      } catch (_) {
+        return;
+      }
+      if (!recovery || recovery.success === false) return;
+
+      const restorePaths = Array.isArray(recovery.queue_recovery?.restore_paths)
+        ? recovery.queue_recovery.restore_paths
+        : [];
+      const hasQueueRecovery = restorePaths.length > 0;
+      const hadUncleanShutdown = !!recovery.unclean_shutdown;
+      if (!hasQueueRecovery && !hadUncleanShutdown) return;
+
+      let queueDismissed = false;
+      if (hasQueueRecovery) {
+        const doRestore = confirm(
+          `Kestrel detected an interrupted analysis queue with ${restorePaths.length} folder${restorePaths.length === 1 ? '' : 's'}.\n\nRestore it now?`
+        );
+        if (doRestore) {
+          try {
+            const restoreResult = await apiRestoreRecoveryQueue();
+            if (restoreResult && restoreResult.success !== false) {
+              startPollingQueue();
+              const status = await apiGetQueueStatus();
+              renderQueuePanel(status);
+              setStatus(`Recovered previous analysis queue (${restoreResult.restored || restorePaths.length} folder(s)).`);
+            } else {
+              const msg = restoreResult?.error || 'Unknown error';
+              alert('Could not restore the previous queue:\n\n' + msg);
+              queueDismissed = true;
+            }
+          } catch (e) {
+            alert('Could not restore the previous queue:\n\n' + (e.message || e));
+            queueDismissed = true;
+          }
+        } else {
+          queueDismissed = true;
+        }
+      }
+
+      if (hadUncleanShutdown) {
+        const sendReport = confirm(
+          'Kestrel detected that the previous session did not shut down cleanly.\n\nSend a crash report now?'
+        );
+        if (sendReport) {
+          try {
+            const reportResult = await apiSendRecoveryCrashReport();
+            if (reportResult && reportResult.success === false) {
+              alert('Could not send crash report:\n\n' + (reportResult.error || 'Unknown error'));
+            } else {
+              showToast('Crash report sent. Thank you.', 3500);
+            }
+          } catch (e) {
+            alert('Could not send crash report:\n\n' + (e.message || e));
+          }
+        }
+      }
+
+      try {
+        if (queueDismissed) {
+          await apiClearRecoveryState(true);
+        } else if (hadUncleanShutdown) {
+          await apiClearRecoveryState(false);
+        }
+      } catch (_) { }
     }
 
     /** Format a duration in seconds to a readable string like "2m 30s". */
@@ -5109,9 +6129,10 @@
       const dets = item.current_detections || [];
       const quality = item.current_quality_results || [];
       const species = item.current_species_results || [];
+      const cardCount = Math.max(crops.length, dets.length, quality.length, species.length);
 
-      // Ensure exactly 5 card elements exist
-      while (row.children.length < 5) {
+      // Keep card count in sync with current live detections.
+      while (row.children.length < cardCount) {
         const card = document.createElement('div');
         card.className = 'live-dlg-crop-card';
         card.innerHTML = `
@@ -5123,8 +6144,11 @@
         <div class="ldc-family">–</div>`;
         row.appendChild(card);
       }
+      while (row.children.length > cardCount) {
+        row.removeChild(row.lastChild);
+      }
 
-      for (let i = 0; i < 5; i++) {
+      for (let i = 0; i < cardCount; i++) {
         const card = row.children[i];
         const imgEl = card.querySelector('.live-dlg-crop-img');
         const confEl = card.querySelector('.ldc-conf');
@@ -5188,6 +6212,8 @@
           fmEl.textContent = '–'; fmEl.className = 'ldc-family';
         }
       }
+
+      _liveLastCropKeys.length = cardCount;
     }
 
     // ── End Live Analysis Dialog ─────────────────────────────────────────────────
@@ -5229,7 +6255,7 @@
             if (!hasPywebviewApi || !window.pywebview?.api?.read_kestrel_csv) continue;
             const result = await window.pywebview.api.read_kestrel_csv(p);
             if (!result.success) continue;
-            const parsed = Papa.parse(result.data, { header: true, skipEmptyLines: true });
+            const parsed = parseCsvText(result.data);
             const newRows = parsed.data || [];
             const newFields = parsed.meta.fields || [];
             const root = result.root || p;
@@ -5265,6 +6291,13 @@
 
         if (changed) {
           ensureSceneNameColumn();        ensureRatingColumns();        await renderScenes();
+          // If a scene dialog is open, its filmstrip is stale after renderScenes
+          // rebuilt the scenes array with fresh row objects — re-render it now.
+          if (_currentScene) {
+            renderFilmstrip(_currentScene);
+            const safeIdx = Math.max(0, Math.min(currentImageIndex, _currentScene.images.length - 1));
+            await selectFilmstripImage(safeIdx, _currentScene);
+          }
           setStatus(`Auto-refreshed ${toRefresh.length} newly-analyzed folder(s)`);
         }
       } finally {
@@ -5347,6 +6380,73 @@
       return false;
     }
 
+    function _normalizeFolderPathForCache(path) {
+      return String(path || '').trim().replace(/\\/g, '/').replace(/\/+$/, '');
+    }
+
+    function _snapshotCheckedFolderPathMap() {
+      const snapshot = new Map();
+      for (const rawPath of checkedFolderPaths) {
+        const normalized = _normalizeFolderPathForCache(rawPath);
+        if (!normalized || snapshot.has(normalized)) continue;
+        snapshot.set(normalized, rawPath);
+      }
+      return snapshot;
+    }
+
+    async function _cleanupCullingCachesForPaths(paths, reason = '') {
+      if (!paths || paths.length === 0) return;
+
+      // Also clear in-memory caches so the UI can't show stale previews.
+      try { blobUrlCache.clear(); } catch (_) {}
+      try { sceneRawCache.clear(); } catch (_) {}
+      try { sceneRawLoading.clear(); } catch (_) {}
+
+      if (!hasPywebviewApi || !window.pywebview?.api?.cleanup_culling_cache) return;
+      await Promise.all(paths.map(async (rootPath) => {
+        try {
+          const res = await window.pywebview.api.cleanup_culling_cache(rootPath);
+          if (!res?.success) {
+            console.warn('[cache] cleanup_culling_cache failed:', rootPath, res?.error || 'Unknown error', reason);
+          }
+        } catch (e) {
+          console.warn('[cache] cleanup_culling_cache error:', rootPath, reason, e);
+        }
+      }));
+    }
+
+    async function _cleanupUncheckedFolderCaches() {
+      const current = _snapshotCheckedFolderPathMap();
+      const removed = [];
+      for (const [normalized, rawPath] of _checkedFolderPathSnapshot.entries()) {
+        if (!current.has(normalized)) removed.push(rawPath);
+      }
+      _checkedFolderPathSnapshot = current;
+      if (removed.length > 0) {
+        await _cleanupCullingCachesForPaths(removed, 'folder_unchecked');
+      }
+    }
+
+    function _collectLoadedRootsForCleanup() {
+      const roots = new Set();
+      try {
+        for (const p of checkedFolderPaths) if (p) roots.add(p);
+      } catch (_) {}
+      try {
+        for (const r of rows) {
+          if (r && r.__rootPath) roots.add(r.__rootPath);
+        }
+      } catch (_) {}
+      if (rootPath) roots.add(rootPath);
+      return Array.from(roots);
+    }
+
+    function _cleanupCachesOnAppClose() {
+      const roots = _collectLoadedRootsForCleanup();
+      if (!roots.length) return;
+      _cleanupCullingCachesForPaths(roots, 'app_close').catch(() => {});
+    }
+
     /** Start or stop auto-refresh timers for checked in-progress folders. */
     function _updateAutoRefreshTimers() {
       try {
@@ -5425,6 +6525,7 @@
     // Auto-load: fires after a short debounce whenever checkboxes change.
     // If nothing is checked, clears the view gracefully.
     const debouncedAutoLoad = debounce(async () => {
+      await _cleanupUncheckedFolderCaches();
       if (checkedFolderPaths.size > 0) {
         await loadMultipleFolders(Array.from(checkedFolderPaths));
       } else {
@@ -5474,6 +6575,7 @@
       if (!paths || paths.length === 0) return;
       const myVer = ++_loadFoldersVersion;
       blobUrlCache.clear();
+      _sceneActiveCropIndexByImage.clear();
       rows = [];
       header = [];
       let loadedCount = 0;
@@ -5489,7 +6591,7 @@
           const result = await window.pywebview.api.read_kestrel_csv(p);
           if (myVer !== _loadFoldersVersion) { hideProgress(); return; }
           if (!result.success) continue;
-          const parsed = Papa.parse(result.data, { header: true, skipEmptyLines: true });
+          const parsed = parseCsvText(result.data);
           const newRows = parsed.data || [];
           const newFields = parsed.meta.fields || [];
           for (const f of newFields) if (!header.includes(f)) header.push(f);
@@ -5528,10 +6630,10 @@
       // Per-row __rootPath handles multi-folder image loading in getBlobUrlForPath.
       const firstRow = rows.find(r => r.__rootPath);
       if (firstRow) rootPath = firstRow.__rootPath;
-      rootDirHandle = null;
       ensureSceneNameColumn();
       ensureRatingColumns();
-      dirty = false; _notifyDirty(false);
+      _clearDirtyRoots();
+      _setDirtyUi(false);
       takeSnapshot();
       const mergeBtn = document.getElementById('openMerge');
       if (mergeBtn) mergeBtn.disabled = true;
@@ -5557,10 +6659,11 @@
         }
 
         // Parse the CSV data
-        const parsed = Papa.parse(result.data, { header: true, skipEmptyLines: true });
+        const parsed = parseCsvText(result.data);
         header = parsed.meta.fields || [];
         const loadedRoot = result.root || folderPath;
         rows = (parsed.data || []).map(r => ({ ...r, __rootPath: loadedRoot, __folderSlot: 0 }));
+        _sceneActiveCropIndexByImage.clear();
         
         // Load scenedata for this folder
         if (hasPywebviewApi && window.pywebview?.api?.read_kestrel_scenedata) {
@@ -5589,8 +6692,9 @@
 
         // IMPORTANT: Set rootPath BEFORE renderScenes so image loading works
         rootPath = loadedRoot;
-        rootDirHandle = null; // Clear handle since we're using Python API
-        rootIsKestrel = false;
+        _clearDirtyRoots();
+        _setDirtyUi(false);
+        takeSnapshot();
 
         // Now render with rootPath set
         await renderScenes();
@@ -5610,6 +6714,7 @@
           treeActivePath = loadedPath;
           checkedFolderPaths.clear();
           checkedFolderPaths.add(loadedPath);
+          _checkedFolderPathSnapshot = _snapshotCheckedFolderPathMap();
           renderFolderTree();
         }
       } catch (e) {
@@ -5683,70 +6788,7 @@
           }
         }
 
-        // PRIORITY 2: File System Access API (browser mode only)
-        // This only runs when NOT in pywebview context
-        if (supportsFS) {
-          // Primary path: pick a folder (root or .kestrel)
-          try {
-            rootDirHandle = await window.showDirectoryPicker();
-            rootIsKestrel = rootDirHandle && rootDirHandle.name === '.kestrel';
-            rootPath = ''; // Clear rootPath since we're using handle-based API
-            await tryOpenDefaultCsv(rootDirHandle);
-            return;
-          } catch (e) {
-            if (e.name !== 'AbortError') {
-              console.error('showDirectoryPicker failed:', e);
-            }
-            // user may have cancelled; fall through to file picker
-          }
-
-          // Secondary path: open CSV directly
-          try {
-            const [fh] = await window.showOpenFilePicker({ types: [{ description: 'CSV', accept: { 'text/csv': ['.csv'] } }] });
-            if (!fh) return;
-            rootDirHandle = null;
-            rootIsKestrel = false;
-            rootPath = ''; // Clear rootPath
-            await loadCsvFromHandle(fh);
-            const mergeBtn = document.getElementById('openMerge');
-            if (mergeBtn) mergeBtn.disabled = true;
-            setStatus('CSV loaded (limited previews; use folder selection for full features)');
-            return;
-          } catch (e) {
-            if (e.name !== 'AbortError') {
-              console.error('showOpenFilePicker failed:', e);
-            }
-            // cancelled
-          }
-          return;
-        }
-
-        // Last resort fallback: file input for CSV only
-        setStatus('Opening file picker (limited functionality)...');
-        const input = document.createElement('input');
-        input.type = 'file';
-        input.accept = '.csv,text/csv';
-        rootDirHandle = null;
-        rootPath = ''; // Clear both for fallback mode
-        input.onchange = async () => {
-          const file = input.files[0];
-          if (!file) return;
-          try {
-            const text = await file.text();
-            const parsed = Papa.parse(text, { header: true, skipEmptyLines: true });
-            header = parsed.meta.fields || [];
-            rows = parsed.data || [];
-            ensureSceneNameColumn();
-            ensureRatingColumns();
-            await renderScenes();
-            setStatus('CSV loaded (limited features - no folder access)');
-            alert('CSV loaded successfully.\n\nNote: Image previews and opening files in editors will not work without folder access.\n\nFor full functionality, use the desktop app or a Chromium-based browser (Chrome, Edge, Brave).');
-          } catch (e) {
-            alert(`Failed to load CSV: ${e.message}`);
-            setStatus('CSV load failed');
-          }
-        };
-        input.click();
+        setStatus('Folder picker unavailable: Desktop API missing.');
       } catch (e) {
         console.error('Unexpected error in pickFolder:', e);
         setStatus('An unexpected error occurred');
@@ -5772,6 +6814,10 @@
     // Apply initial auto-save visibility from cached localStorage settings
     (function initAutoSaveVisibility() {
       _autoSaveEnabled = getSetting('auto_save_enabled', true) !== false;
+      if (!_autoSaveEnabled) {
+        clearTimeout(_autoSaveTimer);
+        _autoSaveTimer = null;
+      }
       _updateSaveRevertVisibility();
     })();
 
@@ -5843,7 +6889,7 @@
     if (zoomInBtn) zoomInBtn.addEventListener('click', () => { uiZoom = Math.min(1.4, uiZoom + 0.1); applyZoom(); });
     if (zoomOutBtn) zoomOutBtn.addEventListener('click', () => { uiZoom = Math.max(0.7, uiZoom - 0.1); applyZoom(); });
 
-    // Initialize toolbar toggle for scene-level manual-rated filter
+    // Initialize toolbar toggle for scene-level manual-reviewed filter
     (function initScenesManualFilter() {
       const t = document.getElementById('filterScenesManualRated');
       if (!t) return;
@@ -5954,9 +7000,10 @@
           if (ids.includes(idStr) && idStr !== targetId) { r.scene_count = targetId; changed++; }
         }
         // Update scenedata: move filenames from non-target scenes into target scene
+        let rpForMerge = '';
         if (hasPywebviewApi && changed > 0) {
           const rowSample = rows.find(r => ids.includes(String(r.scene_count)));
-          const rpForMerge = rowSample?.__rootPath || rootPath || '';
+          rpForMerge = rowSample?.__rootPath || rootPath || '';
           if (rpForMerge) {
             const sd = _initScenedata(rpForMerge);
             const allMovedFiles = new Set();
@@ -5974,7 +7021,7 @@
             }
           }
         }
-        if (changed) { dirty = true; _notifyDirty(true); document.getElementById('saveCsv').disabled = false; setStatus(`Merged scenes into ${targetId}. ${changed} rows updated.`); }
+        if (changed) { markDirty(rpForMerge); setStatus(`Merged scenes into ${targetId}. ${changed} rows updated.`); }
         renderScenes();
         dlg.close();
       };
@@ -5996,6 +7043,9 @@
           renderQueuePanel(status);
           if (status.running) startPollingQueue();
         }
+      } catch (_) { }
+      try {
+        await maybeHandleStartupRecovery();
       } catch (_) { }
     })();
 
@@ -6203,6 +7253,9 @@
         try {
           if (hasPywebviewApi && window.pywebview?.api?.agree_to_legal) {
             await window.pywebview.api.agree_to_legal();
+            // Keep local settings in sync immediately after consent so later
+            // UI-driven settings writes include the persisted legal flags.
+            await hydrateSettingsFromServer();
             document.getElementById('legalNotice').classList.add('hidden');
             showToast('Terms accepted. Welcome to Project Kestrel!', 4000);
           }
@@ -6388,7 +7441,7 @@
         }
       }
       if (changed > 0) {
-        markDirty();
+        markDirty(rootPath);
         renderScenes();
         if (currentSceneId != null && _currentScene) {
           const refreshed = reloadScene(currentSceneId);

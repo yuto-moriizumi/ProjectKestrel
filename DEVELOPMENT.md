@@ -85,6 +85,14 @@ python analyzer/cli.py "C:\path\to\photos" --gpu
 python visualizer/visualizer.py --port 8765 --root "C:\path\to\analyzed\photos"
 ```
 
+Security and runtime mode notes:
+- The visualizer is desktop-first and requires pywebview.
+- Browser-only fallback mode is intentionally unsupported.
+- Keep local API bridge security checks aligned with the token+origin policy.
+- Legacy HTTP control routes are disabled by default; compatibility mode requires explicitly setting `KESTREL_ENABLE_LEGACY_HTTP_API=1` (and optionally `KESTREL_ENABLE_LEGACY_OPEN_ENDPOINT=1` for legacy `/open`).
+- Persisted settings are schema-sanitized and clamped on both load and save; unsupported keys are dropped.
+- Path-taking bridge calls enforce root-boundary checks and log rejection events for auditability.
+
 ## Building Executables
 
 ### Prerequisites

@@ -29,11 +29,15 @@ from .database import (
     build_scenedata_from_database,
     update_scenedata_with_database,
 )
-print("Importing read_image from image_utils...")
+from .exposure_compensation import (
+    apply_exposure_correction as ec_apply_exposure_correction,
+    build_metered_detection_image,
+    compose_total_stops as ec_compose_total_stops,
+    compute_exposure_stops as ec_compute_exposure_stops,
+    refine_exposure_stops as ec_refine_exposure_stops,
+)
 from .image_utils import read_image, read_image_for_pipeline
-print("read_image imported successfully.")
 from .ratings import quality_to_rating, get_profile_thresholds
-print("Importing compute_image_similarity_akaze from similarity...")
 from .similarity import compute_image_similarity_akaze, compute_similarity_timestamp
 from .raw_exif import get_capture_time
 from .logging_utils import get_log_path, log_event, log_exception, log_warning
@@ -45,16 +49,9 @@ except ImportError:
         from analyzer.settings_utils import load_persisted_settings
     except ImportError:
         load_persisted_settings = None
-
-print("Utility functions imported successfully.")
-
-print("Importing ML models... Starting with MaskRCNNWrapper...")
 from .ml.mask_rcnn import MaskRCNNWrapper
-print("MaskRCNNWrapper imported successfully. Now importing BirdSpeciesClassifier...")
 from .ml.bird_species import BirdSpeciesClassifier
-print("BirdSpeciesClassifier imported successfully. Now importing QualityClassifier...")
 from .ml.quality import QualityClassifier
-print("QualityClassifier imported successfully. All ML models imported.")
 
 
 class AnalysisPipeline:
@@ -91,113 +88,50 @@ class AnalysisPipeline:
         return overlay
 
     @staticmethod
-    def _compute_exposure_stops(img: np.ndarray, mask: np.ndarray) -> float:
-        """Estimate exposure correction in stops for the masked subject region.
+    def _compute_exposure_stops(img: np.ndarray, mask: np.ndarray, profile: str = "aggressive") -> float:
+        return ec_compute_exposure_stops(img, mask, profile)
 
-        This is histogram-aware (percentile based), not mean-only. It balances
-        two goals:
-        1) center subject mid-tones toward a neutral target, and
-        2) protect highlight/shadow detail in mixed-contrast scenes.
-
-        Returns a value in [-1.75, +2.5] where positive lifts exposure and
-        negative pulls it down.
-        """
-        EPS = 1e-3        
-        #TARGET_MID = 0.42
-        #TARGET_HI_P90 = 0.90
-        #TARGET_HI_P98 = 0.975
-        TARGET_MID = 0.48
-        TARGET_HI_P90 = 0.92
-        TARGET_HI_P98 = 0.985
-        TARGET_HI_P95_HOT = 0.88
-        SHADOW_FLOOR_P10 = 0.06
-        CLIP_THRESH = 0.985
-        HOT_CLIP_RATIO = 0.02
-        MAX_DARKEN = -1.75
-        MAX_BRIGHTEN = 2.5
-        try:
-            img_f = img.astype(np.float32) / 255.0
-            mask_bool = mask.astype(bool) if mask is not None else None
-            if (
-                mask_bool is not None
-                and mask_bool.any()
-                and img_f.ndim == 3
-                and img_f.shape[:2] == mask_bool.shape
-            ):
-                pixels = img_f[mask_bool]
-            else:
-                pixels = img_f.reshape(-1, 3)
-            # Perceptual luminance weights (Rec. 709)
-            lum = 0.2126 * pixels[:, 0] + 0.7152 * pixels[:, 1] + 0.0722 * pixels[:, 2]
-            lum = lum[np.isfinite(lum)]
-            if lum.size == 0:
-                return 0.0
-            p10, p50, p90, p95, p98 = np.percentile(lum, [10, 50, 90, 95, 98])
-            clip_ratio = float(np.mean(lum >= CLIP_THRESH))
-
-            # Midtone intent (robust against small bright outliers).
-            mid_stop = float(np.log2(TARGET_MID / max(float(p50), EPS)))
-
-            # Highlight ceilings prevent over-bright outputs.
-            hi90_stop = float(np.log2(TARGET_HI_P90 / max(float(p90), EPS)))
-            hi98_stop = float(np.log2(TARGET_HI_P98 / max(float(p98), EPS)))
-            highlight_ceiling = min(hi90_stop, hi98_stop, MAX_BRIGHTEN)
-
-            # Shadow floor prevents excessive darkening in high dynamic-range masks.
-            shadow_floor = max(MAX_DARKEN, float(np.log2(SHADOW_FLOOR_P10 / max(float(p10), EPS))))
-
-            # Start from midtone intent, then clamp by highlight/shadow guardrails.
-            stops = float(np.clip(mid_stop, shadow_floor, highlight_ceiling))
-
-            # If a meaningful chunk is clipped/highlight-hot, bias a little darker
-            # to recover structure in bright regions.
-            if clip_ratio >= HOT_CLIP_RATIO:
-                hot_stop = float(np.log2(TARGET_HI_P95_HOT / max(float(p95), EPS)))
-                stops = min(stops, hot_stop)
-                stops = float(np.clip(stops, MAX_DARKEN, MAX_BRIGHTEN))
-
-            if not np.isfinite(stops):
-                return 0.0
-            return stops
-        except Exception:
-            return 0.0
+    @staticmethod
+    def _refine_exposure_stops(
+        img: np.ndarray,
+        mask: np.ndarray,
+        initial_stops: float,
+        profile: str,
+        solver: str = "metered_refine_one_pass",
+        raw_obj=None,
+        *,
+        base_scale: float = 1.0,
+        no_auto_bright: bool = False,
+    ) -> float:
+        return ec_refine_exposure_stops(
+            img,
+            mask,
+            initial_stops,
+            profile,
+            solver=solver,
+            raw_obj=raw_obj,
+            base_scale=base_scale,
+            no_auto_bright=no_auto_bright,
+        )
 
     @staticmethod
     def _apply_exposure_correction(
-        img: np.ndarray, stops: float, raw_obj=None
+        img: np.ndarray,
+        stops: float,
+        raw_obj=None,
+        *,
+        base_scale: float = 1.0,
+        no_auto_bright: bool = False,
+        profile: str = "aggressive",
     ) -> np.ndarray:
-        """Return a copy of *img* with exposure shifted by *stops* stops.
-
-        When *raw_obj* is a live rawpy.RawPy instance (RAW files), the
-        correction is applied via rawpy.postprocess(exp_shift=…) in the linear
-        domain before demosaicing, which correctly recovers highlight detail
-        on overexposed subjects rather than clipping.
-
-        For non-RAW sources (JPEG/PNG, or if rawpy re-process fails) the
-        method falls back to pixel-level multiplication.
-
-        Positive stops lifts (brightens), negative stops pulls (darkens).
-        Returns the original array unchanged when stops == 0.0.
-        """
-        if stops == 0.0:
-            return img
-        if raw_obj is not None:
-            try:
-                # exp_shift is in linear scale: 2^stops.
-                # rawpy usable range: 0.25 (−2 stops) … 8.0 (+3 stops).
-                linear_scale = float(np.clip(2.0 ** stops, 0.25, 8.0))
-                # Preserve highlights when brightening to avoid blowing out
-                # any remaining highlight detail.
-                preserve = 0.8 if stops > 0 else 0.0
-                return raw_obj.postprocess(
-                    no_auto_bright=True,
-                    exp_shift=linear_scale,
-                    exp_preserve_highlights=preserve,
-                )
-            except Exception:
-                pass  # fall through to pixel-level fallback below
-        factor = 2.0 ** stops
-        return (img.astype(np.float32) * factor).clip(0.0, 255.0).astype(np.uint8)
+        return ec_apply_exposure_correction(
+            img,
+            stops,
+            raw_obj,
+            base_scale=base_scale,
+            no_auto_bright=no_auto_bright,
+            profile=profile,
+        )
 
     @staticmethod
     def _get_image_orientation(img: np.ndarray) -> str:
@@ -210,22 +144,39 @@ class AnalysisPipeline:
             return "landscape"
         return "square"
 
-    def load_models(self, status_cb: Optional[Callable[[str], None]] = None) -> None:
-        if self.mask_rcnn and self.species_clf and self.quality_clf:
+    def load_models(
+        self,
+        status_cb: Optional[Callable[[str], None]] = None,
+        max_bird_crops: int = 5,
+    ) -> None:
+        try:
+            max_bird_crops = int(max_bird_crops)
+        except (TypeError, ValueError):
+            max_bird_crops = 5
+        max_bird_crops = max(1, min(20, max_bird_crops))
+
+        mask_ready_for_cap = bool(
+            self.mask_rcnn
+            and int(getattr(self.mask_rcnn, "max_bird_crops", 5)) == max_bird_crops
+        )
+        if mask_ready_for_cap and self.species_clf and self.quality_clf:
             return
         if status_cb:
             status_cb("Loading models... This may take a while on first run.")
-        self.mask_rcnn = MaskRCNNWrapper()
-        self.species_clf = BirdSpeciesClassifier(
-            str(SPECIESCLASSIFIER_PATH),
-            str(SPECIESCLASSIFIER_LABELS),
-            self.use_gpu,
-            models_dir=str(MODELS_DIR),
-        )
-        self.quality_clf = QualityClassifier(
-            str(QUALITYCLASSIFIER_PATH),
-            normalization_data_path=str(QUALITY_NORMALIZATION_DATA_PATH),
-        )
+        if not mask_ready_for_cap:
+            self.mask_rcnn = MaskRCNNWrapper(max_bird_crops=max_bird_crops)
+        if not self.species_clf:
+            self.species_clf = BirdSpeciesClassifier(
+                str(SPECIESCLASSIFIER_PATH),
+                str(SPECIESCLASSIFIER_LABELS),
+                self.use_gpu,
+                models_dir=str(MODELS_DIR),
+            )
+        if not self.quality_clf:
+            self.quality_clf = QualityClassifier(
+                str(QUALITYCLASSIFIER_PATH),
+                normalization_data_path=str(QUALITY_NORMALIZATION_DATA_PATH),
+            )
         if status_cb:
             status_cb("Models loaded. Processing started.")
 
@@ -240,6 +191,7 @@ class AnalysisPipeline:
         detection_threshold: float = 0.75,
         scene_time_threshold: float = 1.0,
         mask_threshold: float = 0.5,
+        max_bird_crops: int = 5,
     ) -> None:
         callbacks = callbacks or {}
         status_cb = callbacks.get("on_status")
@@ -252,12 +204,26 @@ class AnalysisPipeline:
         species_cb = callbacks.get("on_species")
         error_cb = callbacks.get("on_error")
 
+        try:
+            max_bird_crops = int(max_bird_crops)
+        except (TypeError, ValueError):
+            max_bird_crops = 5
+        max_bird_crops = max(1, min(20, max_bird_crops))
+
         rating_thresholds = None
+        exposure_profile = "aggressive"
+        exposure_solver = "metered_refine_one_pass"
         if callable(load_persisted_settings):
             try:
                 sett = load_persisted_settings() or {}
                 profile = sett.get('rating_profile', 'balanced')
                 rating_thresholds = get_profile_thresholds(profile)
+                raw_exp_profile = str(sett.get('exposure_compensation_profile', 'aggressive') or 'aggressive').strip().lower()
+                if raw_exp_profile in {'lenient', 'normal', 'aggressive'}:
+                    exposure_profile = raw_exp_profile
+                raw_exp_solver = str(sett.get('exposure_compensation_solver', 'metered_refine_one_pass') or 'metered_refine_one_pass').strip().lower()
+                if raw_exp_solver in {'metered_refine_one_pass', 'convergent_two_pass', 'predictive_fast'}:
+                    exposure_solver = raw_exp_solver
             except Exception:
                 rating_thresholds = None
 
@@ -350,7 +316,7 @@ class AnalysisPipeline:
                 return
 
             stage_ctx["stage"] = "load_models"
-            self.load_models(status_cb=status_cb)
+            self.load_models(status_cb=status_cb, max_bird_crops=max_bird_crops)
 
             previous_image = None
             previous_image_path = None
@@ -391,6 +357,8 @@ class AnalysisPipeline:
                     "quality": -1.0,
                     "export_path": "N/A",
                     "crop_path": "N/A",
+                    "crops_json": "[]",
+                    "primary_crop_index": 0,
                     "scene_count": scene_count,
                     "feature_similarity": -1.0,
                     "feature_confidence": -1.0,
@@ -402,6 +370,9 @@ class AnalysisPipeline:
                     "secondary_family_list": [],
                     "secondary_family_scores": [],
                     "exposure_correction": 0.0,
+                    "exposure_pipeline": "legacy_auto_bright_v1",
+                    "exposure_subject_stops": 0.0,
+                    "exposure_meter_scale": 1.0,
                     "detection_scores": [],
                     "capture_time": "",
                     "orientation": "unknown",
@@ -409,6 +380,7 @@ class AnalysisPipeline:
 
                 image_path = None
                 raw_obj = None
+                raw_meter_scale = 1.0
                 try:
                     stage_ctx["stage"] = "read_image"
                     stage_ctx["file"] = raw_file
@@ -416,6 +388,23 @@ class AnalysisPipeline:
                     img, raw_obj = read_image_for_pipeline(image_path)
                     if img is None:
                         raise RuntimeError("Image read returned None")
+
+                    if raw_obj is not None:
+                        entry["exposure_pipeline"] = "no_auto_bright_metered_v1"
+                        metered_img, raw_meter_scale, meter_debug = build_metered_detection_image(
+                            raw_obj,
+                            profile=exposure_profile,
+                        )
+                        entry["exposure_meter_scale"] = float(raw_meter_scale)
+                        if metered_img is not None:
+                            img = metered_img
+                        elif meter_debug.get("error"):
+                            log_warning(
+                                self._log_path,
+                                f"RAW metering fallback to default decode: {meter_debug['error']}",
+                                stage=stage_ctx["stage"],
+                                context={"file": raw_file, "folder": folder},
+                            )
 
                     current_orientation = self._get_image_orientation(img)
                     entry["orientation"] = current_orientation
@@ -527,7 +516,7 @@ class AnalysisPipeline:
                         if status_cb:
                             status_cb(f"No detections in {raw_file}")
                         stage_ctx["stage"] = "write_crop"
-                        crop_path = os.path.join(crop_dir, f"{os.path.splitext(raw_file)[0]}_crop.jpg")
+                        crop_path = os.path.join(crop_dir, f"{os.path.splitext(raw_file)[0]}_crop_0.jpg")
                         cv2.imwrite(
                             crop_path,
                             cv2.cvtColor(img_small, cv2.COLOR_RGB2BGR),
@@ -535,7 +524,44 @@ class AnalysisPipeline:
                         )
                         # Store relative path for cross-platform compatibility
                         crop_path_rel = os.path.relpath(crop_path, folder)
-                        entry.update({"crop_path": crop_path_rel})
+                        h, w = img.shape[:2]
+                        fallback_crop = {
+                            "crop_index": 0,
+                            "crop_path": crop_path_rel,
+                            "detection_index": -1,
+                            "detection_confidence": 0.0,
+                            "species": "Unknown",
+                            "species_confidence": 0.0,
+                            "family": "Unknown",
+                            "family_confidence": 0.0,
+                            "quality": -1.0,
+                            "rating": 0,
+                            "exposure_correction": 0.0,
+                            "exposure_pipeline": entry.get("exposure_pipeline", "legacy_auto_bright_v1"),
+                            "exposure_subject_stops": 0.0,
+                            "exposure_meter_scale": float(entry.get("exposure_meter_scale", 1.0)),
+                            "bbox": {
+                                "x_min": 0,
+                                "x_max": int(w),
+                                "y_min": 0,
+                                "y_max": int(h),
+                                "width": int(w),
+                                "height": int(h),
+                                "x_min_norm": 0.0,
+                                "x_max_norm": 1.0,
+                                "y_min_norm": 0.0,
+                                "y_max_norm": 1.0,
+                                "x_center_norm": 0.5,
+                                "y_center_norm": 0.5,
+                            },
+                        }
+                        entry.update(
+                            {
+                                "crop_path": crop_path_rel,
+                                "crops_json": json.dumps([fallback_crop]),
+                                "primary_crop_index": 0,
+                            }
+                        )
                         stage_ctx["stage"] = "save_database"
                         database = pd.concat([database, pd.DataFrame([entry])], ignore_index=True)
                         save_database(database, db_path)
@@ -550,7 +576,7 @@ class AnalysisPipeline:
 
                     wildlife_indices = [i for i, c in enumerate(pred_class) if c in active_wildlife_categories]
                     bird_indices = [i for i, c in enumerate(pred_class) if c == "bird"]
-                    bird_indices = sorted(bird_indices, key=lambda i: pred_score[i], reverse=True)[:5]
+                    bird_indices = sorted(bird_indices, key=lambda i: pred_score[i], reverse=True)[:max_bird_crops]
 
                     overlay_indices = bird_indices if bird_indices else wildlife_indices[:1]
                     if detection_cb:
@@ -564,13 +590,44 @@ class AnalysisPipeline:
 
                     def process_nonbird(primary_mask_i):
                         stage_ctx["stage"] = "process_nonbird"
-                        stops = self._compute_exposure_stops(img, masks[primary_mask_i])
-                        img_src = self._apply_exposure_correction(img, stops, raw_obj)
+                        stops = self._compute_exposure_stops(img, masks[primary_mask_i], exposure_profile)
+                        stops = self._refine_exposure_stops(
+                            img,
+                            masks[primary_mask_i],
+                            stops,
+                            exposure_profile,
+                            solver=exposure_solver,
+                            raw_obj=raw_obj,
+                            base_scale=raw_meter_scale,
+                            no_auto_bright=raw_obj is not None,
+                        )
+                        img_src = self._apply_exposure_correction(
+                            img,
+                            stops,
+                            raw_obj,
+                            base_scale=raw_meter_scale,
+                            no_auto_bright=raw_obj is not None,
+                            profile=exposure_profile,
+                        )
+                        total_stops = (
+                            ec_compose_total_stops(stops, raw_meter_scale)
+                            if raw_obj is not None
+                            else float(stops)
+                        )
+                        meter_scale = float(raw_meter_scale if raw_obj is not None else 1.0)
+                        pipeline_mode = (
+                            "no_auto_bright_metered_v1"
+                            if raw_obj is not None
+                            else "legacy_auto_bright_v1"
+                        )
+                        crop_bbox = self.mask_rcnn.get_square_crop_box(masks[primary_mask_i])
                         quality_crop, quality_mask = self.mask_rcnn.get_square_crop(
                             masks[primary_mask_i], img_src, resize=True
                         )
                         quality_score = self.quality_clf.classify(quality_crop, quality_mask)
                         return {
+                            "index": int(primary_mask_i),
+                            "confidence": float(pred_score[primary_mask_i]),
                             "species": pred_class[primary_mask_i],
                             "species_confidence": float(pred_score[primary_mask_i]),
                             "family": "N/A",
@@ -578,7 +635,11 @@ class AnalysisPipeline:
                             "quality": quality_score,
                             "rating": quality_to_rating(quality_score, rating_thresholds),
                             "quality_crop": quality_crop,
-                            "exposure_correction": round(stops, 4),
+                            "exposure_correction": round(total_stops, 4),
+                            "exposure_pipeline": pipeline_mode,
+                            "exposure_subject_stops": round(float(stops), 4),
+                            "exposure_meter_scale": round(meter_scale, 6),
+                            "crop_bbox": crop_bbox,
                         }
 
                     def process_bird_items(indices):
@@ -587,9 +648,38 @@ class AnalysisPipeline:
                         for i in indices:
                             # Process per-crop results. Pause is checked at the
                             # top of the image loop so we avoid pausing mid-image.
-                            stops = self._compute_exposure_stops(img, masks[i])
-                            img_src = self._apply_exposure_correction(img, stops, raw_obj)
+                            stops = self._compute_exposure_stops(img, masks[i], exposure_profile)
+                            stops = self._refine_exposure_stops(
+                                img,
+                                masks[i],
+                                stops,
+                                exposure_profile,
+                                solver=exposure_solver,
+                                raw_obj=raw_obj,
+                                base_scale=raw_meter_scale,
+                                no_auto_bright=raw_obj is not None,
+                            )
+                            img_src = self._apply_exposure_correction(
+                                img,
+                                stops,
+                                raw_obj,
+                                base_scale=raw_meter_scale,
+                                no_auto_bright=raw_obj is not None,
+                                profile=exposure_profile,
+                            )
+                            total_stops = (
+                                ec_compose_total_stops(stops, raw_meter_scale)
+                                if raw_obj is not None
+                                else float(stops)
+                            )
+                            meter_scale = float(raw_meter_scale if raw_obj is not None else 1.0)
+                            pipeline_mode = (
+                                "no_auto_bright_metered_v1"
+                                if raw_obj is not None
+                                else "legacy_auto_bright_v1"
+                            )
                             species_crop = self.mask_rcnn.get_species_crop(pred_boxes[i], img_src)
+                            crop_bbox = self.mask_rcnn.get_square_crop_box(masks[i])
                             quality_crop, quality_mask = self.mask_rcnn.get_square_crop(masks[i], img_src, resize=True)
                             items.append(
                                 {
@@ -599,6 +689,11 @@ class AnalysisPipeline:
                                     "quality_crop": quality_crop,
                                     "quality_mask": quality_mask,
                                     "stops": stops,
+                                    "total_stops": total_stops,
+                                    "exposure_pipeline": pipeline_mode,
+                                    "exposure_subject_stops": round(float(stops), 4),
+                                    "exposure_meter_scale": round(meter_scale, 6),
+                                    "crop_bbox": crop_bbox,
                                 }
                             )
                         if crops_cb:
@@ -638,7 +733,10 @@ class AnalysisPipeline:
                                 item["species_confidence"] = float(pred_score[i])
                                 item["family"] = "N/A"
                                 item["family_confidence"] = 0.0
-                            item["exposure_correction"] = round(item["stops"], 4)
+                            item["exposure_correction"] = round(
+                                float(item.get("total_stops", item["stops"])),
+                                4,
+                            )
                             stage_ctx["stage"] = "quality_score"
                             quality_score = self.quality_clf.classify(item["quality_crop"], item["quality_mask"])
                             item["quality"] = quality_score
@@ -669,10 +767,16 @@ class AnalysisPipeline:
                             )
                         return items
 
+                    crop_items_for_write = []
+                    primary_crop_index = 0
+                    img_h, img_w = img.shape[:2]
+
                     if bird_indices:
                         bird_items = process_bird_items(bird_indices)
                         bird_data = [
                             {
+                                "index": i["index"],
+                                "confidence": i["confidence"],
                                 "species": i["species"],
                                 "species_confidence": i["species_confidence"],
                                 "family": i["family"],
@@ -681,10 +785,15 @@ class AnalysisPipeline:
                                 "rating": i["rating"],
                                 "quality_crop": i["quality_crop"],
                                 "exposure_correction": i.get("exposure_correction", 0.0),
+                                "exposure_pipeline": i.get("exposure_pipeline", "legacy_auto_bright_v1"),
+                                "exposure_subject_stops": i.get("exposure_subject_stops", 0.0),
+                                "exposure_meter_scale": i.get("exposure_meter_scale", 1.0),
+                                "crop_bbox": i.get("crop_bbox"),
                             }
                             for i in bird_items
                         ]
-                        primary_bird = max(bird_data, key=lambda x: x["quality"])
+                        primary_crop_index = int(np.argmax([b["quality"] for b in bird_data]))
+                        primary_bird = bird_data[primary_crop_index]
                         entry.update(
                             {
                                 "species": primary_bird["species"],
@@ -693,6 +802,9 @@ class AnalysisPipeline:
                                 "family_confidence": primary_bird["family_confidence"],
                                 "quality": primary_bird["quality"],
                                 "exposure_correction": primary_bird["exposure_correction"],
+                                "exposure_pipeline": primary_bird["exposure_pipeline"],
+                                "exposure_subject_stops": primary_bird["exposure_subject_stops"],
+                                "exposure_meter_scale": primary_bird["exposure_meter_scale"],
                             }
                         )
                         all_species = [b["species"] for b in bird_data]
@@ -707,7 +819,7 @@ class AnalysisPipeline:
                                 "secondary_family_scores": json.dumps(all_family_conf),
                             }
                         )
-                        crop_img = primary_bird["quality_crop"]
+                        crop_items_for_write = bird_data
                     else:
                         if wildlife_indices:
                             primary_index = wildlife_indices[np.argmax([pred_score[i] for i in wildlife_indices])]
@@ -749,9 +861,13 @@ class AnalysisPipeline:
                                     "family_confidence": result["family_confidence"],
                                     "quality": result["quality"],
                                     "exposure_correction": result["exposure_correction"],
+                                    "exposure_pipeline": result.get("exposure_pipeline", "legacy_auto_bright_v1"),
+                                    "exposure_subject_stops": result.get("exposure_subject_stops", 0.0),
+                                    "exposure_meter_scale": result.get("exposure_meter_scale", 1.0),
                                 }
                             )
-                            crop_img = result["quality_crop"]
+                            crop_items_for_write = [result]
+                            primary_crop_index = 0
                         else:
                             if crops_cb:
                                 crops_cb({"filename": raw_file, "crops": [], "confidences": []})
@@ -759,18 +875,121 @@ class AnalysisPipeline:
                                 quality_cb({"filename": raw_file, "results": []})
                             if species_cb:
                                 species_cb({"filename": raw_file, "results": []})
-                            crop_img = img_small
+                            crop_items_for_write = [
+                                {
+                                    "index": -1,
+                                    "confidence": 0.0,
+                                    "species": entry.get("species", "Unknown"),
+                                    "species_confidence": entry.get("species_confidence", 0.0),
+                                    "family": entry.get("family", "Unknown"),
+                                    "family_confidence": entry.get("family_confidence", 0.0),
+                                    "quality": entry.get("quality", -1.0),
+                                    "rating": 0,
+                                    "quality_crop": img_small,
+                                    "exposure_correction": entry.get("exposure_correction", 0.0),
+                                    "exposure_pipeline": entry.get("exposure_pipeline", "legacy_auto_bright_v1"),
+                                    "exposure_subject_stops": entry.get("exposure_subject_stops", 0.0),
+                                    "exposure_meter_scale": entry.get("exposure_meter_scale", 1.0),
+                                    "crop_bbox": {
+                                        "x_min": 0,
+                                        "x_max": int(img_w),
+                                        "y_min": 0,
+                                        "y_max": int(img_h),
+                                        "width": int(img_w),
+                                        "height": int(img_h),
+                                        "x_min_norm": 0.0,
+                                        "x_max_norm": 1.0,
+                                        "y_min_norm": 0.0,
+                                        "y_max_norm": 1.0,
+                                        "x_center_norm": 0.5,
+                                        "y_center_norm": 0.5,
+                                    },
+                                }
+                            ]
+                            primary_crop_index = 0
 
                     stage_ctx["stage"] = "write_crop"
-                    crop_path = os.path.join(crop_dir, f"{os.path.splitext(raw_file)[0]}_crop.jpg")
-                    cv2.imwrite(
-                        crop_path,
-                        cv2.cvtColor(crop_img, cv2.COLOR_RGB2BGR),
-                        [cv2.IMWRITE_JPEG_QUALITY, 85],
+                    serialized_crops = []
+                    base_name = os.path.splitext(raw_file)[0]
+                    for crop_idx, crop_item in enumerate(crop_items_for_write):
+                        crop_img = crop_item.get("quality_crop")
+                        if crop_img is None:
+                            continue
+                        crop_path = os.path.join(crop_dir, f"{base_name}_crop_{crop_idx}.jpg")
+                        cv2.imwrite(
+                            crop_path,
+                            cv2.cvtColor(crop_img, cv2.COLOR_RGB2BGR),
+                            [cv2.IMWRITE_JPEG_QUALITY, 85],
+                        )
+                        crop_path_rel = os.path.relpath(crop_path, folder)
+                        bbox = crop_item.get("crop_bbox") or {
+                            "x_min": 0,
+                            "x_max": int(img_w),
+                            "y_min": 0,
+                            "y_max": int(img_h),
+                            "width": int(img_w),
+                            "height": int(img_h),
+                            "x_min_norm": 0.0,
+                            "x_max_norm": 1.0,
+                            "y_min_norm": 0.0,
+                            "y_max_norm": 1.0,
+                            "x_center_norm": 0.5,
+                            "y_center_norm": 0.5,
+                        }
+                        serialized_crops.append(
+                            {
+                                "crop_index": int(crop_idx),
+                                "crop_path": crop_path_rel,
+                                "detection_index": int(crop_item.get("index", -1)),
+                                "detection_confidence": float(crop_item.get("confidence", 0.0)),
+                                "species": str(crop_item.get("species", "Unknown") or "Unknown"),
+                                "species_confidence": float(crop_item.get("species_confidence", 0.0)),
+                                "family": str(crop_item.get("family", "Unknown") or "Unknown"),
+                                "family_confidence": float(crop_item.get("family_confidence", 0.0)),
+                                "quality": float(crop_item.get("quality", -1.0)),
+                                "rating": int(crop_item.get("rating", 0)),
+                                "exposure_correction": float(crop_item.get("exposure_correction", 0.0)),
+                                "exposure_pipeline": str(crop_item.get("exposure_pipeline", "legacy_auto_bright_v1") or "legacy_auto_bright_v1"),
+                                "exposure_subject_stops": float(crop_item.get("exposure_subject_stops", 0.0)),
+                                "exposure_meter_scale": float(crop_item.get("exposure_meter_scale", 1.0)),
+                                "bbox": {
+                                    "x_min": int(bbox.get("x_min", 0)),
+                                    "x_max": int(bbox.get("x_max", img_w)),
+                                    "y_min": int(bbox.get("y_min", 0)),
+                                    "y_max": int(bbox.get("y_max", img_h)),
+                                    "width": int(bbox.get("width", img_w)),
+                                    "height": int(bbox.get("height", img_h)),
+                                    "x_min_norm": float(bbox.get("x_min_norm", 0.0)),
+                                    "x_max_norm": float(bbox.get("x_max_norm", 1.0)),
+                                    "y_min_norm": float(bbox.get("y_min_norm", 0.0)),
+                                    "y_max_norm": float(bbox.get("y_max_norm", 1.0)),
+                                    "x_center_norm": float(bbox.get("x_center_norm", 0.5)),
+                                    "y_center_norm": float(bbox.get("y_center_norm", 0.5)),
+                                },
+                            }
+                        )
+
+                    if not serialized_crops:
+                        raise RuntimeError("No crop records generated for image")
+
+                    primary_crop_index = int(np.clip(primary_crop_index, 0, len(serialized_crops) - 1))
+                    primary_crop = serialized_crops[primary_crop_index]
+                    entry.update(
+                        {
+                            "species": primary_crop["species"],
+                            "species_confidence": primary_crop["species_confidence"],
+                            "family": primary_crop["family"],
+                            "family_confidence": primary_crop["family_confidence"],
+                            "quality": primary_crop["quality"],
+                            "exposure_correction": primary_crop["exposure_correction"],
+                            "exposure_pipeline": primary_crop.get("exposure_pipeline", "legacy_auto_bright_v1"),
+                            "exposure_subject_stops": primary_crop.get("exposure_subject_stops", 0.0),
+                            "exposure_meter_scale": primary_crop.get("exposure_meter_scale", 1.0),
+                            "crop_path": primary_crop["crop_path"],
+                            "crops_json": json.dumps(serialized_crops),
+                            "primary_crop_index": primary_crop_index,
+                        }
                     )
-                    # Store relative path for cross-platform compatibility
-                    crop_path_rel = os.path.relpath(crop_path, folder)
-                    entry.update({"crop_path": crop_path_rel})
 
                     stage_ctx["stage"] = "save_database"
                     database = pd.concat([database, pd.DataFrame([entry])], ignore_index=True)
@@ -860,8 +1079,27 @@ class AnalysisPipeline:
                                 _meta = _json.load(mf)
                         else:
                             _meta = {"version": VERSION, "analyzer": analyzer_name}
+
+                        pipeline_modes = set()
+                        if "exposure_pipeline" in database.columns:
+                            for _mode in database["exposure_pipeline"].tolist():
+                                _mode_txt = str(_mode or "").strip().lower()
+                                if _mode_txt:
+                                    pipeline_modes.add(_mode_txt)
+                        if pipeline_modes == {"no_auto_bright_metered_v1"}:
+                            render_mode_meta = "no_auto_bright_metered_v1"
+                        elif pipeline_modes == {"legacy_auto_bright_v1"}:
+                            render_mode_meta = "legacy_auto_bright_v1"
+                        elif pipeline_modes:
+                            render_mode_meta = "mixed_per_row_v1"
+                        else:
+                            render_mode_meta = "legacy_auto_bright_v1"
+
                         _meta["quality_distribution"] = distribution
                         _meta["quality_distribution_stored"] = True
+                        _meta["exposure_pipeline_version"] = 2
+                        _meta["exposure_render_mode"] = render_mode_meta
+                        _meta["exposure_compensation_profile"] = exposure_profile
                         with open(metadata_path, "w", encoding="utf-8") as mf:
                             _json.dump(_meta, mf, indent=2)
                     except Exception as _meta_e:

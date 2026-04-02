@@ -26,3 +26,12 @@ analyzer/models/quality_set4_ep4.keras
 analyzer/models/quality_set4_ep6.keras
 analyzer/models/quality_set6_ep1.keras
 analyzer/models/current.md
+tmp_onefile_probe.py
+tmp_compare_legacy_vs_proposed_demosets_detailed_summary.json
+tmp_compare_legacy_vs_proposed_demosets_detailed.py
+tmp_compare_legacy_vs_proposed_demosets_summary.json
+tmp_compare_legacy_vs_proposed_demosets.py
+tmp_exposure_solver_benchmark_report_reimagined.json
+tmp_exposure_solver_benchmark_report.json
+tmp_exposure_solver_benchmark_rounds.py
+tmp*

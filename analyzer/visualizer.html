@@ -7,8 +7,7 @@
   <title>Project Kestrel</title>
   <link rel="icon" href="data:," />
   <link rel="stylesheet" href="visualizer.css" />
-  <script src="https://cdn.jsdelivr.net/npm/papaparse@5.4.1/papaparse.min.js"></script>
-  <script src="bridge_config.js"></script>
+  <script src="csv_parser.js"></script>
 </head>
 
 <body>
@@ -38,7 +37,7 @@
             <button id="analyzeQueueBtn" title="Select folders to add to the analysis queue" style="flex:1">🔬 Analyze Folders…</button>
             <button id="openSettings" title="Open Kestrel settings" style="flex:1">⚙ Settings</button>
           </div>
-          <div id="saveRevertWrap" style="display:flex;gap:6px">
+          <div id="saveRevertWrap" class="hidden" style="display:flex;gap:6px">
             <button id="revertCsv" disabled title="Discard all unsaved changes" style="flex:1">Revert Changes</button>
             <button id="saveCsv" disabled style="flex:1">Save Changes</button>
           </div>
@@ -80,9 +79,9 @@
             </select>
           </div>
           <div class="filter-divider"></div>
-          <label class="inline" title="Only show scenes with photos that you've manually assigned ratings to.">
+          <label class="inline" title="Only show scenes you've manually reviewed: user star ratings, user accept/reject culling decisions, reviewed scene tags, or renamed scene names.">
             <input id="filterScenesManualRated" type="checkbox" />
-            <span class="muted">Only manually-rated scenes</span>
+            <span class="muted">Only manually reviewed scenes</span>
           </label>
           <label class="inline">
             <input id="includeSecondarySpecies" type="checkbox" />
@@ -121,11 +120,8 @@
     <div id="mainZoom">
       <div id="compat" class="wrap hidden">
         <div class="notice">
-          Limited functionality detected. For the best experience with full folder access and image previews, use one of
-          these options:<br />
-          • Use the Project Kestrel desktop app (recommended for macOS)<br />
-          • Use a Chromium-based browser (Chrome, Edge, Brave, Arc)<br />
-          You can still load CSV files directly, but image previews and opening files in editors will not work.
+          Desktop bridge unavailable. Project Kestrel now runs in desktop-only mode.<br />
+          Please close this window and relaunch from the Project Kestrel app.
         </div>
       </div>
 
@@ -253,7 +249,9 @@
       <!-- Keyboard shortcut legend (toggle visibility) -->
       <div class="scene-shortcut-legend hidden" id="sceneShortcutLegend">
         <span><kbd>←</kbd><kbd>→</kbd> Navigate images (scrub boundaries)</span>
+        <span><kbd>↑</kbd><kbd>↓</kbd> Switch active crop</span>
         <span><kbd>Ctrl</kbd>+<kbd>←</kbd><kbd>→</kbd> Jump to start/end</span>
+        <span><kbd>Enter</kbd> Promote active crop</span>
         <span><kbd>Tab</kbd> Next scene</span>
         <span><kbd>Ctrl</kbd>+<kbd>Tab</kbd> Previous scene</span>
         <span><kbd>Z</kbd> Accept</span>
@@ -269,22 +267,37 @@
 
       <!-- ═══ CENTER: Dual preview panels ═══ -->
       <div class="scene-main">
-        <div class="scene-previews">
-          <div class="scene-preview-panel" id="scenePreviewCrop">
-            <div class="scene-preview-label">Bird Crop</div>
-            <div class="scene-preview-img" id="previewCropBox">
-              <span class="muted">Select an image…</span>
-            </div>
-          </div>
+        <div class="scene-previews" id="scenePreviews">
           <div class="scene-preview-panel" id="scenePreviewExport">
             <div class="scene-preview-label">Full Image</div>
             <div class="scene-preview-img" id="previewBox" data-raw-label="RAW">
               <span class="muted">Select an image…</span>
+              <button class="scene-preview-copy-btn" id="sceneCopyExportBtn" type="button" title="Copy full image to clipboard" aria-label="Copy full image to clipboard" disabled>
+                <span class="copy-icon">📋</span>
+                <span>Copy</span>
+              </button>
             </div>
             <label class="scene-zoom-bar" id="sceneZoomWrap" title="RAW Zoom — click and hold on the full image to zoom">
               <span class="muted" style="font-size:11px">RAW Zoom</span>
               <input type="range" id="sceneZoomSlider" min="2" max="12" value="5" step="0.5" style="width:90px">
             </label>
+          </div>
+          <div
+            class="scene-preview-divider"
+            id="scenePreviewDivider"
+            role="separator"
+            aria-orientation="vertical"
+            aria-label="Resize scene previews"
+            tabindex="0"></div>
+          <div class="scene-preview-panel" id="scenePreviewCrop">
+            <div class="scene-preview-label">Bird Crop</div>
+            <div class="scene-preview-img" id="previewCropBox">
+              <span class="muted">Select an image…</span>
+              <button class="scene-preview-copy-btn" id="sceneCopyCropBtn" type="button" title="Copy bird crop to clipboard" aria-label="Copy bird crop to clipboard" disabled>
+                <span class="copy-icon">📋</span>
+                <span>Copy</span>
+              </button>
+            </div>
           </div>
         </div>
         <!-- Info bar between previews and filmstrip -->
@@ -440,6 +453,33 @@
       <div class="muted" style="font-size:12px;margin-top:-6px;margin-bottom:8px">Confidence threshold for mask
         segmentation (0.50–0.95). Higher values produce tighter masks around birds, lower values are more
         inclusive. Requires re-analysis to take effect.</div>
+
+      <div class="row">
+        <label for="maxBirdCrops">Max Bird Crops Saved Per Image</label>
+        <input id="maxBirdCrops" type="number" min="1" max="20" step="1" value="5"
+          style="width:80px" title="Maximum number of bird crops Kestrel saves per image (1-20)." />
+      </div>
+      <div class="muted" style="font-size:12px;margin-top:-6px;margin-bottom:8px">Controls how many top bird detections Kestrel saves per image. Mask R-CNN proposal and detection caps are automatically set to 2x this value. <b style="color:#e0a34a">Warning: increasing this value (for example to 20) can substantially increase compute time and memory overhead.</b> Requires re-analysis to take effect.</div>
+
+      <div class="row">
+        <label for="exposureCompensationProfile">Exposure Compensation Profile</label>
+        <select id="exposureCompensationProfile">
+          <option value="lenient">Lenient &mdash; tolerates brighter highlights and applies gentler shadow lift</option>
+          <option value="normal">Normal &mdash; balanced highlight protection and shadow lift</option>
+          <option value="aggressive" selected>Aggressive &mdash; maximizes lift to clipping guardrails with strict highlight control</option>
+        </select>
+      </div>
+      <div class="muted" style="font-size:12px;margin-top:-6px;margin-bottom:8px">Controls histogram-constrained exposure correction during analysis. Aggressive pushes brightness as far as possible without violating clipping/highlight guardrails; lenient and normal use progressively softer lift and darkening. Requires re-analysis to take effect.</div>
+
+      <div class="row">
+        <label for="exposureCompensationSolver">Exposure Solver Speed / Accuracy</label>
+        <select id="exposureCompensationSolver">
+          <option value="metered_refine_one_pass" selected>Default &mdash; metered refined one pass (recommended)</option>
+          <option value="predictive_fast">Fast &mdash; Predictive Fast</option>
+          <option value="convergent_two_pass">Accurate &mdash; Convergent two-pass</option>
+        </select>
+      </div>
+      <div class="muted" style="font-size:12px;margin-top:-6px;margin-bottom:8px">Default uses metered refined one pass for stronger speed with quality safeguards. Fast uses Predictive Fast for highest throughput with larger exposure drift risk. Accurate uses Convergent two-pass for best consistency at higher compute cost. Requires re-analysis to take effect.</div>
 
       <h4 style="margin:12px 0 8px;padding-top:8px;border-top:1px solid #1d2230;color:#a0a8b8;font-size:13px;text-transform:uppercase;letter-spacing:0.5px">Data &amp; Preview</h4>
 
@@ -623,7 +663,7 @@
       <div style="display:flex; gap:14px; align-items:center; flex-wrap:wrap">
         <label class="inline" style="font-size:13px">
           <input type="checkbox" id="feedbackIncludeLogs" />
-          <span class="muted">Include recent analysis logs</span>
+          <span class="muted">Include recent analysis logs (last 3 runtime sessions)</span>
         </label>
         <label class="inline" style="font-size:13px">
           <input type="checkbox" id="feedbackIncludeScreenshot" />
