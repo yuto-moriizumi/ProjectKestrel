@@ -1,0 +1,9 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(grep -E '\\\\.py$')",
+      "Bash(ls \"c:/Data/Code/Project Kestrel/ProjectKestrel\"/tmp*)",
+      "Bash(python tmp_exposure_underexposure_diag.py)"
+    ]
+  }
+}

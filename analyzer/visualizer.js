@@ -6129,7 +6129,7 @@
       const dets = item.current_detections || [];
       const quality = item.current_quality_results || [];
       const species = item.current_species_results || [];
-      const cardCount = Math.max(crops.length, dets.length, quality.length, species.length, 1);
+      const cardCount = Math.max(crops.length, dets.length, quality.length, species.length);
 
       // Keep card count in sync with current live detections.
       while (row.children.length < cardCount) {
