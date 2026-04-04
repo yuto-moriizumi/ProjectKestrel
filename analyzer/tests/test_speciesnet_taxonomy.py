@@ -6,6 +6,7 @@ from speciesnet.constants import Classification
 
 from kestrel_analyzer.ml.speciesnet_taxonomy import (
     bird_vs_wildlife_classifier_scores,
+    format_species_display_name,
     is_ambiguous_generic_taxonomy,
     is_bird_taxon,
     is_ignored_prediction,
@@ -16,6 +17,11 @@ from kestrel_analyzer.ml.speciesnet_taxonomy import (
 
 
 class TestSpeciesNetTaxonomy(unittest.TestCase):
+    def test_format_species_display_name(self):
+        self.assertEqual(format_species_display_name("pronghorn"), "Pronghorn")
+        self.assertEqual(format_species_display_name("CANE TOAD"), "Cane Toad")
+        self.assertEqual(format_species_display_name("red-tailed hawk"), "Red-Tailed Hawk")
+
     def test_examples_ignore(self):
         self.assertTrue(is_ignored_prediction("f1856211-cfb7-4a5b-9158-c0f72fd09ee6;;;;;;blank"))
         self.assertTrue(is_ignored_prediction("e2895ed5-780b-48f6-8a11-9e27cb594511;;;;;;vehicle"))
@@ -25,7 +31,7 @@ class TestSpeciesNetTaxonomy(unittest.TestCase):
             "04eda76f-c0e7-4e9e-85c3-5b1542db2915;"
             "amphibia;anura;bufonidae;rhinella;marina;cane toad"
         )
-        self.assertEqual(wildlife_display_name(raw), "cane toad")
+        self.assertEqual(wildlife_display_name(raw), "Cane Toad")
 
     def test_bird_aves(self):
         raw = "b1352069-a39c-4a84-a949-60044271c5c1;aves;;;;;bird"
@@ -41,7 +47,7 @@ class TestSpeciesNetTaxonomy(unittest.TestCase):
         )
         route, label = route_prediction(raw, wildlife_enabled=True)
         self.assertEqual(route, "wildlife")
-        self.assertEqual(label, "cane toad")
+        self.assertEqual(label, "Cane Toad")
 
     def test_wildlife_disabled_skips_non_bird(self):
         raw = (
@@ -118,7 +124,7 @@ class TestSpeciesNetTaxonomy(unittest.TestCase):
             wildlife_enabled=True,
         )
         self.assertEqual(route, "wildlife")
-        self.assertEqual(label, "cane toad")
+        self.assertEqual(label, "Cane Toad")
         self.assertAlmostEqual(score, 0.8)
 
 

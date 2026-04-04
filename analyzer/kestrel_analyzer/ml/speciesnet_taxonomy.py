@@ -20,13 +20,34 @@ def split_taxonomy(raw: str) -> list[str]:
     return [p.strip() for p in raw.split(";")]
 
 
+def format_species_display_name(name: str) -> str:
+    """Word-level capitalization for SpeciesNet common names (e.g. pronghorn → Pronghorn, cane toad → Cane Toad)."""
+    if not name or not str(name).strip():
+        return (name or "").strip()
+
+    def cap_segment(seg: str) -> str:
+        if not seg:
+            return seg
+        return seg[0].upper() + seg[1:].lower() if len(seg) > 1 else seg.upper()
+
+    def cap_token(tok: str) -> str:
+        if not tok:
+            return tok
+        if "-" in tok:
+            return "-".join(cap_segment(p) if p else p for p in tok.split("-"))
+        return cap_segment(tok)
+
+    s = str(name).strip()
+    return " ".join(cap_token(t) for t in s.split())
+
+
 def wildlife_display_name(raw: str) -> str:
-    """Last non-empty semicolon segment (common name when present)."""
+    """Last non-empty semicolon segment (common name when present), title-cased for display."""
     parts = split_taxonomy(raw)
     for seg in reversed(parts):
         if seg:
-            return seg
-    return raw.strip() or "unknown"
+            return format_species_display_name(seg)
+    return format_species_display_name(raw.strip() or "unknown")
 
 
 def is_ignored_prediction(raw: str) -> bool:
