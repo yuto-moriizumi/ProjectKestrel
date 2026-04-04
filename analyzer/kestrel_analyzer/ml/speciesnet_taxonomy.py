@@ -2,6 +2,10 @@
 
 from __future__ import annotations
 
+from typing import Any
+
+from speciesnet.constants import Classification
+
 # Full label strings from SpeciesNet taxonomy (see speciesnet.constants.Classification).
 _SPECIESNET_BLANK = "f1856211-cfb7-4a5b-9158-c0f72fd09ee6;;;;;;blank"
 _SPECIESNET_VEHICLE = "e2895ed5-780b-48f6-8a11-9e27cb594511;;;;;;vehicle"
@@ -66,3 +70,66 @@ def route_prediction(
     if not wildlife_enabled:
         return "ignore", None
     return "wildlife", wildlife_display_name(raw_prediction)
+
+
+def bird_vs_wildlife_classifier_scores(classifications: dict[str, Any]) -> tuple[float, float]:
+    """Max classifier score for an Aves label vs. max for any other non-ignored label.
+
+    Used when the ensemble rolls up to a generic class (e.g. ``animal``): comparing
+    these two indicates whether a bird-specific species hypothesis is stronger than
+    other animal hypotheses in the top-k list.
+    """
+    classes = classifications.get("classes") or []
+    scores = classifications.get("scores") or []
+    best_bird = 0.0
+    best_other = 0.0
+    for raw, sc in zip(classes, scores):
+        try:
+            conf = float(sc)
+        except (TypeError, ValueError):
+            continue
+        label = str(raw)
+        if is_ignored_prediction(label):
+            continue
+        if is_bird_taxon(label):
+            best_bird = max(best_bird, conf)
+        else:
+            best_other = max(best_other, conf)
+    return best_bird, best_other
+
+
+def is_ambiguous_generic_taxonomy(raw_prediction: str) -> bool:
+    """True when ensemble did not commit to a species-level animal class."""
+    if not raw_prediction or not str(raw_prediction).strip():
+        return True
+    s = str(raw_prediction).strip()
+    if s == Classification.ANIMAL.value or s == Classification.UNKNOWN.value:
+        return True
+    last = wildlife_display_name(s).lower()
+    return last == "animal"
+
+
+def route_with_classifier_tiebreak(
+    raw_prediction: str,
+    pred_score: float,
+    classifications: dict[str, Any],
+    *,
+    wildlife_enabled: bool,
+) -> tuple[str, str | None, float]:
+    """Apply ``route_prediction``, then optionally prefer bird using classifier top-k.
+
+    When the ensemble prediction is *ambiguous* (generic ``animal``, ``unknown``, or
+    display name ``animal`` only), we compare max bird vs max other non-ignored
+    classifier scores. If the bird score is strictly higher, we route as ``bird`` and
+    use that score—so a stronger aves hypothesis in the top-k list wins over a
+    generic or conflicting rollup. Species-level non-bird predictions are unchanged.
+    """
+    route, pred_label = route_prediction(raw_prediction, wildlife_enabled=wildlife_enabled)
+    if is_ignored_prediction(raw_prediction):
+        return route, pred_label, pred_score
+    if not is_ambiguous_generic_taxonomy(raw_prediction):
+        return route, pred_label, pred_score
+    best_bird, best_other = bird_vs_wildlife_classifier_scores(classifications)
+    if best_bird > best_other and best_bird > 0.0:
+        return "bird", "bird", best_bird
+    return route, pred_label, pred_score

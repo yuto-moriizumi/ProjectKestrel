@@ -11,7 +11,11 @@ import torch
 from PIL import Image
 
 from ..config import SAM_HQ_MODEL_KEY, SAM_HQ_WEIGHTS_PATH
-from .speciesnet_taxonomy import route_prediction
+from .speciesnet_taxonomy import (
+    bird_vs_wildlife_classifier_scores,
+    is_ambiguous_generic_taxonomy,
+    route_with_classifier_tiebreak,
+)
 
 _DEFAULT_MAX_BIRD_CROPS = 5
 _MIN_MAX_BIRD_CROPS = 1
@@ -93,13 +97,25 @@ class SpeciesNetSAMHQWrapper:
     def __init__(self, max_bird_crops: int = _DEFAULT_MAX_BIRD_CROPS, use_gpu: bool = True):
         self.max_bird_crops = _coerce_max_bird_crops(max_bird_crops)
         self.use_gpu = bool(use_gpu)
-        self._sam_force_cpu: Optional[bool] = None
+        self._sam_device_resolved: Optional[torch.device] = None
         self.predictor = None
         self.detector = None
         self.classifier = None
         self.ensemble = None
         self.model_name: Optional[str] = None
         self._sam_checkpoint = Path(SAM_HQ_WEIGHTS_PATH)
+
+    @staticmethod
+    def _resolve_sam_device(use_gpu: bool) -> torch.device:
+        """PyTorch device for SAM-HQ (independent of ONNX/DirectML ``use_gpu``)."""
+        if not use_gpu:
+            return torch.device("cpu")
+        if torch.cuda.is_available():
+            return torch.device("cuda")
+        mps = getattr(torch.backends, "mps", None)
+        if mps is not None and mps.is_available():
+            return torch.device("mps")
+        return torch.device("cpu")
 
     def _ensure_speciesnet(self) -> None:
         from speciesnet import (
@@ -120,8 +136,8 @@ class SpeciesNetSAMHQWrapper:
     def _ensure_sam(self) -> None:
         from segment_anything_hq import SamPredictor, sam_model_registry
 
-        force_cpu = not self.use_gpu
-        need_new = self.predictor is None or self._sam_force_cpu != force_cpu
+        sam_device = self._resolve_sam_device(self.use_gpu)
+        need_new = self.predictor is None or self._sam_device_resolved != sam_device
         if not need_new:
             return
         if not self._sam_checkpoint.exists():
@@ -132,8 +148,8 @@ class SpeciesNetSAMHQWrapper:
         original_torch_load = torch.load
 
         def _safe_torch_load(*args, **kwargs):
-            if force_cpu:
-                kwargs.setdefault("map_location", "cpu")
+            # Checkpoints may be CUDA-serialized; always load to CPU then .to(device).
+            kwargs.setdefault("map_location", torch.device("cpu"))
             return original_torch_load(*args, **kwargs)
 
         torch.load = _safe_torch_load
@@ -141,11 +157,11 @@ class SpeciesNetSAMHQWrapper:
             sam = sam_model_registry[SAM_HQ_MODEL_KEY](checkpoint=str(self._sam_checkpoint))
         finally:
             torch.load = original_torch_load
-        if force_cpu and hasattr(sam, "to"):
-            sam.to("cpu")
+        if hasattr(sam, "to"):
+            sam.to(sam_device)
         sam.eval()
         self.predictor = SamPredictor(sam)
-        self._sam_force_cpu = force_cpu
+        self._sam_device_resolved = sam_device
 
     def _run_ensemble_for_item(
         self,
@@ -263,8 +279,20 @@ class SpeciesNetSAMHQWrapper:
                 pred_source,
             )
 
-            route, pred_label = route_prediction(pred_raw, wildlife_enabled=wildlife_enabled)
-            print("[SpeciesNet] route:", route, "pred_label:", pred_label)
+            route, pred_label, pred_score = route_with_classifier_tiebreak(
+                pred_raw,
+                pred_score,
+                cls_info,
+                wildlife_enabled=wildlife_enabled,
+            )
+            if is_ambiguous_generic_taxonomy(pred_raw):
+                bb, bo = bird_vs_wildlife_classifier_scores(cls_info)
+                print(
+                    "[SpeciesNet] ambiguous taxonomy; classifier bird_max="
+                    f"{bb:.4f} other_animal_max={bo:.4f} -> route={route} pred_label={pred_label}"
+                )
+            else:
+                print("[SpeciesNet] route:", route, "pred_label:", pred_label)
 
             if route == "ignore" or pred_label is None:
                 continue
