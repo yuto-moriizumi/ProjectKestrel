@@ -52,7 +52,12 @@ _MAX_RUNTIME_LOG_TOTAL_CHARS = 60_000
 # ---------------------------------------------------------------------------
 
 def _read_version() -> str:
-    """Read the version string from VERSION.txt (failsafe)."""
+    """Read the version string from VERSION.txt (failsafe).
+
+    Supports two formats:
+      - Labelled:   'version: Kentucky Warbler'  (preferred)
+      - Plain-text: 'Kentucky Warbler'            (single non-empty line)
+    """
     try:
         # Check relative to this file, then one level up (repo root)
         for candidate in [
@@ -61,9 +66,14 @@ def _read_version() -> str:
         ]:
             if os.path.isfile(candidate):
                 with open(candidate, 'r', encoding='utf-8') as f:
-                    for line in f:
-                        if line.strip().lower().startswith('version:'):
-                            return line.strip().split(':', 1)[1].strip()
+                    lines = [l.strip() for l in f if l.strip()]
+                # Preferred: explicit 'version:' label on any line
+                for line in lines:
+                    if line.lower().startswith('version:'):
+                        return line.split(':', 1)[1].strip()
+                # Fallback: plain single-line file (e.g. 'Kentucky Warbler')
+                if len(lines) == 1:
+                    return lines[0]
         return 'unknown'
     except Exception:
         return 'unknown'

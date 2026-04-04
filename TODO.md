@@ -1,48 +1,25 @@
 # Project Kestrel To-Do and Changelog
 
-Bugs
-* Known issue that skipping to next scene works inconsistently, and the background view should scroll to match the current scene opened in the film strip. [DONE]
-* Add "Parent folder" button to analyze folders directory so you can walk up the folder tree if needed. 
-* Fix GPU non-supported in Github documentation. [DONE]
-* RAW+JPG co-movement problem in Culling Assistant. [DONE]
-* Frequent failures when running on images with many subjects; find a way to lower Mask-RCNN region proposal threshold to improve performance. [DONE]
-* Known issue where exposure compensation still tends to be slightly too dark, particularly for noisy images. Root cause unknown. [DONE]
-* Auto-save may save all folders rather than just the ones that have been modified. [DONE]
-* Bug where un-loading a folder that has recently been analyzed sometimes causes it to auto-check itself. Uncertain why. In this situation, hitting the next arrow to skip to the next scene sometimes goes to the next scene of a different folder, if it is loaded with a similar capture time. We need to make sure that the next scene is consistent with the way that the scenes are displayed in the main view. 
-* PIPELINE CHANGE New ML model is needed to correctly handle the exposure shift adjustements. [TEMP-DONE]
-* Delete cache files after folder unloaded or software closed. [DONE]
-* Fix bad UI problem when splitting a scene. [DONE]
-* Tweak exposure compensation algorithm to be slightly more aggressive in correcting exposure changes; making sure that highlights are not blown out while also making sure that shadows or highly underexposed birds are properly adjusted and lifted. Potentially exclude some of the boundary pixel layers during exposure compensation calculation as they my reflect mask-rcnn boundary inconsistencies. [DONE]
-* Restore Queue bugs - It doesn't seem to be working. The intention is if the program crashes mid-analysis, Kestrel can detect that something went wrong. It will then 1) say "I crashed. want me to send crash report?" 2) "clean crash log" [DONE]
-* No clean crash log; all current print statements go to terminal output. Need a cleaner way to pipe these into a userprofile's kestrel logs folder. Also too many terminal outputs; some of these need to be cleared to the extent possible. [DONE]
---> Remove all "read_image_for_pipeline" logs
---> remove telemetry debug calls 
-* Canon EOS R5 Mark II RAW Decode Issue --> Bumped Rawpy dependency from 0.23.1 to 0.26.1 [DONE]
-* Resolve dependabot dependency security vulnerability alerts [DONE]
-* Conduct comprehensive security review. [DONE]
-* Security Fixes: remove browser mode fallback, tighten exposed API endpoints, enforce schema validation for settings files, tighten path normalization escapes, and reduce blast radius of auth token breach. [DONE]
-* Some exposure compensation adjustment failures for overexposed images persists [DONE]
-* Swapped position of the bird crop and full image thumbnail. [DONE]
-* Added adjustable divider to control size of the two UI elements. [DONE]
+Known issues:
+* Multi-subject mode crop promotion is a bit inconsistent --> doesn't seem to save changes properly. Look into and investigate this; might be an issue with folder being status analysis in progress (perhaps it overwrites entire database which contains crop promotion)
+* metering approach might be slightly reducing bird detection performance
+* fix telemetry issues - version not being sent
+* add versioned legal agreement checks so that terms of service can be updated.
 
 
 Features under consideration
-* Add a "Quick Export" system or copy thumbnail system. [DONE]
-* Implement "Suggested" system to manually reclassify species quickly based on majority confidence-weighted vote of all scene components. [DONE]
-* Multi-subject mode is not handled super consistently. Consider reworking pipeline to store crop exports of all detected subjects for improved analysis. [DONE]
-* Implement "Analyze JPGs instead of RAWs" with clear warning that analysis on RAWs is strongly preferred since JPG compression artifacts can dramatically alter quality scores. [DEFERRED]
-* Investigate GPU support from recent pull request #14
-* Alter search "show only manually reviewed photos" to include those with manual culling decisions or species selections. [DONE]
-* Add restore capability that persists after closing/reopening Culling Assistant/Kestrel [DONE]
-* eBird integration: After integrating Clerk (log-in system), add ability to connect eBird account. Then add ability to attach a particular checklist to an outing. Add ability to hit "T" to enter tagging mode, and add capability to turn the text box into a text+combobox which fetches from the current checklist. Then, add ability to upload photos to eBird/Malaculay library from in-app. [DEFERRED]
-
-Test before release:
-* Fix to Mask-RCNN Region Proposal System [DONE]
-* Quality classifier performance on revised pipeline [DONE - WORKS WELL ENOUGH]
-* RAW+JPG co-movement fix in Culing Assistant + test restore capability persists after Kestrel re-opens. [DONE, FIXED]
-* Improvement to crash handling and error logging. [DONE]
-* Test rawpy decode issue. [DONE, FIXED]
-* Test Queue restore fixes [DONE]
+* Quick export/Kestrel quick edit feature --> meant to be an intermediary between using a full-feature photo editor like lightroom/darktable and just getting the photo out there as quick as possible. 
+    With the following features:
+        - Crop
+        - Denoise
+        - Exposure adjustment
+        - Shadows/Highlights adjustment
+        - Color saturation adjustment
+        - White balance adjustment
+        - Pre-sets you can utilize (so you just tweak exposure, determine the crop)
+        - maybe with AI denoise???
+    Should take as little time as possible to export; then directly copies the exported photo into your clipboard and also features a way to access it again later.
+* Revised pipeline using YOLOX + Fast-SAM-HQ 
 
 
 
@@ -143,6 +120,7 @@ Major update featuring significant corrections to exposure compensation algorith
     * New "Suggested Species" tags make it easier to add tags based on machine learning model outputs.
     * Improved split scene behavior to make it substantially more intuitive (use Shift+Click to split scenes)
     * "Only manually reviewed scenes" toggle now reflects culling decisions, scenes with reviewed tags, and renamed scenes in addition to manually applied star ratings.
+    * Fixed CTRL/CMD Keyboard shortcuts for MacOS systems
 * Substantial improvements to Kestrel's handling of multiple birds within the same image.
     * Kestrel will now detect, analyze, and save results of multiple birds within the same image (up to 5 by default, with user customizable settings)
     * Browse through all of the birds that Kestrel detects using the up/down arrow keys! Hit "Enter" to assign a specific bird as primary (default: highest-quality bird). 
@@ -165,3 +143,51 @@ Major update featuring significant corrections to exposure compensation algorith
 
 ## Coming soon
 * Website will be updated to reflect latest analysis framework and new features.
+
+
+=== archive===
+
+
+Bugs
+* Known issue that skipping to next scene works inconsistently, and the background view should scroll to match the current scene opened in the film strip. [DONE]
+* Add "Parent folder" button to analyze folders directory so you can walk up the folder tree if needed. 
+* Fix GPU non-supported in Github documentation. [DONE]
+* RAW+JPG co-movement problem in Culling Assistant. [DONE]
+* Frequent failures when running on images with many subjects; find a way to lower Mask-RCNN region proposal threshold to improve performance. [DONE]
+* Known issue where exposure compensation still tends to be slightly too dark, particularly for noisy images. Root cause unknown. [DONE]
+* Auto-save may save all folders rather than just the ones that have been modified. [DONE]
+* Bug where un-loading a folder that has recently been analyzed sometimes causes it to auto-check itself. Uncertain why. In this situation, hitting the next arrow to skip to the next scene sometimes goes to the next scene of a different folder, if it is loaded with a similar capture time. We need to make sure that the next scene is consistent with the way that the scenes are displayed in the main view. 
+* PIPELINE CHANGE New ML model is needed to correctly handle the exposure shift adjustements. [TEMP-DONE]
+* Delete cache files after folder unloaded or software closed. [DONE]
+* Fix bad UI problem when splitting a scene. [DONE]
+* Tweak exposure compensation algorithm to be slightly more aggressive in correcting exposure changes; making sure that highlights are not blown out while also making sure that shadows or highly underexposed birds are properly adjusted and lifted. Potentially exclude some of the boundary pixel layers during exposure compensation calculation as they my reflect mask-rcnn boundary inconsistencies. [DONE]
+* Restore Queue bugs - It doesn't seem to be working. The intention is if the program crashes mid-analysis, Kestrel can detect that something went wrong. It will then 1) say "I crashed. want me to send crash report?" 2) "clean crash log" [DONE]
+* No clean crash log; all current print statements go to terminal output. Need a cleaner way to pipe these into a userprofile's kestrel logs folder. Also too many terminal outputs; some of these need to be cleared to the extent possible. [DONE]
+--> Remove all "read_image_for_pipeline" logs
+--> remove telemetry debug calls 
+* Canon EOS R5 Mark II RAW Decode Issue --> Bumped Rawpy dependency from 0.23.1 to 0.26.1 [DONE]
+* Resolve dependabot dependency security vulnerability alerts [DONE]
+* Conduct comprehensive security review. [DONE]
+* Security Fixes: remove browser mode fallback, tighten exposed API endpoints, enforce schema validation for settings files, tighten path normalization escapes, and reduce blast radius of auth token breach. [DONE]
+* Some exposure compensation adjustment failures for overexposed images persists [DONE]
+* Swapped position of the bird crop and full image thumbnail. [DONE]
+* Added adjustable divider to control size of the two UI elements. [DONE]
+
+
+Features under consideration
+* Add a "Quick Export" system or copy thumbnail system. [DONE]
+* Implement "Suggested" system to manually reclassify species quickly based on majority confidence-weighted vote of all scene components. [DONE]
+* Multi-subject mode is not handled super consistently. Consider reworking pipeline to store crop exports of all detected subjects for improved analysis. [DONE]
+* Implement "Analyze JPGs instead of RAWs" with clear warning that analysis on RAWs is strongly preferred since JPG compression artifacts can dramatically alter quality scores. [DEFERRED]
+* Investigate GPU support from recent pull request #14
+* Alter search "show only manually reviewed photos" to include those with manual culling decisions or species selections. [DONE]
+* Add restore capability that persists after closing/reopening Culling Assistant/Kestrel [DONE]
+* eBird integration: After integrating Clerk (log-in system), add ability to connect eBird account. Then add ability to attach a particular checklist to an outing. Add ability to hit "T" to enter tagging mode, and add capability to turn the text box into a text+combobox which fetches from the current checklist. Then, add ability to upload photos to eBird/Malaculay library from in-app. [DEFERRED]
+
+Test before release:
+* Fix to Mask-RCNN Region Proposal System [DONE]
+* Quality classifier performance on revised pipeline [DONE - WORKS WELL ENOUGH]
+* RAW+JPG co-movement fix in Culing Assistant + test restore capability persists after Kestrel re-opens. [DONE, FIXED]
+* Improvement to crash handling and error logging. [DONE]
+* Test rawpy decode issue. [DONE, FIXED]
+* Test Queue restore fixes [DONE]
