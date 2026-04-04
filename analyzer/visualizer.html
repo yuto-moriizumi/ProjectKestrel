@@ -428,10 +428,10 @@
       <div class="row">
         <label for="detectionThreshold">Detection Confidence Threshold</label>
         <input id="detectionThreshold" type="number" min="0.1" max="0.99" step="0.05" value="0.75"
-          style="width:80px" title="Minimum MaskRCNN confidence score (0.10–0.99) required to count as a true detection" />
+          style="width:80px" title="Minimum MegaDetector animal confidence (0.10–0.99) required to count as a true detection (SpeciesNet)" />
       </div>
       <div class="muted" style="font-size:12px;margin-top:-6px;margin-bottom:8px">Minimum confidence score
-        (0.10–0.99) that the bird detector must reach before Kestrel counts something as a detection. Lowering
+        (0.10–0.99) that the SpeciesNet MegaDetector must reach on an <b>animal</b> box before Kestrel keeps that detection. Lowering
         this value may increase <b>false positive</b> detections on difficult images. Requires re-analysis to
         take effect. Also filters which species and family tags are shown in scene dialogs.</div>
 
@@ -446,20 +446,18 @@
         re-analysis to take effect.</div>
 
       <div class="row">
-        <label for="maskThreshold">Mask Segmentation Threshold</label>
+        <label for="maskThreshold">Mask Segmentation Threshold (legacy)</label>
         <input id="maskThreshold" type="number" min="0.5" max="0.95" step="0.05" value="0.5"
-          style="width:80px" title="Pixel confidence threshold for bird mask segmentation (0.50–0.95). Higher = tighter masks." />
+          style="width:80px" title="Not used by the SpeciesNet + SAM-HQ pipeline (kept for settings compatibility). Previously: Mask R-CNN mask pixel threshold." />
       </div>
-      <div class="muted" style="font-size:12px;margin-top:-6px;margin-bottom:8px">Confidence threshold for mask
-        segmentation (0.50–0.95). Higher values produce tighter masks around birds, lower values are more
-        inclusive. Requires re-analysis to take effect.</div>
+      <div class="muted" style="font-size:12px;margin-top:-6px;margin-bottom:8px">The current analyzer uses SAM-HQ for masks; this control is <b>not applied</b>. It remains so older saved settings still load. Requires re-analysis only when other analysis settings change.</div>
 
       <div class="row">
         <label for="maxBirdCrops">Max Bird Crops Saved Per Image</label>
         <input id="maxBirdCrops" type="number" min="1" max="20" step="1" value="5"
           style="width:80px" title="Maximum number of bird crops Kestrel saves per image (1-20)." />
       </div>
-      <div class="muted" style="font-size:12px;margin-top:-6px;margin-bottom:8px">Controls how many top bird detections Kestrel saves per image. Mask R-CNN proposal and detection caps are automatically set to 2x this value. <b style="color:#e0a34a">Warning: increasing this value (for example to 20) can substantially increase compute time and memory overhead.</b> Requires re-analysis to take effect.</div>
+      <div class="muted" style="font-size:12px;margin-top:-6px;margin-bottom:8px">Maximum number of <b>bird</b> (aves) and <b>non-bird wildlife</b> subjects saved per image (each list capped separately). <b style="color:#e0a34a">Warning: increasing this value (for example to 20) can substantially increase compute time and memory overhead.</b> Requires re-analysis to take effect.</div>
 
       <div class="row">
         <label for="exposureCompensationProfile">Exposure Compensation Profile</label>

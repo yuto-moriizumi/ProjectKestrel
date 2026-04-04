@@ -529,8 +529,7 @@ class QueueManager:
                         try:
                             os.makedirs(os.path.dirname(overlay_path), exist_ok=True)
                             _cv2.imwrite(overlay_path,
-                                         _cv2.cvtColor(overlay_np, _cv2.COLOR_RGB2BGR),
-                                         [_cv2.IMWRITE_JPEG_QUALITY, 80])
+                                         _cv2.cvtColor(overlay_np, _cv2.COLOR_RGB2BGR))
                             rel = os.path.relpath(overlay_path, _it.path).replace('\\', '/')
                         except Exception:
                             pass
@@ -553,8 +552,7 @@ class QueueManager:
                         cp = os.path.join(export_dir, f'__live_crop_{idx}.jpg')
                         try:
                             _cv2.imwrite(cp,
-                                         _cv2.cvtColor(crop, _cv2.COLOR_RGB2BGR),
-                                         [_cv2.IMWRITE_JPEG_QUALITY, 85])
+                                         _cv2.cvtColor(crop, _cv2.COLOR_RGB2BGR))
                             saved_rels.append(
                                 os.path.relpath(cp, _it.path).replace('\\', '/'))
                         except Exception:

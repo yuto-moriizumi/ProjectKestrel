@@ -15,7 +15,6 @@ from .config import (
     SPECIESCLASSIFIER_PATH,
     QUALITYCLASSIFIER_PATH,
     QUALITY_NORMALIZATION_DATA_PATH,
-    WILDLIFE_CATEGORIES,
     MODELS_DIR,
     KESTREL_DIR_NAME,
     METADATA_FILENAME,
@@ -49,7 +48,7 @@ except ImportError:
         from analyzer.settings_utils import load_persisted_settings
     except ImportError:
         load_persisted_settings = None
-from .ml.mask_rcnn import MaskRCNNWrapper
+from .ml.speciesnet_sam_hq import SpeciesNetSAMHQWrapper
 from .ml.bird_species import BirdSpeciesClassifier
 from .ml.quality import QualityClassifier
 
@@ -57,7 +56,7 @@ from .ml.quality import QualityClassifier
 class AnalysisPipeline:
     def __init__(self, use_gpu: bool):
         self.use_gpu = use_gpu
-        self.mask_rcnn: Optional[MaskRCNNWrapper] = None
+        self.sn_sam: Optional[SpeciesNetSAMHQWrapper] = None
         self.species_clf: Optional[BirdSpeciesClassifier] = None
         self.quality_clf: Optional[QualityClassifier] = None
         self._log_path: Optional[str] = None
@@ -156,15 +155,19 @@ class AnalysisPipeline:
         max_bird_crops = max(1, min(20, max_bird_crops))
 
         mask_ready_for_cap = bool(
-            self.mask_rcnn
-            and int(getattr(self.mask_rcnn, "max_bird_crops", 5)) == max_bird_crops
+            self.sn_sam
+            and int(getattr(self.sn_sam, "max_bird_crops", 5)) == max_bird_crops
+            and getattr(self.sn_sam, "use_gpu", None) == self.use_gpu
         )
         if mask_ready_for_cap and self.species_clf and self.quality_clf:
             return
         if status_cb:
             status_cb("Loading models... This may take a while on first run.")
         if not mask_ready_for_cap:
-            self.mask_rcnn = MaskRCNNWrapper(max_bird_crops=max_bird_crops)
+            self.sn_sam = SpeciesNetSAMHQWrapper(
+                max_bird_crops=max_bird_crops,
+                use_gpu=self.use_gpu,
+            )
         if not self.species_clf:
             self.species_clf = BirdSpeciesClassifier(
                 str(SPECIESCLASSIFIER_PATH),
@@ -226,8 +229,6 @@ class AnalysisPipeline:
                     exposure_solver = raw_exp_solver
             except Exception:
                 rating_thresholds = None
-
-        active_wildlife_categories = WILDLIFE_CATEGORIES if wildlife_enabled else []
 
         self._log_path = get_log_path(folder)
         stage_ctx = {"stage": "startup", "file": None}
@@ -485,7 +486,6 @@ class AnalysisPipeline:
                     cv2.imwrite(
                         export_path,
                         cv2.cvtColor(img_small, cv2.COLOR_RGB2BGR),
-                        [cv2.IMWRITE_JPEG_QUALITY, 70],
                     )
                     # Store relative path for cross-platform compatibility
                     export_path_rel = os.path.relpath(export_path, folder)
@@ -493,11 +493,18 @@ class AnalysisPipeline:
                     if thumbnail_cb:
                         thumbnail_cb({"filename": raw_file, "thumbnail": img_small, "export_path": export_path_rel})
 
-                    stage_ctx["stage"] = "mask_rcnn_prediction"
-                    # MaskRCNN inference can take many seconds. Pause semantics are
+                    stage_ctx["stage"] = "detection_segmentation"
+                    # SpeciesNet + SAM-HQ inference can take many seconds. Pause semantics are
                     # handled at the start of each image loop so we do not check
                     # repeatedly inside the image processing path.
-                    masks, pred_boxes, pred_class, pred_score = self.mask_rcnn.get_prediction(img, threshold=detection_threshold, mask_threshold=mask_threshold)
+                    # mask_threshold is accepted for API compatibility; SAM-HQ ignores it (see settings tooltip).
+                    masks, pred_boxes, pred_class, pred_score = self.sn_sam.get_prediction(
+                        img,
+                        image_path,
+                        wildlife_enabled=wildlife_enabled,
+                        threshold=detection_threshold,
+                        mask_threshold=mask_threshold,
+                    )
                     if masks is None or len(masks) == 0:
                         if detection_cb:
                             detection_cb(
@@ -520,7 +527,6 @@ class AnalysisPipeline:
                         cv2.imwrite(
                             crop_path,
                             cv2.cvtColor(img_small, cv2.COLOR_RGB2BGR),
-                            [cv2.IMWRITE_JPEG_QUALITY, 85],
                         )
                         # Store relative path for cross-platform compatibility
                         crop_path_rel = os.path.relpath(crop_path, folder)
@@ -571,14 +577,13 @@ class AnalysisPipeline:
                             progress_cb(idx + processed_count, total)
                         continue
 
-                    # Store top-5 raw MaskRCNN detection confidence scores
+                    # Top-5 SpeciesNet ensemble scores (per retained detection)
                     entry["detection_scores"] = json.dumps([float(s) for s in sorted(pred_score, reverse=True)[:5]])
 
-                    wildlife_indices = [i for i, c in enumerate(pred_class) if c in active_wildlife_categories]
                     bird_indices = [i for i, c in enumerate(pred_class) if c == "bird"]
-                    bird_indices = sorted(bird_indices, key=lambda i: pred_score[i], reverse=True)[:max_bird_crops]
+                    subject_indices = list(range(len(pred_class)))
 
-                    overlay_indices = bird_indices if bird_indices else wildlife_indices[:1]
+                    overlay_indices = subject_indices
                     if detection_cb:
                         detection_cb(
                             {
@@ -588,66 +593,10 @@ class AnalysisPipeline:
                             }
                         )
 
-                    def process_nonbird(primary_mask_i):
-                        stage_ctx["stage"] = "process_nonbird"
-                        stops = self._compute_exposure_stops(img, masks[primary_mask_i], exposure_profile)
-                        stops = self._refine_exposure_stops(
-                            img,
-                            masks[primary_mask_i],
-                            stops,
-                            exposure_profile,
-                            solver=exposure_solver,
-                            raw_obj=raw_obj,
-                            base_scale=raw_meter_scale,
-                            no_auto_bright=raw_obj is not None,
-                        )
-                        img_src = self._apply_exposure_correction(
-                            img,
-                            stops,
-                            raw_obj,
-                            base_scale=raw_meter_scale,
-                            no_auto_bright=raw_obj is not None,
-                            profile=exposure_profile,
-                        )
-                        total_stops = (
-                            ec_compose_total_stops(stops, raw_meter_scale)
-                            if raw_obj is not None
-                            else float(stops)
-                        )
-                        meter_scale = float(raw_meter_scale if raw_obj is not None else 1.0)
-                        pipeline_mode = (
-                            "no_auto_bright_metered_v1"
-                            if raw_obj is not None
-                            else "legacy_auto_bright_v1"
-                        )
-                        crop_bbox = self.mask_rcnn.get_square_crop_box(masks[primary_mask_i])
-                        quality_crop, quality_mask = self.mask_rcnn.get_square_crop(
-                            masks[primary_mask_i], img_src, resize=True
-                        )
-                        quality_score = self.quality_clf.classify(quality_crop, quality_mask)
-                        return {
-                            "index": int(primary_mask_i),
-                            "confidence": float(pred_score[primary_mask_i]),
-                            "species": pred_class[primary_mask_i],
-                            "species_confidence": float(pred_score[primary_mask_i]),
-                            "family": "N/A",
-                            "family_confidence": 0.0,
-                            "quality": quality_score,
-                            "rating": quality_to_rating(quality_score, rating_thresholds),
-                            "quality_crop": quality_crop,
-                            "exposure_correction": round(total_stops, 4),
-                            "exposure_pipeline": pipeline_mode,
-                            "exposure_subject_stops": round(float(stops), 4),
-                            "exposure_meter_scale": round(meter_scale, 6),
-                            "crop_bbox": crop_bbox,
-                        }
-
-                    def process_bird_items(indices):
-                        stage_ctx["stage"] = "process_bird"
+                    def process_subject_items(indices):
+                        stage_ctx["stage"] = "process_subjects"
                         items = []
                         for i in indices:
-                            # Process per-crop results. Pause is checked at the
-                            # top of the image loop so we avoid pausing mid-image.
                             stops = self._compute_exposure_stops(img, masks[i], exposure_profile)
                             stops = self._refine_exposure_stops(
                                 img,
@@ -678,9 +627,9 @@ class AnalysisPipeline:
                                 if raw_obj is not None
                                 else "legacy_auto_bright_v1"
                             )
-                            species_crop = self.mask_rcnn.get_species_crop(pred_boxes[i], img_src)
-                            crop_bbox = self.mask_rcnn.get_square_crop_box(masks[i])
-                            quality_crop, quality_mask = self.mask_rcnn.get_square_crop(masks[i], img_src, resize=True)
+                            species_crop = self.sn_sam.get_species_crop(pred_boxes[i], img_src)
+                            crop_bbox = self.sn_sam.get_square_crop_box(masks[i])
+                            quality_crop, quality_mask = self.sn_sam.get_square_crop(masks[i], img_src, resize=True)
                             items.append(
                                 {
                                     "index": i,
@@ -771,9 +720,9 @@ class AnalysisPipeline:
                     primary_crop_index = 0
                     img_h, img_w = img.shape[:2]
 
-                    if bird_indices:
-                        bird_items = process_bird_items(bird_indices)
-                        bird_data = [
+                    if subject_indices:
+                        subject_items = process_subject_items(subject_indices)
+                        crop_data = [
                             {
                                 "index": i["index"],
                                 "confidence": i["confidence"],
@@ -790,27 +739,27 @@ class AnalysisPipeline:
                                 "exposure_meter_scale": i.get("exposure_meter_scale", 1.0),
                                 "crop_bbox": i.get("crop_bbox"),
                             }
-                            for i in bird_items
+                            for i in subject_items
                         ]
-                        primary_crop_index = int(np.argmax([b["quality"] for b in bird_data]))
-                        primary_bird = bird_data[primary_crop_index]
+                        primary_crop_index = int(np.argmax([b["quality"] for b in crop_data]))
+                        primary_row = crop_data[primary_crop_index]
                         entry.update(
                             {
-                                "species": primary_bird["species"],
-                                "species_confidence": primary_bird["species_confidence"],
-                                "family": primary_bird["family"],
-                                "family_confidence": primary_bird["family_confidence"],
-                                "quality": primary_bird["quality"],
-                                "exposure_correction": primary_bird["exposure_correction"],
-                                "exposure_pipeline": primary_bird["exposure_pipeline"],
-                                "exposure_subject_stops": primary_bird["exposure_subject_stops"],
-                                "exposure_meter_scale": primary_bird["exposure_meter_scale"],
+                                "species": primary_row["species"],
+                                "species_confidence": primary_row["species_confidence"],
+                                "family": primary_row["family"],
+                                "family_confidence": primary_row["family_confidence"],
+                                "quality": primary_row["quality"],
+                                "exposure_correction": primary_row["exposure_correction"],
+                                "exposure_pipeline": primary_row["exposure_pipeline"],
+                                "exposure_subject_stops": primary_row["exposure_subject_stops"],
+                                "exposure_meter_scale": primary_row["exposure_meter_scale"],
                             }
                         )
-                        all_species = [b["species"] for b in bird_data]
-                        all_species_conf = [float(b["species_confidence"]) for b in bird_data]
-                        all_families = [b["family"] for b in bird_data]
-                        all_family_conf = [float(b["family_confidence"]) for b in bird_data]
+                        all_species = [b["species"] for b in crop_data]
+                        all_species_conf = [float(b["species_confidence"]) for b in crop_data]
+                        all_families = [b["family"] for b in crop_data]
+                        all_family_conf = [float(b["family_confidence"]) for b in crop_data]
                         entry.update(
                             {
                                 "secondary_species_list": json.dumps(all_species),
@@ -819,94 +768,46 @@ class AnalysisPipeline:
                                 "secondary_family_scores": json.dumps(all_family_conf),
                             }
                         )
-                        crop_items_for_write = bird_data
+                        crop_items_for_write = crop_data
                     else:
-                        if wildlife_indices:
-                            primary_index = wildlife_indices[np.argmax([pred_score[i] for i in wildlife_indices])]
-                            result = process_nonbird(primary_index)
-                            if crops_cb:
-                                crops_cb(
-                                    {
-                                        "filename": raw_file,
-                                        "crops": [result["quality_crop"]],
-                                        "confidences": [float(pred_score[primary_index])],
-                                    }
-                                )
-                            if quality_cb:
-                                quality_cb(
-                                    {
-                                        "filename": raw_file,
-                                        "results": [{"quality": result["quality"], "rating": result["rating"]}],
-                                    }
-                                )
-                            if species_cb:
-                                species_cb(
-                                    {
-                                        "filename": raw_file,
-                                        "results": [
-                                            {
-                                                "species": result["species"],
-                                                "species_confidence": result["species_confidence"],
-                                                "family": result["family"],
-                                                "family_confidence": result["family_confidence"],
-                                            }
-                                        ],
-                                    }
-                                )
-                            entry.update(
-                                {
-                                    "species": result["species"],
-                                    "species_confidence": result["species_confidence"],
-                                    "family": result["family"],
-                                    "family_confidence": result["family_confidence"],
-                                    "quality": result["quality"],
-                                    "exposure_correction": result["exposure_correction"],
-                                    "exposure_pipeline": result.get("exposure_pipeline", "legacy_auto_bright_v1"),
-                                    "exposure_subject_stops": result.get("exposure_subject_stops", 0.0),
-                                    "exposure_meter_scale": result.get("exposure_meter_scale", 1.0),
-                                }
-                            )
-                            crop_items_for_write = [result]
-                            primary_crop_index = 0
-                        else:
-                            if crops_cb:
-                                crops_cb({"filename": raw_file, "crops": [], "confidences": []})
-                            if quality_cb:
-                                quality_cb({"filename": raw_file, "results": []})
-                            if species_cb:
-                                species_cb({"filename": raw_file, "results": []})
-                            crop_items_for_write = [
-                                {
-                                    "index": -1,
-                                    "confidence": 0.0,
-                                    "species": entry.get("species", "Unknown"),
-                                    "species_confidence": entry.get("species_confidence", 0.0),
-                                    "family": entry.get("family", "Unknown"),
-                                    "family_confidence": entry.get("family_confidence", 0.0),
-                                    "quality": entry.get("quality", -1.0),
-                                    "rating": 0,
-                                    "quality_crop": img_small,
-                                    "exposure_correction": entry.get("exposure_correction", 0.0),
-                                    "exposure_pipeline": entry.get("exposure_pipeline", "legacy_auto_bright_v1"),
-                                    "exposure_subject_stops": entry.get("exposure_subject_stops", 0.0),
-                                    "exposure_meter_scale": entry.get("exposure_meter_scale", 1.0),
-                                    "crop_bbox": {
-                                        "x_min": 0,
-                                        "x_max": int(img_w),
-                                        "y_min": 0,
-                                        "y_max": int(img_h),
-                                        "width": int(img_w),
-                                        "height": int(img_h),
-                                        "x_min_norm": 0.0,
-                                        "x_max_norm": 1.0,
-                                        "y_min_norm": 0.0,
-                                        "y_max_norm": 1.0,
-                                        "x_center_norm": 0.5,
-                                        "y_center_norm": 0.5,
-                                    },
-                                }
-                            ]
-                            primary_crop_index = 0
+                        if crops_cb:
+                            crops_cb({"filename": raw_file, "crops": [], "confidences": []})
+                        if quality_cb:
+                            quality_cb({"filename": raw_file, "results": []})
+                        if species_cb:
+                            species_cb({"filename": raw_file, "results": []})
+                        crop_items_for_write = [
+                            {
+                                "index": -1,
+                                "confidence": 0.0,
+                                "species": entry.get("species", "Unknown"),
+                                "species_confidence": entry.get("species_confidence", 0.0),
+                                "family": entry.get("family", "Unknown"),
+                                "family_confidence": entry.get("family_confidence", 0.0),
+                                "quality": entry.get("quality", -1.0),
+                                "rating": 0,
+                                "quality_crop": img_small,
+                                "exposure_correction": entry.get("exposure_correction", 0.0),
+                                "exposure_pipeline": entry.get("exposure_pipeline", "legacy_auto_bright_v1"),
+                                "exposure_subject_stops": entry.get("exposure_subject_stops", 0.0),
+                                "exposure_meter_scale": entry.get("exposure_meter_scale", 1.0),
+                                "crop_bbox": {
+                                    "x_min": 0,
+                                    "x_max": int(img_w),
+                                    "y_min": 0,
+                                    "y_max": int(img_h),
+                                    "width": int(img_w),
+                                    "height": int(img_h),
+                                    "x_min_norm": 0.0,
+                                    "x_max_norm": 1.0,
+                                    "y_min_norm": 0.0,
+                                    "y_max_norm": 1.0,
+                                    "x_center_norm": 0.5,
+                                    "y_center_norm": 0.5,
+                                },
+                            }
+                        ]
+                        primary_crop_index = 0
 
                     stage_ctx["stage"] = "write_crop"
                     serialized_crops = []
@@ -919,7 +820,6 @@ class AnalysisPipeline:
                         cv2.imwrite(
                             crop_path,
                             cv2.cvtColor(crop_img, cv2.COLOR_RGB2BGR),
-                            [cv2.IMWRITE_JPEG_QUALITY, 85],
                         )
                         crop_path_rel = os.path.relpath(crop_path, folder)
                         bbox = crop_item.get("crop_bbox") or {
@@ -1054,7 +954,7 @@ class AnalysisPipeline:
                     except Exception: pass
                     try: del items
                     except Exception: pass
-                    try: del bird_items
+                    try: del subject_items
                     except Exception: pass
                 except Exception:
                     pass

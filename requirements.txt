@@ -28,3 +28,8 @@ msvc-runtime==14.44.35112
 # EXIF reading
 exifread
 pillow==12.1.1
+
+# Camera-trap detection + segmentation (SpeciesNet + SAM-HQ)
+speciesnet
+segment-anything-hq
+timm

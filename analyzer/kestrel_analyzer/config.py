@@ -10,6 +10,9 @@ SPECIESCLASSIFIER_LABELS = MODELS_DIR / "labels.txt"
 QUALITYCLASSIFIER_PATH = MODELS_DIR / "quality.keras"
 QUALITY_NORMALIZATION_DATA_PATH = MODELS_DIR / "quality_normalization_data.csv"
 MASK_RCNN_WEIGHTS_PATH = MODELS_DIR / "mask_rcnn_resnet50_fpn_v2.pth"
+# SAM-HQ: ViT-Tiny default (faster). For ViT-B quality, set path to sam_hq_vit_b.pth and SAM_HQ_MODEL_KEY = "vit_b".
+SAM_HQ_WEIGHTS_PATH = MODELS_DIR / "sam_hq_vit_tiny.pth"
+SAM_HQ_MODEL_KEY = "vit_tiny"  # segment_anything_hq.sam_model_registry
 
 WILDLIFE_CATEGORIES = [
     "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe", "bird"

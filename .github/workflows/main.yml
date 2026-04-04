@@ -87,14 +87,15 @@ jobs:
           New-Item -ItemType Directory -Force -Path "analyzer\models" | Out-Null
 
           $models = @(
-            @{ name = "mask_rcnn_resnet50_fpn_v2.pth"; url = "https://github.com/SanjaySoniLV/ProjectKestrel/releases/download/test/mask_rcnn_resnet50_fpn_v2.pth" }
+            @{ name = "sam_hq_vit_tiny.pth"; url = "https://huggingface.co/lkeab/hq-sam/resolve/main/sam_hq_vit_tiny.pth" }
           )
 
           foreach ($m in $models) {
             Write-Host "  -> $($m.name)"
             Invoke-WebRequest -Uri $m.url -OutFile "analyzer\models\$($m.name)"
             $size = (Get-Item "analyzer\models\$($m.name)").Length
-            if ($size -lt 100000) { throw "Downloaded $($m.name) is too small ($size bytes)" }
+            $minBytes = if ($m.name -like "sam_*.pth") { 20000000 } else { 100000 }
+            if ($size -lt $minBytes) { throw "Downloaded $($m.name) is too small ($size bytes)" }
             Write-Host "     OK ($size bytes)"
           }
 

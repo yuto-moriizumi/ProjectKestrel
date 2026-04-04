@@ -30,3 +30,8 @@ pyinstaller==6.18.0
 # EXIF reading
 exifread
 pillow==12.1.1
+
+# Camera-trap detection + segmentation (SpeciesNet + SAM-HQ)
+speciesnet
+segment-anything-hq
+timm
