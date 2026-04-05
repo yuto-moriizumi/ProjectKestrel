@@ -32,6 +32,6 @@ exifread
 pillow==12.1.1
 
 # Camera-trap detection + segmentation (SpeciesNet + SAM-HQ)
-speciesnet
+speciesnet==5.0.3
 segment-anything-hq
 timm

@@ -10,7 +10,7 @@ import numpy as np
 import torch
 from PIL import Image
 
-from ..config import SAM_HQ_MODEL_KEY, SAM_HQ_WEIGHTS_PATH
+from ..config import SAM_HQ_MODEL_KEY, SAM_HQ_WEIGHTS_PATH, SPECIESNET_MODEL_DIR
 from .speciesnet_taxonomy import (
     bird_vs_wildlife_classifier_scores,
     is_ambiguous_generic_taxonomy,
@@ -79,6 +79,17 @@ def _pixel_box_to_pipeline_box(
     return (float(x1), float(y1)), (float(x2), float(y2))
 
 
+def _speciesnet_bundle_model_name() -> str:
+    """Filesystem path for the bundled SpeciesNet model (see speciesnet.utils.ModelInfo)."""
+    bundle = SPECIESNET_MODEL_DIR
+    info_json = bundle / "info.json"
+    if not info_json.is_file():
+        raise FileNotFoundError(
+            f"SpeciesNet model bundle not found. Expected {info_json} with classifier, detector, and taxonomy files."
+        )
+    return str(bundle.resolve())
+
+
 def _clip_xyxy(x1: float, y1: float, x2: float, y2: float, w: int, h: int) -> tuple[int, int, int, int]:
     x1i = int(max(0, min(w - 1, x1)))
     y1i = int(max(0, min(h - 1, y1)))
@@ -119,14 +130,13 @@ class SpeciesNetSAMHQWrapper:
 
     def _ensure_speciesnet(self) -> None:
         from speciesnet import (
-            DEFAULT_MODEL,
             SpeciesNetClassifier,
             SpeciesNetDetector,
             SpeciesNetEnsemble,
         )
 
         if self.detector is None or self.classifier is None:
-            self.model_name = DEFAULT_MODEL
+            self.model_name = _speciesnet_bundle_model_name()
             self.detector = SpeciesNetDetector(self.model_name)
             device = "cpu" if not self.use_gpu else self.detector.device
             self.classifier = SpeciesNetClassifier(self.model_name, device=device)

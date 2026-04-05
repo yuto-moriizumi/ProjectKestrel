@@ -14,6 +14,9 @@ MASK_RCNN_WEIGHTS_PATH = MODELS_DIR / "mask_rcnn_resnet50_fpn_v2.pth"
 SAM_HQ_WEIGHTS_PATH = MODELS_DIR / "sam_hq_vit_tiny.pth"
 SAM_HQ_MODEL_KEY = "vit_tiny"  # segment_anything_hq.sam_model_registry
 
+# SpeciesNet: bundled Kaggle-style folder (info.json + .pt + taxonomy). Passed as local model_name to speciesnet.ModelInfo.
+SPECIESNET_MODEL_DIR = MODELS_DIR / "speciesnet"
+
 WILDLIFE_CATEGORIES = [
     "cat", "dog", "horse", "sheep", "cow", "elephant", "bear", "zebra", "giraffe", "bird"
 ]

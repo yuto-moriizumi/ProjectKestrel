@@ -425,6 +425,20 @@ class QueueManager:
         self._persist_recovery_state()
         return {'success': True}
 
+    def join_worker(self, timeout: float | None = 120.0) -> bool:
+        """Block until the analysis worker thread stops (e.g. after :meth:`cancel`).
+
+        Returns True if no worker is running or the thread joined within *timeout*.
+        Returns False if the thread is still alive after waiting (caller may exit anyway).
+        """
+        t = self._thread
+        if t is None:
+            return True
+        if not t.is_alive():
+            return True
+        t.join(timeout=timeout)
+        return not t.is_alive()
+
     def clear_done(self) -> dict:
         with self._lock:
             self._items = [it for it in self._items if it.status not in ('done', 'error', 'cancelled')]

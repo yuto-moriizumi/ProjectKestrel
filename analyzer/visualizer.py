@@ -38,6 +38,7 @@ import argparse
 import json
 import os
 import sys
+import time
 
 import secrets
 from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
@@ -824,6 +825,22 @@ def main():
                 except Exception as e:
                     log('Cache cleanup on close failed:', e)
 
+            def _cancel_analysis_wait_for_worker_and_telemetry():
+                """Cancel queue, wait for worker (sends completion telemetry), then allow HTTP to finish."""
+                try:
+                    _queue_manager.cancel()
+                except Exception:
+                    pass
+                try:
+                    _queue_manager.join_worker(timeout=120.0)
+                except Exception:
+                    pass
+                try:
+                    # Mirror top-level crash handler: async telemetry uses daemon threads.
+                    time.sleep(2)
+                except Exception:
+                    pass
+
             # When an analysis is running or paused, prompt the user with
             # options to Minimize, Exit (cancel) or Cancel the close.
             if _queue_manager.is_running or _queue_manager.is_paused:
@@ -844,10 +861,7 @@ def main():
                         # IDNO=7  -> Minimize instead of closing
                         # IDCANCEL=2 -> Do not close
                         if resp == 6:
-                            try:
-                                _queue_manager.cancel()
-                            except Exception:
-                                pass
+                            _cancel_analysis_wait_for_worker_and_telemetry()
                             _cleanup_preview_cache_before_exit()
                             return True
                         if resp == 7:
@@ -871,10 +885,7 @@ def main():
                         root.destroy()
                         # askyesnocancel returns True=Yes, False=No, None=Cancel
                         if res is True:
-                            try:
-                                _queue_manager.cancel()
-                            except Exception:
-                                pass
+                            _cancel_analysis_wait_for_worker_and_telemetry()
                             _cleanup_preview_cache_before_exit()
                             return True
                         if res is False:
