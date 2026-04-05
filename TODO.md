@@ -1,5 +1,13 @@
 # Project Kestrel To-Do and Changelog
 
+Pipeline version 2.0 Notes
+* Confirmed that speciesnet + SAM-HQ-tiny is almost certainly a much better pipeline than Mask-RCNN; bird/wildlife detection is much more reliable, and SAM-HQ works way better than mask-rcnn in getting good-qualiy segmentation masks.
+* The rest of the pipeline already works wonderfully, current implementation has minimal changes needed. - Just need to bundle speciesnet and tiny-sam-hq 
+* Wildlife detection seems reasonable too but will need further testing once yellowstone images finish.
+* Really want cloud compute to work... need to re-engineer colab pipeline for this latest system.
+
+
+
 Known issues:
 * Multi-subject mode crop promotion is a bit inconsistent --> doesn't seem to save changes properly. Look into and investigate this; might be an issue with folder being status analysis in progress (perhaps it overwrites entire database which contains crop promotion)
 * metering approach might be slightly reducing bird detection performance
