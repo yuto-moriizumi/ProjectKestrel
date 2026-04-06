@@ -5,6 +5,11 @@ Pipeline version 2.0 Notes
 * The rest of the pipeline already works wonderfully, current implementation has minimal changes needed. - Just need to bundle speciesnet and tiny-sam-hq 
 * Wildlife detection seems reasonable too but will need further testing once yellowstone images finish.
 * Really want cloud compute to work... need to re-engineer colab pipeline for this latest system.
+* Remove .claude directory
+* Fix "Dropped unsupported keys (1): culling_tutorial_seen\n127.0.0.1 - - [06/Apr/2026 13:13:59] \"GET / HTTP/1.1\" 200 -\n127.0.0.1 - - [06/Apr/2026 13:13:59]" tutorial keeps showing up.
+* Add "2x speed" mode for attempted faster processing
+* Add ability to change what specific XML fields are written (no auto import of star ratings, etc.)
+
 
 
 
@@ -13,6 +18,7 @@ Known issues:
 * metering approach might be slightly reducing bird detection performance
 * fix telemetry issues - version not being sent
 * add versioned legal agreement checks so that terms of service can be updated.
+* fix "tutorial_seen" field causing problems.
 
 
 Features under consideration

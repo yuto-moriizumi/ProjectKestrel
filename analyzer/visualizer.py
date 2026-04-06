@@ -191,11 +191,12 @@ def _mark_session_start() -> None:
 
 
 def _mark_session_clean_exit() -> None:
-    """Mark this app session as closed cleanly."""
+    """Mark this session closed cleanly and clear stale unclean-shutdown recovery."""
     try:
         settings = load_persisted_settings()
         settings['app_session_closed_cleanly'] = True
         settings['last_session_closed_utc'] = _utc_now_iso()
+        settings.pop('last_unclean_shutdown_utc', None)
         save_persisted_settings(settings)
     except Exception:
         pass
