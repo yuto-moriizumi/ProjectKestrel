@@ -8,6 +8,7 @@ Pipeline version 2.0 Notes
 * Add ability to change what specific XML fields are written (no auto import of star ratings, etc.)
 * Upgrade exposure compensation methodology for improved performance, potentially via a metering system
 * Investigate hazy images from various reddit users
+* Investigate Sony HEIF image support
 
 
 Known issues:
