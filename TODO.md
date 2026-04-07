@@ -1,16 +1,13 @@
 # Project Kestrel To-Do and Changelog
 
 Pipeline version 2.0 Notes
-* Confirmed that speciesnet + SAM-HQ-tiny is almost certainly a much better pipeline than Mask-RCNN; bird/wildlife detection is much more reliable, and SAM-HQ works way better than mask-rcnn in getting good-qualiy segmentation masks.
-* The rest of the pipeline already works wonderfully, current implementation has minimal changes needed. - Just need to bundle speciesnet and tiny-sam-hq 
-* Wildlife detection seems reasonable too but will need further testing once yellowstone images finish.
-* Really want cloud compute to work... need to re-engineer colab pipeline for this latest system.
-* Remove .claude directory
+* Upgrade pipeline to verify GPU support does not crash the platform. Verify the build works cross platform. 
+* Pipeline upgrade: veriy models are bundled correctly with the git repository and remove steps related to downloading mask-rcnn weights file - just use Git LFS.
 * Fix "Dropped unsupported keys (1): culling_tutorial_seen\n127.0.0.1 - - [06/Apr/2026 13:13:59] \"GET / HTTP/1.1\" 200 -\n127.0.0.1 - - [06/Apr/2026 13:13:59]" tutorial keeps showing up.
 * Add "2x speed" mode for attempted faster processing
 * Add ability to change what specific XML fields are written (no auto import of star ratings, etc.)
-
-
+* Upgrade exposure compensation methodology for improved performance, potentially via a metering system
+* Investigate hazy images from various reddit users
 
 
 Known issues:
