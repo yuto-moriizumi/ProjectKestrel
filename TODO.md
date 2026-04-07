@@ -9,6 +9,9 @@ Pipeline version 2.0 Notes
 * Upgrade exposure compensation methodology for improved performance, potentially via a metering system
 * Investigate hazy images from various reddit users
 * Investigate Sony HEIF image support
+* Update terms of service to clarify file and folder names may be sent with crash reports.
+* Implement Kestrel Quick Export system (see below)
+* Revise multi-subject mode to support both birds and wildlife via similar pipelines, with a "wildlife mode" toggle to decide whether to filter away from birds or not ?
 
 
 Known issues:
@@ -31,7 +34,7 @@ Features under consideration
         - Pre-sets you can utilize (so you just tweak exposure, determine the crop)
         - maybe with AI denoise???
     Should take as little time as possible to export; then directly copies the exported photo into your clipboard and also features a way to access it again later.
-* Revised pipeline using YOLOX + Fast-SAM-HQ 
+* eBird integration support via user-provided API keys. [potentially pushed for next release]
 
 
 
