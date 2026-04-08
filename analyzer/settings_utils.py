@@ -17,8 +17,7 @@ _ALLOWED_EDITORS = {
     'acdsee', 'paintshop', 'faststone', 'xnview', 'irfanview', 'custom',
 }
 _ALLOWED_RATING_PROFILES = {'very_strict', 'strict', 'balanced', 'lenient', 'very_lenient'}
-_ALLOWED_EXPOSURE_PROFILES = {'lenient', 'normal', 'aggressive'}
-_ALLOWED_EXPOSURE_SOLVERS = {'metered_refine_one_pass', 'convergent_two_pass', 'predictive_fast'}
+_ALLOWED_EXPOSURE_QUALITY = {'lenient', 'balanced', 'aggressive'}
 _ALLOWED_QUEUE_ITEM_STATUSES = {'pending', 'running', 'done', 'error', 'cancelled'}
 
 # Telemetry — failsafe import (never blocks startup)
@@ -294,18 +293,11 @@ def _sanitize_settings_payload(data: dict, emit_log: bool = False) -> dict:
     _set_float('mask_threshold', default=0.5, min_value=0.5, max_value=0.95, digits=4)
     _set_int('max_bird_crops', default=5, min_value=1, max_value=20)
 
-    if 'exposure_compensation_profile' in data:
-        out['exposure_compensation_profile'] = _coerce_enum(
-            data.get('exposure_compensation_profile'),
-            _ALLOWED_EXPOSURE_PROFILES,
-            default='aggressive',
-        )
-
-    if 'exposure_compensation_solver' in data:
-        out['exposure_compensation_solver'] = _coerce_enum(
-            data.get('exposure_compensation_solver'),
-            _ALLOWED_EXPOSURE_SOLVERS,
-            default='metered_refine_one_pass',
+    if 'exposure_quality' in data:
+        out['exposure_quality'] = _coerce_enum(
+            data.get('exposure_quality'),
+            _ALLOWED_EXPOSURE_QUALITY,
+            default='balanced',
         )
 
     _set_bool('raw_preview_cache_enabled', default=True)

@@ -29,11 +29,10 @@ from .database import (
     update_scenedata_with_database,
 )
 from .exposure_compensation import (
-    apply_exposure_correction as ec_apply_exposure_correction,
     build_metered_detection_image,
     compose_total_stops as ec_compose_total_stops,
-    compute_exposure_stops as ec_compute_exposure_stops,
-    refine_exposure_stops as ec_refine_exposure_stops,
+    compute_stops_numpy_solver,
+    apply_exposure_crop_numpy,
 )
 from .image_utils import read_image, read_image_for_pipeline
 from .ratings import quality_to_rating, get_profile_thresholds
@@ -87,50 +86,21 @@ class AnalysisPipeline:
         return overlay
 
     @staticmethod
-    def _compute_exposure_stops(img: np.ndarray, mask: np.ndarray, profile: str = "aggressive") -> float:
-        return ec_compute_exposure_stops(img, mask, profile)
-
-    @staticmethod
-    def _refine_exposure_stops(
-        img: np.ndarray,
+    def _compute_stops_numpy(
+        noauto_linear: np.ndarray,
         mask: np.ndarray,
-        initial_stops: float,
-        profile: str,
-        solver: str = "metered_refine_one_pass",
-        raw_obj=None,
-        *,
-        base_scale: float = 1.0,
-        no_auto_bright: bool = False,
+        meter_scale: float,
+        quality: str = "balanced",
     ) -> float:
-        return ec_refine_exposure_stops(
-            img,
-            mask,
-            initial_stops,
-            profile,
-            solver=solver,
-            raw_obj=raw_obj,
-            base_scale=base_scale,
-            no_auto_bright=no_auto_bright,
-        )
+        return compute_stops_numpy_solver(noauto_linear, mask, meter_scale, quality)
 
     @staticmethod
-    def _apply_exposure_correction(
-        img: np.ndarray,
-        stops: float,
-        raw_obj=None,
-        *,
-        base_scale: float = 1.0,
-        no_auto_bright: bool = False,
-        profile: str = "aggressive",
+    def _apply_crop_numpy(
+        noauto_linear: np.ndarray,
+        crop_bbox,
+        total_scale: float,
     ) -> np.ndarray:
-        return ec_apply_exposure_correction(
-            img,
-            stops,
-            raw_obj,
-            base_scale=base_scale,
-            no_auto_bright=no_auto_bright,
-            profile=profile,
-        )
+        return apply_exposure_crop_numpy(noauto_linear, crop_bbox, total_scale)
 
     @staticmethod
     def _get_image_orientation(img: np.ndarray) -> str:
@@ -214,19 +184,15 @@ class AnalysisPipeline:
         max_bird_crops = max(1, min(20, max_bird_crops))
 
         rating_thresholds = None
-        exposure_profile = "aggressive"
-        exposure_solver = "metered_refine_one_pass"
+        exposure_quality = "balanced"
         if callable(load_persisted_settings):
             try:
                 sett = load_persisted_settings() or {}
                 profile = sett.get('rating_profile', 'balanced')
                 rating_thresholds = get_profile_thresholds(profile)
-                raw_exp_profile = str(sett.get('exposure_compensation_profile', 'aggressive') or 'aggressive').strip().lower()
-                if raw_exp_profile in {'lenient', 'normal', 'aggressive'}:
-                    exposure_profile = raw_exp_profile
-                raw_exp_solver = str(sett.get('exposure_compensation_solver', 'metered_refine_one_pass') or 'metered_refine_one_pass').strip().lower()
-                if raw_exp_solver in {'metered_refine_one_pass', 'convergent_two_pass', 'predictive_fast'}:
-                    exposure_solver = raw_exp_solver
+                raw_eq = str(sett.get('exposure_quality', 'balanced') or 'balanced').strip().lower()
+                if raw_eq in {'lenient', 'balanced', 'aggressive'}:
+                    exposure_quality = raw_eq
             except Exception:
                 rating_thresholds = None
 
@@ -387,14 +353,16 @@ class AnalysisPipeline:
                     stage_ctx["file"] = raw_file
                     image_path = os.path.join(folder, raw_file)
                     img, raw_obj = read_image_for_pipeline(image_path)
-                    if img is None:
+                    # For RAW files, read_image_for_pipeline returns (None, raw_obj)
+                    # intentionally — the metered decode below populates img.
+                    if img is None and raw_obj is None:
                         raise RuntimeError("Image read returned None")
 
+                    noauto_linear = None
                     if raw_obj is not None:
-                        entry["exposure_pipeline"] = "no_auto_bright_metered_v1"
-                        metered_img, raw_meter_scale, meter_debug = build_metered_detection_image(
+                        entry["exposure_pipeline"] = "numpy_linear_v2"
+                        metered_img, raw_meter_scale, meter_debug, noauto_linear = build_metered_detection_image(
                             raw_obj,
-                            profile=exposure_profile,
                         )
                         entry["exposure_meter_scale"] = float(raw_meter_scale)
                         if metered_img is not None:
@@ -406,6 +374,8 @@ class AnalysisPipeline:
                                 stage=stage_ctx["stage"],
                                 context={"file": raw_file, "folder": folder},
                             )
+                    if img is None:
+                        raise RuntimeError("Image build returned None")
 
                     current_orientation = self._get_image_orientation(img)
                     entry["orientation"] = current_orientation
@@ -597,38 +567,37 @@ class AnalysisPipeline:
                         stage_ctx["stage"] = "process_subjects"
                         items = []
                         for i in indices:
-                            stops = self._compute_exposure_stops(img, masks[i], exposure_profile)
-                            stops = self._refine_exposure_stops(
-                                img,
-                                masks[i],
-                                stops,
-                                exposure_profile,
-                                solver=exposure_solver,
-                                raw_obj=raw_obj,
-                                base_scale=raw_meter_scale,
-                                no_auto_bright=raw_obj is not None,
-                            )
-                            img_src = self._apply_exposure_correction(
-                                img,
-                                stops,
-                                raw_obj,
-                                base_scale=raw_meter_scale,
-                                no_auto_bright=raw_obj is not None,
-                                profile=exposure_profile,
-                            )
-                            total_stops = (
-                                ec_compose_total_stops(stops, raw_meter_scale)
-                                if raw_obj is not None
-                                else float(stops)
-                            )
-                            meter_scale = float(raw_meter_scale if raw_obj is not None else 1.0)
-                            pipeline_mode = (
-                                "no_auto_bright_metered_v1"
-                                if raw_obj is not None
-                                else "legacy_auto_bright_v1"
-                            )
-                            species_crop = self.sn_sam.get_species_crop(pred_boxes[i], img_src)
                             crop_bbox = self.sn_sam.get_square_crop_box(masks[i])
+                            if noauto_linear is not None:
+                                # RAW numpy path — no additional rawpy calls
+                                stops = self._compute_stops_numpy(
+                                    noauto_linear, masks[i], raw_meter_scale, exposure_quality
+                                )
+                                total_scale = float(raw_meter_scale) * (2.0 ** float(stops))
+                                bbox_tuple = (
+                                    crop_bbox["y_min"], crop_bbox["x_min"],
+                                    crop_bbox["y_max"], crop_bbox["x_max"],
+                                )
+                                corrected_crop = self._apply_crop_numpy(noauto_linear, bbox_tuple, total_scale)
+                                # Patch corrected crop into a copy of the metered image so
+                                # subsequent slicing (species_crop, quality_crop) uses
+                                # full-image coordinates as expected.
+                                img_src = img.copy()
+                                img_src[
+                                    crop_bbox["y_min"]:crop_bbox["y_max"],
+                                    crop_bbox["x_min"]:crop_bbox["x_max"],
+                                ] = corrected_crop
+                                total_stops = ec_compose_total_stops(stops, raw_meter_scale)
+                                meter_scale = float(raw_meter_scale)
+                                pipeline_mode = "numpy_linear_v2"
+                            else:
+                                # Non-RAW / JPEG path — simple numpy multiply on uint8
+                                stops = 0.0
+                                img_src = img
+                                total_stops = 0.0
+                                meter_scale = 1.0
+                                pipeline_mode = "legacy_auto_bright_v1"
+                            species_crop = self.sn_sam.get_species_crop(pred_boxes[i], img_src)
                             quality_crop, quality_mask = self.sn_sam.get_square_crop(masks[i], img_src, resize=True)
                             items.append(
                                 {
@@ -986,8 +955,8 @@ class AnalysisPipeline:
                                 _mode_txt = str(_mode or "").strip().lower()
                                 if _mode_txt:
                                     pipeline_modes.add(_mode_txt)
-                        if pipeline_modes == {"no_auto_bright_metered_v1"}:
-                            render_mode_meta = "no_auto_bright_metered_v1"
+                        if pipeline_modes == {"numpy_linear_v2"}:
+                            render_mode_meta = "numpy_linear_v2"
                         elif pipeline_modes == {"legacy_auto_bright_v1"}:
                             render_mode_meta = "legacy_auto_bright_v1"
                         elif pipeline_modes:
@@ -999,7 +968,7 @@ class AnalysisPipeline:
                         _meta["quality_distribution_stored"] = True
                         _meta["exposure_pipeline_version"] = 2
                         _meta["exposure_render_mode"] = render_mode_meta
-                        _meta["exposure_compensation_profile"] = exposure_profile
+                        _meta["exposure_quality"] = exposure_quality
                         with open(metadata_path, "w", encoding="utf-8") as mf:
                             _json.dump(_meta, mf, indent=2)
                     except Exception as _meta_e:

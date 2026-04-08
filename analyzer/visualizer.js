@@ -3989,18 +3989,11 @@
       if (maskThEl) maskThEl.value = getSetting('mask_threshold', 0.5);
       const maxBirdCropsEl = document.getElementById('maxBirdCrops');
       if (maxBirdCropsEl) maxBirdCropsEl.value = getSetting('max_bird_crops', 5);
-      // Exposure compensation profile
-      const expProfileEl = document.getElementById('exposureCompensationProfile');
-      if (expProfileEl) {
-        const savedExpProfile = String(getSetting('exposure_compensation_profile', 'aggressive') || 'aggressive').toLowerCase();
-        expProfileEl.value = ['lenient', 'normal', 'aggressive'].includes(savedExpProfile) ? savedExpProfile : 'aggressive';
-      }
-      const expSolverEl = document.getElementById('exposureCompensationSolver');
-      if (expSolverEl) {
-        const savedExpSolver = String(getSetting('exposure_compensation_solver', 'metered_refine_one_pass') || 'metered_refine_one_pass').toLowerCase();
-        expSolverEl.value = ['metered_refine_one_pass', 'predictive_fast', 'convergent_two_pass'].includes(savedExpSolver)
-          ? savedExpSolver
-          : 'metered_refine_one_pass';
+      // Exposure quality
+      const expQualityEl = document.getElementById('exposureQuality');
+      if (expQualityEl) {
+        const savedExpQuality = String(getSetting('exposure_quality', 'balanced') || 'balanced').toLowerCase();
+        expQualityEl.value = ['lenient', 'balanced', 'aggressive'].includes(savedExpQuality) ? savedExpQuality : 'balanced';
       }
       // RAW preview cache
       const rawCacheCb = document.getElementById('rawPreviewCacheEnabled');
@@ -4051,16 +4044,11 @@
         maxBirdCrops = Number.isFinite(parsedMaxBirdCrops) ? parsedMaxBirdCrops : 5;
       }
       maxBirdCrops = Math.max(1, Math.min(20, maxBirdCrops));
-      const expProfileEl2 = document.getElementById('exposureCompensationProfile');
-      const exposureCompensationProfile = (expProfileEl2 ? String(expProfileEl2.value || 'aggressive') : 'aggressive').toLowerCase();
-      const exposureCompensationProfileSafe = ['lenient', 'normal', 'aggressive'].includes(exposureCompensationProfile)
-        ? exposureCompensationProfile
-        : 'aggressive';
-      const expSolverEl2 = document.getElementById('exposureCompensationSolver');
-      const exposureCompensationSolver = (expSolverEl2 ? String(expSolverEl2.value || 'metered_refine_one_pass') : 'metered_refine_one_pass').toLowerCase();
-      const exposureCompensationSolverSafe = ['metered_refine_one_pass', 'predictive_fast', 'convergent_two_pass'].includes(exposureCompensationSolver)
-        ? exposureCompensationSolver
-        : 'metered_refine_one_pass';
+      const expQualityEl2 = document.getElementById('exposureQuality');
+      const exposureQualityRaw = (expQualityEl2 ? String(expQualityEl2.value || 'balanced') : 'balanced').toLowerCase();
+      const exposureQualitySafe = ['lenient', 'balanced', 'aggressive'].includes(exposureQualityRaw)
+        ? exposureQualityRaw
+        : 'balanced';
       const rawCacheCb2 = document.getElementById('rawPreviewCacheEnabled');
       const rawPreviewCacheEnabled = rawCacheCb2 ? rawCacheCb2.checked : true;
       const autoSaveCb = document.getElementById('settingsAutoSave');
@@ -4086,8 +4074,7 @@
         scene_time_threshold: sceneTimeThreshold,
         mask_threshold: maskThreshold,
         max_bird_crops: maxBirdCrops,
-        exposure_compensation_profile: exposureCompensationProfileSafe,
-        exposure_compensation_solver: exposureCompensationSolverSafe,
+        exposure_quality: exposureQualitySafe,
         raw_preview_cache_enabled: rawPreviewCacheEnabled,
         auto_save_enabled: autoSaveEnabled,
         raw_exposure_correction_disabled: document.getElementById('rawExposureCorrectionDisabled').checked,

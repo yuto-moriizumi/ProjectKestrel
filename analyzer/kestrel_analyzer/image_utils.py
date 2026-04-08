@@ -65,9 +65,11 @@ def read_image_for_pipeline(path: str):
 
         if ext in raw_extensions:
             # Do NOT use a context manager — we intentionally keep the object open.
+            # Do NOT call raw.postprocess() here — the pipeline immediately calls
+            # build_metered_detection_image() which does its own decode.  The
+            # default postprocess result would be discarded, wasting ~2 s per image.
             raw = rawpy.imread(path)
-            rgb = raw.postprocess()  # same defaults as read_image()
-            return rgb, raw
+            return None, raw
         else:
             return read_image(path), None
 
