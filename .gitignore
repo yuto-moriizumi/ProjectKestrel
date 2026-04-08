@@ -40,7 +40,6 @@ tmp_exposure_solver_benchmark_rounds.py
 tmp*
 .venv-speciesnet/
 .kestrel*
-*.pt
 documentation/
 .claude*
 EXPCOMP_tests/

@@ -12,6 +12,8 @@ Pipeline version 2.0 Notes
 * Update terms of service to clarify file and folder names may be sent with crash reports.
 * Implement Kestrel Quick Export system (see below)
 * Revise multi-subject mode to support both birds and wildlife via similar pipelines, with a "wildlife mode" toggle to decide whether to filter away from birds or not ?
+* Unknown error "Image build returned None" failure. 
+    -> ref IMG_8688-IMG_8717.CR3 in '4 3 2026 Wilsons Wabler
 
 
 Known issues:
