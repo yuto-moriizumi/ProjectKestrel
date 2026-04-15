@@ -1,8 +1,11 @@
+import concurrent.futures
 import json
 import os
+import queue
+import threading
 import time
 import warnings
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Generator, Optional
 
 import cv2
 import numpy as np
@@ -112,6 +115,115 @@ class AnalysisPipeline:
         if w > h:
             return "landscape"
         return "square"
+
+    # Number of parallel RAW decode threads.  3 keeps 3 files decoding concurrently
+    # while the main analysis thread runs inference; raises total CPU + RAM modestly.
+    _N_DECODE_WORKERS: int = 3
+
+    def _decode_image(self, image_path: str, raw_file: str) -> dict:
+        """Decode one image.  Safe to call from a worker thread.
+
+        Returns a dict with keys:
+            file_name, image_path, img, noauto_linear, raw_meter_scale,
+            exposure_pipeline, meter_warning, orientation, capture_time, error
+        """
+        result: dict = {
+            "file_name": raw_file,
+            "image_path": image_path,
+            "img": None,
+            "noauto_linear": None,
+            "raw_meter_scale": 1.0,
+            "exposure_pipeline": "legacy_auto_bright_v1",
+            "meter_warning": None,
+            "orientation": "unknown",
+            "capture_time": None,
+            "error": None,
+        }
+        try:
+            img, raw_obj = read_image_for_pipeline(image_path)
+            if img is None and raw_obj is None:
+                raise RuntimeError("Image read returned None for both img and raw_obj")
+
+            if raw_obj is not None:
+                result["exposure_pipeline"] = "numpy_linear_v2"
+                try:
+                    metered_img, raw_meter_scale, meter_debug, noauto_linear = (
+                        build_metered_detection_image(raw_obj)
+                    )
+                finally:
+                    raw_obj.close()
+                result["raw_meter_scale"] = float(raw_meter_scale)
+                result["noauto_linear"] = noauto_linear
+                if metered_img is not None:
+                    img = metered_img
+                elif meter_debug.get("error"):
+                    result["meter_warning"] = (
+                        f"RAW metering fallback to default decode: {meter_debug['error']}"
+                    )
+
+            if img is None:
+                raise RuntimeError("Image build returned None after decode")
+
+            result["img"] = img
+            result["orientation"] = self._get_image_orientation(img)
+
+            try:
+                ct = get_capture_time(image_path)
+                result["capture_time"] = ct
+            except Exception:
+                pass
+
+        except Exception as exc:
+            result["error"] = exc
+
+        return result
+
+    def _iter_decoded(
+        self,
+        file_list: list,
+        folder: str,
+        max_workers: int = 3,
+    ) -> Generator[dict, None, None]:
+        """Yield decoded image dicts in file_list order.
+
+        Up to *max_workers* files are decoded concurrently by background threads.
+        A semaphore limits total submitted-but-not-yet-consumed results to
+        ``max_workers + 1`` so peak memory stays bounded regardless of how
+        slowly the consumer processes each image.
+        """
+        if max_workers <= 1 or len(file_list) == 0:
+            # Degenerate cases: decode inline (no threading overhead).
+            for raw_file in file_list:
+                yield self._decode_image(os.path.join(folder, raw_file), raw_file)
+            return
+
+        max_buffered = max_workers + 1
+        semaphore = threading.Semaphore(max_buffered)
+        futures_q: queue.Queue = queue.Queue()
+
+        def _submit_all() -> None:
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                for raw_file in file_list:
+                    semaphore.acquire()  # block if max_buffered images are already in-flight
+                    future = executor.submit(
+                        self._decode_image,
+                        os.path.join(folder, raw_file),
+                        raw_file,
+                    )
+                    futures_q.put(future)
+            futures_q.put(None)  # sentinel: all jobs submitted and executor shut down
+
+        submit_thread = threading.Thread(target=_submit_all, daemon=True)
+        submit_thread.start()
+
+        while True:
+            future = futures_q.get()
+            if future is None:
+                break
+            yield future.result()     # blocks until this specific image is decoded
+            semaphore.release()       # allow one more image to be submitted + decoded
+
+        submit_thread.join()
 
     def load_models(
         self,
@@ -300,7 +412,12 @@ class AnalysisPipeline:
                         previous_orientation = self._get_image_orientation(img)
             scene_count = database["scene_count"].max() if not database.empty else 0
 
-            for idx, raw_file in enumerate(new_files, start=1):
+            for idx, decoded in enumerate(
+                self._iter_decoded(new_files, folder, max_workers=self._N_DECODE_WORKERS),
+                start=1,
+            ):
+                raw_file = decoded["file_name"]
+
                 # Pause: wait until resume or until cancel_event is set.
                 if pause_event is not None:
                     while not pause_event.is_set():
@@ -345,46 +462,37 @@ class AnalysisPipeline:
                     "orientation": "unknown",
                 }
 
-                image_path = None
-                raw_obj = None
-                raw_meter_scale = 1.0
+                image_path = decoded["image_path"]
+                raw_meter_scale = decoded["raw_meter_scale"]
                 try:
                     stage_ctx["stage"] = "read_image"
                     stage_ctx["file"] = raw_file
-                    image_path = os.path.join(folder, raw_file)
-                    img, raw_obj = read_image_for_pipeline(image_path)
-                    # For RAW files, read_image_for_pipeline returns (None, raw_obj)
-                    # intentionally — the metered decode below populates img.
-                    if img is None and raw_obj is None:
-                        raise RuntimeError("Image read returned None")
 
-                    noauto_linear = None
-                    if raw_obj is not None:
-                        entry["exposure_pipeline"] = "numpy_linear_v2"
-                        metered_img, raw_meter_scale, meter_debug, noauto_linear = build_metered_detection_image(
-                            raw_obj,
-                        )
-                        entry["exposure_meter_scale"] = float(raw_meter_scale)
-                        if metered_img is not None:
-                            img = metered_img
-                        elif meter_debug.get("error"):
-                            log_warning(
-                                self._log_path,
-                                f"RAW metering fallback to default decode: {meter_debug['error']}",
-                                stage=stage_ctx["stage"],
-                                context={"file": raw_file, "folder": folder},
-                            )
+                    # Re-raise any decode error inside the per-image error handler.
+                    if decoded["error"] is not None:
+                        raise decoded["error"]
+
+                    img = decoded["img"]
+                    noauto_linear = decoded["noauto_linear"]
+
                     if img is None:
                         raise RuntimeError("Image build returned None")
 
-                    current_orientation = self._get_image_orientation(img)
+                    entry["exposure_pipeline"] = decoded["exposure_pipeline"]
+                    entry["exposure_meter_scale"] = float(raw_meter_scale)
+                    if decoded.get("meter_warning"):
+                        log_warning(
+                            self._log_path,
+                            decoded["meter_warning"],
+                            stage=stage_ctx["stage"],
+                            context={"file": raw_file, "folder": folder},
+                        )
+
+                    current_orientation = decoded["orientation"]
                     entry["orientation"] = current_orientation
 
-                    try:
-                        ct = get_capture_time(image_path)
-                        entry["capture_time"] = ct.isoformat() if ct is not None else ""
-                    except Exception:
-                        pass
+                    ct = decoded["capture_time"]
+                    entry["capture_time"] = ct.isoformat() if ct is not None else ""
 
                     stage_ctx["stage"] = "compute_similarity"
                     timestamp_similar = None
@@ -907,13 +1015,8 @@ class AnalysisPipeline:
 
                 # Explicitly clear large temporary variables after each image
                 # so that pausing between images doesn't retain large buffers.
+                # raw_obj is owned by _decode_image (closed there); not present here.
                 try:
-                    # Close the rawpy object first to release the RAW file buffer.
-                    try:
-                        if raw_obj is not None:
-                            raw_obj.close()
-                        del raw_obj
-                    except Exception: pass
                     try: del masks
                     except Exception: pass
                     try: del pred_boxes

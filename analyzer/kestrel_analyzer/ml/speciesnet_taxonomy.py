@@ -51,7 +51,7 @@ def wildlife_display_name(raw: str) -> str:
 
 
 def is_ignored_prediction(raw: str) -> bool:
-    """blank, vehicle, human — skip for downstream processing."""
+    """blank, vehicle, human, no cv result — skip for downstream processing."""
     if not raw or not str(raw).strip():
         return True
     s = str(raw).strip()
@@ -61,9 +61,11 @@ def is_ignored_prediction(raw: str) -> bool:
         return True
     if s == _SPECIESNET_HUMAN:
         return True
+    if s == Classification.UNKNOWN.value:
+        return True
     parts_lower = [p.lower() for p in split_taxonomy(s) if p]
     last = parts_lower[-1] if parts_lower else ""
-    if last in ("blank", "vehicle", "human"):
+    if last in ("blank", "vehicle", "human", "no cv result"):
         return True
     return False
 
