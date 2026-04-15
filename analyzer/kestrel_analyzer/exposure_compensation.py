@@ -134,13 +134,23 @@ def build_metered_detection_image(
     - noauto_linear: float32 [0,1] truly-linear full-res array; reused for all
                      per-bird numpy corrections — no second rawpy call needed
     """
+    def _decode(use_camera_wb: bool) -> np.ndarray:
+        kwargs: Dict[str, Any] = {
+            "gamma": (1, 1),        # truly linear — no gamma curve applied
+            "no_auto_bright": True, # no auto-brightness compression
+            "output_bps": 16,       # full dynamic range
+        }
+        if use_camera_wb:
+            kwargs["use_camera_wb"] = True  # camera-metered WB from EXIF (fixes hazy look)
+        return raw_obj.postprocess(**kwargs)
+
     try:
-        noauto16 = raw_obj.postprocess(
-            gamma=(1, 1),           # truly linear — no gamma curve applied
-            no_auto_bright=True,    # no auto-brightness compression
-            output_bps=16,          # full dynamic range
-            use_camera_wb=True,     # camera-metered WB from EXIF (fixes hazy look)
-        )
+        try:
+            noauto16 = _decode(use_camera_wb=True)
+        except Exception:
+            # Some RAW files (manual WB, certain bodies) have no stored camera WB
+            # coefficients — fall back to rawpy's default daylight WB.
+            noauto16 = _decode(use_camera_wb=False)
         noauto_linear = np.clip(noauto16.astype(np.float32) / 65535.0, 0.0, 1.0)
         meter_scale, meter_debug = compute_global_meter_scale(noauto_linear)
         metered_linear = np.clip(noauto_linear * meter_scale, 0.0, 1.0)
