@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import os
 from pathlib import Path
 from typing import Any, Optional
 
@@ -402,7 +403,10 @@ class SpeciesNetSAMHQWrapper:
                 f"SAM-HQ decoder ONNX not found at: {SAM_DEC_ONNX_PATH}\n"
                 "Place sam_hq_vit_tiny_decoder.onnx under models/speciesnet/."
             )
-        self.predictor = OnnxSamPredictor(SAM_ENC_ONNX_PATH, SAM_DEC_ONNX_PATH, use_gpu=self.use_gpu)
+        # SAM-HQ always runs on CPU: DirectML does not correctly implement all
+        # SAM-HQ ops on Windows (produces all-True masks → full-image crops).
+        # The encode-once pattern means this is ~200–500 ms per image, which is fine.
+        self.predictor = OnnxSamPredictor(SAM_ENC_ONNX_PATH, SAM_DEC_ONNX_PATH, use_gpu=False)
         print(f"[SpeciesNetSAMHQ] SAM-HQ            : {self.predictor.device}")
 
     def _run_ensemble_for_item(
@@ -458,9 +462,6 @@ class SpeciesNetSAMHQWrapper:
         det_result = self.detector.predict(fp, detector_input)
         detections = det_result.get("detections", []) or []
 
-        print("[SpeciesNet] detector raw:", det_result)
-        print("[SpeciesNet] image:", fp, "detections count:", len(detections))
-
         animal_dets: list[dict[str, Any]] = []
         for det in detections:
             label = str(det.get("label", ""))
@@ -472,6 +473,8 @@ class SpeciesNetSAMHQWrapper:
             animal_dets.append(det)
 
         animal_dets.sort(key=lambda d: float(d.get("conf", 0.0)), reverse=True)
+        print(f"[SpeciesNet] {os.path.basename(fp)}  animals above threshold: {len(animal_dets)}"
+              f"  (threshold={threshold:.2f}, total proposals={len(detections)})")
 
         bird_rows: list[dict[str, Any]] = []
         wildlife_rows: list[dict[str, Any]] = []
@@ -509,19 +512,6 @@ class SpeciesNetSAMHQWrapper:
                 pred_score = float(scores[0]) if scores else conf
                 pred_source = "classifier_fallback"
 
-            print(
-                "[SpeciesNet] det",
-                det_idx,
-                "md_bbox",
-                md_bbox,
-                "ensemble pred:",
-                pred_raw,
-                "score",
-                pred_score,
-                "source",
-                pred_source,
-            )
-
             route, pred_label, pred_score = route_with_classifier_tiebreak(
                 pred_raw,
                 pred_score,
@@ -531,11 +521,16 @@ class SpeciesNetSAMHQWrapper:
             if is_ambiguous_generic_taxonomy(pred_raw):
                 bb, bo = bird_vs_wildlife_classifier_scores(cls_info)
                 print(
-                    "[SpeciesNet] ambiguous taxonomy; classifier bird_max="
-                    f"{bb:.4f} other_animal_max={bo:.4f} -> route={route} pred_label={pred_label}"
+                    f"[SpeciesNet] det {det_idx}  conf={conf:.2f}  pred={pred_raw!r}"
+                    f"  ambiguous: bird_max={bb:.3f} other={bo:.3f}"
+                    f"  -> route={route} label={pred_label}"
                 )
             else:
-                print("[SpeciesNet] route:", route, "pred_label:", pred_label)
+                print(
+                    f"[SpeciesNet] det {det_idx}  conf={conf:.2f}  pred={pred_raw!r}"
+                    f"  score={pred_score:.3f}  route={route}  label={pred_label}"
+                    f"  via={pred_source}"
+                )
 
             if route == "ignore" or pred_label is None:
                 continue
