@@ -738,6 +738,11 @@ class AnalysisPipeline:
                             }
                         )
                         crop_items_for_write = crop_data
+                        # Release full-res buffers now that all crops are extracted as
+                        # self-contained uint8 arrays.  img_h/img_w are already scalars;
+                        # img_small is a separate 1200px array and is unaffected.
+                        noauto_linear = None
+                        img = np.zeros((1, 1, 3), dtype=np.uint8)
                     else:
                         if crops_cb:
                             crops_cb({"filename": raw_file, "crops": [], "confidences": []})

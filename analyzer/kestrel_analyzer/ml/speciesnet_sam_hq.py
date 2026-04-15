@@ -7,10 +7,9 @@ from typing import Any, Optional
 
 import cv2
 import numpy as np
-import torch
 from PIL import Image
 
-from ..config import SAM_HQ_MODEL_KEY, SAM_HQ_WEIGHTS_PATH, SPECIESNET_MODEL_DIR
+from ..config import MDV6_ONNX_PATH, SAM_DEC_ONNX_PATH, SAM_ENC_ONNX_PATH, SPECIESNET_MODEL_DIR
 from .speciesnet_taxonomy import (
     bird_vs_wildlife_classifier_scores,
     is_ambiguous_generic_taxonomy,
@@ -102,76 +101,309 @@ def _clip_xyxy(x1: float, y1: float, x2: float, y2: float, w: int, h: int) -> tu
     return x1i, y1i, x2i, y2i
 
 
+class OnnxClassifier:
+    """
+    Drop-in replacement for SpeciesNetClassifier using ONNX Runtime.
+
+    Implements the same .preprocess() / .predict() interface so it can be
+    swapped in without changing any call sites in get_prediction().
+    """
+
+    IMG_SIZE = 480
+
+    def __init__(self, onnx_path: Path, labels_path: Path, use_gpu: bool = False):
+        import onnxruntime as ort
+
+        providers = (
+            ["DmlExecutionProvider", "CPUExecutionProvider"]
+            if use_gpu
+            else ["CPUExecutionProvider"]
+        )
+        self._session = ort.InferenceSession(str(onnx_path), providers=providers)
+        self.providers_used = self._session.get_providers()
+        with open(labels_path) as f:
+            self._labels = [line.strip() for line in f]
+        print(f"[OnnxClassifier] {len(self._labels)} labels  providers={self.providers_used}")
+
+    def preprocess(self, img_pil: Image.Image, bboxes: list | None = None) -> np.ndarray:
+        """
+        Replicate SpeciesNetClassifier.preprocess() for the 'always_crop' model type.
+
+        Args:
+            img_pil:  PIL RGB image.
+            bboxes:   List of BBox-like objects (first entry used). Each BBox is
+                      speciesnet BBox dataclass with xmin/ymin/width/height (normalized).
+
+        Returns:
+            uint8 numpy array of shape (480, 480, 3) HWC.
+        """
+        if bboxes:
+            b = bboxes[0]
+            # BBox is a frozen dataclass: xmin, ymin, width, height (all normalized)
+            left   = max(0, int(b.xmin   * img_pil.width))
+            top    = max(0, int(b.ymin   * img_pil.height))
+            width  = max(1, min(int(b.width  * img_pil.width),  img_pil.width  - left))
+            height = max(1, min(int(b.height * img_pil.height), img_pil.height - top))
+            crop   = img_pil.crop((left, top, left + width, top + height))
+        else:
+            crop = img_pil
+
+        crop_resized = crop.resize((self.IMG_SIZE, self.IMG_SIZE), Image.BILINEAR)
+        return np.array(crop_resized, dtype=np.uint8)  # (480, 480, 3) HWC uint8
+
+    def predict(self, filepath: str, preprocessed: np.ndarray) -> dict:
+        """
+        Run ONNX inference and return classifications in SpeciesNet format.
+
+        Returns:
+            {"classifications": {"classes": [...all labels desc by score...],
+                                 "scores":  [...corresponding float scores...]}}
+        """
+        inp = (preprocessed.astype(np.float32) / 255.0)[np.newaxis, ...]  # (1,480,480,3)
+        logits = self._session.run(None, {"input": inp})[0][0]             # (N_classes,)
+        exp = np.exp(logits - logits.max())
+        scores = exp / exp.sum()
+        order = np.argsort(scores)[::-1]
+        return {
+            "classifications": {
+                "classes": [self._labels[i] for i in order],
+                "scores":  [float(scores[i]) for i in order],
+            }
+        }
+
+
+class OnnxMDv6Detector:
+    """
+    MegaDetector v6 (RT-DETRv2-C) via ONNX Runtime.
+
+    Interface (identical to MDv6Detector):
+        preprocess(img_pil)          → (img_tensor, orig_w, orig_h)
+        predict(filepath, det_input) → {"filepath": str,
+                                         "detections": [{"label": str,
+                                                          "conf": float,
+                                                          "bbox": [xmin,ymin,w,h]}]}
+
+    Preprocessing squashes the image to 640×640 (CPU, pure numpy).
+    Category map:  0 → "animal"   1 → "person"   2 → "vehicle"
+    """
+
+    _LABEL_MAP: dict[int, str] = {0: "animal", 1: "person", 2: "vehicle"}
+
+    def __init__(self, onnx_path: Path, use_gpu: bool = False) -> None:
+        import onnxruntime as ort
+
+        onnx_path = Path(onnx_path)
+        if not onnx_path.is_file():
+            raise FileNotFoundError(
+                f"MDv6 weights not found: {onnx_path}\n"
+                "Place mdv6-apa-rtdetr-c.onnx (and mdv6-apa-rtdetr-c.onnx.data) "
+                "under models/speciesnet/."
+            )
+        providers = (
+            ["DmlExecutionProvider", "CPUExecutionProvider"]
+            if use_gpu
+            else ["CPUExecutionProvider"]
+        )
+        self._session = ort.InferenceSession(str(onnx_path), providers=providers)
+        _provs = self._session.get_providers()
+        self.device = "ONNX/GPU" if "DmlExecutionProvider" in _provs else "ONNX/CPU"
+        print(f"[OnnxMDv6Detector] Loaded {onnx_path.name}  providers={_provs}")
+
+    def preprocess(self, img_pil: "Image.Image") -> tuple:
+        """CPU: squash PIL to 640×640 float tensor; record original dims.
+
+        Returns (img_tensor [1,3,640,640] float32 [0,1], orig_w, orig_h).
+        """
+        orig_w, orig_h = img_pil.size
+        img_640 = np.array(img_pil.resize((640, 640), Image.BILINEAR), dtype=np.float32) / 255.0
+        img_tensor = img_640.transpose(2, 0, 1)[np.newaxis]  # [1, 3, 640, 640]
+        return (img_tensor, orig_w, orig_h)
+
+    def predict(self, filepath: str, det_input: tuple) -> dict:
+        """ONNX inference + decode absolute xyxy → normalised xywh."""
+        img_tensor, orig_w, orig_h = det_input
+        orig_sizes = np.array([[orig_w, orig_h]], dtype=np.float32)
+        labels_b, boxes_b, scores_b = self._session.run(
+            None, {"images": img_tensor, "orig_target_sizes": orig_sizes}
+        )
+        labels = labels_b[0]  # (300,)
+        boxes  = boxes_b[0]   # (300, 4) xyxy absolute pixels in orig space
+        scores = scores_b[0]  # (300,)
+
+        detections: list[dict] = []
+        for i in range(len(labels)):
+            conf = float(scores[i])
+            if conf < 0.01:
+                continue
+            cls_idx = int(labels[i])
+            x1, y1, x2, y2 = float(boxes[i][0]), float(boxes[i][1]), float(boxes[i][2]), float(boxes[i][3])
+            bbox = [
+                x1 / orig_w,
+                y1 / orig_h,
+                (x2 - x1) / orig_w,
+                (y2 - y1) / orig_h,
+            ]
+            label = self._LABEL_MAP.get(cls_idx, "unknown")
+            detections.append({"label": label, "conf": conf, "bbox": bbox})
+        return {"filepath": filepath, "detections": detections}
+
+
+class OnnxSamPredictor:
+    """
+    SAM-HQ ViT-Tiny via ONNX Runtime (split encoder + decoder).
+
+    Usage:
+        predictor = OnnxSamPredictor(enc_path, dec_path)
+        emb, interm, resized_hw, orig_hw = predictor.encode(img_np)
+        # For each detection box on the same image:
+        mask, iou = predictor.decode_box(emb, interm, (x1, y1, x2, y2), resized_hw, orig_hw)
+    """
+
+    _IMG_SIZE = 1024
+
+    def __init__(self, enc_path: Path, dec_path: Path, use_gpu: bool = False) -> None:
+        import onnxruntime as ort
+
+        providers = (
+            ["DmlExecutionProvider", "CPUExecutionProvider"]
+            if use_gpu
+            else ["CPUExecutionProvider"]
+        )
+        self._enc_session = ort.InferenceSession(str(enc_path), providers=providers)
+        self._dec_session = ort.InferenceSession(str(dec_path), providers=providers)
+        _provs = self._enc_session.get_providers()
+        self.device = "ONNX/GPU" if "DmlExecutionProvider" in _provs else "ONNX/CPU"
+        print(f"[OnnxSamPredictor] Loaded encoder+decoder  providers={_provs}")
+
+    @staticmethod
+    def _resize_longest_side(image: np.ndarray, target: int) -> np.ndarray:
+        h, w = image.shape[:2]
+        scale = target / max(h, w)
+        new_h, new_w = int(round(h * scale)), int(round(w * scale))
+        return cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+    def encode(self, img_np: np.ndarray) -> tuple:
+        """
+        Encode an image to SAM embeddings. Called once per image; reuse
+        the returned embeddings for all per-detection decode_box() calls.
+
+        The ONNX encoder normalizes internally, so input must be float32
+        in [0, 255] — do NOT pre-normalize.
+
+        Args:
+            img_np: uint8 HxWxC RGB numpy array.
+
+        Returns:
+            (image_embeddings, interm_embeddings, resized_hw, original_hw)
+        """
+        orig_h, orig_w = img_np.shape[:2]
+        resized = self._resize_longest_side(img_np, self._IMG_SIZE)
+        resized_h, resized_w = resized.shape[:2]
+
+        img = resized.astype(np.float32)
+        pad_h = self._IMG_SIZE - resized_h
+        pad_w = self._IMG_SIZE - resized_w
+        img = np.pad(img, ((0, pad_h), (0, pad_w), (0, 0)))  # HxWx3
+        img = img.transpose(2, 0, 1)[np.newaxis]             # [1, 3, 1024, 1024]
+
+        image_embeddings, interm_embeddings = self._enc_session.run(None, {"input_image": img})
+        return image_embeddings, interm_embeddings, (resized_h, resized_w), (orig_h, orig_w)
+
+    def decode_box(
+        self,
+        image_embeddings: np.ndarray,
+        interm_embeddings: np.ndarray,
+        box_xyxy: tuple,
+        resized_hw: tuple,
+        original_hw: tuple,
+    ) -> tuple[np.ndarray, float]:
+        """
+        Decode a bounding-box prompt to a mask.
+
+        Args:
+            image_embeddings, interm_embeddings: from encode()
+            box_xyxy: (x1, y1, x2, y2) in original pixel space (absolute coords)
+            resized_hw, original_hw: from encode()
+
+        Returns:
+            (mask bool HxW at original resolution, iou float)
+        """
+        orig_h, orig_w = original_hw
+        resized_h, resized_w = resized_hw
+        x1, y1, x2, y2 = box_xyxy
+
+        # Transform box corners from original space to the resized (apply_image) space
+        box_pts = np.array([
+            [x1 * resized_w / orig_w, y1 * resized_h / orig_h],
+            [x2 * resized_w / orig_w, y2 * resized_h / orig_h],
+        ], dtype=np.float32)
+
+        point_coords = box_pts[np.newaxis]                        # (1, 2, 2)
+        point_labels = np.array([[2.0, 3.0]], dtype=np.float32)   # TL=2, BR=3
+        mask_input   = np.zeros((1, 1, 256, 256), dtype=np.float32)
+        has_mask     = np.array([0.0], dtype=np.float32)
+        orig_im_size = np.array([orig_h, orig_w], dtype=np.float32)  # H, W
+
+        masks_out, iou_out, _ = self._dec_session.run(None, {
+            "image_embeddings":  image_embeddings,
+            "interm_embeddings": interm_embeddings,
+            "point_coords":      point_coords,
+            "point_labels":      point_labels,
+            "mask_input":        mask_input,
+            "has_mask_input":    has_mask,
+            "orig_im_size":      orig_im_size,
+        })
+        mask = masks_out[0, 0] > 0.0
+        iou  = float(iou_out[0, 0])
+        return mask, iou
+
+
 class SpeciesNetSAMHQWrapper:
-    """Detector/classifier/ensemble from SpeciesNet; masks from SAM-HQ (default ViT-Tiny) box prompts."""
+    """Detector/classifier/ensemble from SpeciesNet; masks from SAM-HQ (ViT-Tiny ONNX) box prompts."""
 
     def __init__(self, max_bird_crops: int = _DEFAULT_MAX_BIRD_CROPS, use_gpu: bool = True):
         self.max_bird_crops = _coerce_max_bird_crops(max_bird_crops)
         self.use_gpu = bool(use_gpu)
-        self._sam_device_resolved: Optional[torch.device] = None
-        self.predictor = None
-        self.detector = None
-        self.classifier = None
+        self.predictor: Optional[OnnxSamPredictor] = None
+        self.detector: Optional[OnnxMDv6Detector] = None
+        self.classifier: Optional[OnnxClassifier] = None
         self.ensemble = None
         self.model_name: Optional[str] = None
-        self._sam_checkpoint = Path(SAM_HQ_WEIGHTS_PATH)
-
-    @staticmethod
-    def _resolve_sam_device(use_gpu: bool) -> torch.device:
-        """PyTorch device for SAM-HQ (independent of ONNX/DirectML ``use_gpu``)."""
-        if not use_gpu:
-            return torch.device("cpu")
-        if torch.cuda.is_available():
-            return torch.device("cuda")
-        mps = getattr(torch.backends, "mps", None)
-        if mps is not None and mps.is_available():
-            return torch.device("mps")
-        return torch.device("cpu")
 
     def _ensure_speciesnet(self) -> None:
-        from speciesnet import (
-            SpeciesNetClassifier,
-            SpeciesNetDetector,
-            SpeciesNetEnsemble,
-        )
+        from speciesnet import SpeciesNetEnsemble
 
         if self.detector is None or self.classifier is None:
             self.model_name = _speciesnet_bundle_model_name()
-            self.detector = SpeciesNetDetector(self.model_name)
-            device = "cpu" if not self.use_gpu else self.detector.device
-            self.classifier = SpeciesNetClassifier(self.model_name, device=device)
+            self.detector = OnnxMDv6Detector(MDV6_ONNX_PATH, use_gpu=self.use_gpu)
+            onnx_path   = SPECIESNET_MODEL_DIR / "speciesNet_v4.0.1a.onnx"
+            labels_path = SPECIESNET_MODEL_DIR / "always_crop_99710272_22x8_v12_epoch_00148.labels.20251208.txt"
+            self.classifier = OnnxClassifier(onnx_path, labels_path, use_gpu=self.use_gpu)
+            print(f"[SpeciesNetSAMHQ] Detector          : {self.detector.device}")
+            print(f"[SpeciesNetSAMHQ] Classifier        : ONNX  providers={self.classifier.providers_used}")
         if self.ensemble is None:
             self.ensemble = SpeciesNetEnsemble(self.model_name, geofence=False)
 
+    def ensure_loaded(self) -> None:
+        """Eagerly load SpeciesNet + SAM-HQ models for this wrapper instance."""
+        self._ensure_speciesnet()
+        self._ensure_sam()
+
     def _ensure_sam(self) -> None:
-        from segment_anything_hq import SamPredictor, sam_model_registry
-
-        sam_device = self._resolve_sam_device(self.use_gpu)
-        need_new = self.predictor is None or self._sam_device_resolved != sam_device
-        if not need_new:
+        if self.predictor is not None:
             return
-        if not self._sam_checkpoint.exists():
+        if not Path(SAM_ENC_ONNX_PATH).is_file():
             raise FileNotFoundError(
-                f"SAM-HQ weights not found at: {self._sam_checkpoint}\n"
-                "Place sam_hq_vit_tiny.pth under analyzer/models/ (see config.SAM_HQ_WEIGHTS_PATH)."
+                f"SAM-HQ encoder ONNX not found at: {SAM_ENC_ONNX_PATH}\n"
+                "Place sam_hq_vit_tiny_encoder.onnx under models/speciesnet/."
             )
-        original_torch_load = torch.load
-
-        def _safe_torch_load(*args, **kwargs):
-            # Checkpoints may be CUDA-serialized; always load to CPU then .to(device).
-            kwargs.setdefault("map_location", torch.device("cpu"))
-            return original_torch_load(*args, **kwargs)
-
-        torch.load = _safe_torch_load
-        try:
-            sam = sam_model_registry[SAM_HQ_MODEL_KEY](checkpoint=str(self._sam_checkpoint))
-        finally:
-            torch.load = original_torch_load
-        if hasattr(sam, "to"):
-            sam.to(sam_device)
-        sam.eval()
-        self.predictor = SamPredictor(sam)
-        self._sam_device_resolved = sam_device
+        if not Path(SAM_DEC_ONNX_PATH).is_file():
+            raise FileNotFoundError(
+                f"SAM-HQ decoder ONNX not found at: {SAM_DEC_ONNX_PATH}\n"
+                "Place sam_hq_vit_tiny_decoder.onnx under models/speciesnet/."
+            )
+        self.predictor = OnnxSamPredictor(SAM_ENC_ONNX_PATH, SAM_DEC_ONNX_PATH, use_gpu=self.use_gpu)
+        print(f"[SpeciesNetSAMHQ] SAM-HQ            : {self.predictor.device}")
 
     def _run_ensemble_for_item(
         self,
@@ -247,7 +479,8 @@ class SpeciesNetSAMHQWrapper:
         if self.predictor is None:
             return [], [], [], []
 
-        self.predictor.set_image(image_data)
+        # Encode once — all detections on this image share the same embeddings
+        image_embeddings, interm_embeddings, resized_hw, original_hw = self.predictor.encode(image_data)
 
         for det_idx, det in enumerate(animal_dets):
             md_bbox = det.get("bbox", [0.0, 0.0, 0.0, 0.0])
@@ -311,14 +544,10 @@ class SpeciesNetSAMHQWrapper:
             xi1, yi1, xi2, yi2 = _clip_xyxy(x1, y1, x2, y2, w, h)
 
             try:
-                masks_out, _mask_scores, _ = self.predictor.predict(
-                    point_coords=None,
-                    point_labels=None,
-                    box=np.array([xi1, yi1, xi2, yi2], dtype=np.float32),
-                    multimask_output=False,
-                    hq_token_only=True,
+                mask, _iou = self.predictor.decode_box(
+                    image_embeddings, interm_embeddings,
+                    (xi1, yi1, xi2, yi2), resized_hw, original_hw,
                 )
-                mask = masks_out[0].astype(bool)
             except Exception as e:
                 print("[SAM-HQ] mask failed:", e)
                 continue
@@ -354,11 +583,6 @@ class SpeciesNetSAMHQWrapper:
     # --- Geometry (aligned with MaskRCNNWrapper) for square crops and species bbox ---
 
     @staticmethod
-    def _center_of_mass(mask):
-        y, x = np.where(mask > 0)
-        return (int(np.mean(x)), int(np.mean(y)))
-
-    @staticmethod
     def _fsolve(func, xmin, xmax):
         x_min, x_max = xmin, xmax
         while x_max - x_min > 10:
@@ -370,18 +594,26 @@ class SpeciesNetSAMHQWrapper:
         return (x_min + x_max) / 2
 
     def _get_bounding_box(self, mask):
-        center = self._center_of_mass(mask)
+        # Compute marginal sums once (two O(N) passes) instead of materialising
+        # all nonzero coordinates with np.where (allocates ~19 MB for a 30% mask).
+        # Also caches mask_sum in the bisection closure, avoiding repeated full-image
+        # scans (was 8+ np.sum(mask) calls, each ~5-10 ms on a 12 MP mask).
+        cols_sum = mask.sum(axis=0, dtype=np.int64)   # (W,)
+        rows_sum = mask.sum(axis=1, dtype=np.int64)   # (H,)
+        mask_sum = int(cols_sum.sum())
+        if mask_sum == 0:
+            h, w = mask.shape[:2]
+            return 0, w, 0, h
+        cx = int(np.dot(cols_sum.astype(np.float64), np.arange(mask.shape[1], dtype=np.float64)) / mask_sum)
+        cy = int(np.dot(rows_sum.astype(np.float64), np.arange(mask.shape[0], dtype=np.float64)) / mask_sum)
+        center = (cx, cy)
 
         def fraction_inside(center_of_mass, S):
-            x_min = int(center_of_mass[0] - S / 2)
-            x_max = int(center_of_mass[0] + S / 2)
-            y_min = int(center_of_mass[1] - S / 2)
-            y_max = int(center_of_mass[1] + S / 2)
-            x_min2 = max(0, x_min)
-            x_max2 = min(mask.shape[1], x_max)
-            y_min2 = max(0, y_min)
-            y_max2 = min(mask.shape[0], y_max)
-            return np.sum(mask[y_min2:y_max2, x_min2:x_max2]) / np.sum(mask)
+            x_min2 = max(0, int(center_of_mass[0] - S / 2))
+            x_max2 = min(mask.shape[1], int(center_of_mass[0] + S / 2))
+            y_min2 = max(0, int(center_of_mass[1] - S / 2))
+            y_max2 = min(mask.shape[0], int(center_of_mass[1] + S / 2))
+            return int(mask[y_min2:y_max2, x_min2:x_max2].sum()) / mask_sum  # cached
 
         S = self._fsolve(lambda S: fraction_inside(center, S) - 0.8, 10, 3000)
         S = int(S * 1 / 0.5)
