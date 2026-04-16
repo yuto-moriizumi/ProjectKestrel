@@ -10,7 +10,13 @@ import cv2
 import numpy as np
 from PIL import Image
 
-from ..config import MDV6_ONNX_PATH, SAM_DEC_ONNX_PATH, SAM_ENC_ONNX_PATH, SPECIESNET_MODEL_DIR
+from ..config import (
+    DEFAULT_DETECTOR_NAME,
+    DETECTOR_ONNX_PATHS,
+    SAM_DEC_ONNX_PATH,
+    SAM_ENC_ONNX_PATH,
+    SPECIESNET_MODEL_DIR,
+)
 from .speciesnet_taxonomy import (
     bird_vs_wildlife_classifier_scores,
     is_ambiguous_generic_taxonomy,
@@ -20,6 +26,9 @@ from .speciesnet_taxonomy import (
 _DEFAULT_MAX_BIRD_CROPS = 5
 _MIN_MAX_BIRD_CROPS = 1
 _MAX_MAX_BIRD_CROPS = 20
+_HEAVY_OVERLAP_IOU = 0.75
+_SUPPORTED_DETECTOR_NAMES = tuple(DETECTOR_ONNX_PATHS.keys())
+_YOLOV9_DETECTOR_NAMES = {"mdv6-mit-yolov9-c", "mdv6-mit-yolov9-e"}
 
 
 def _coerce_max_bird_crops(value) -> int:
@@ -30,14 +39,73 @@ def _coerce_max_bird_crops(value) -> int:
     return max(_MIN_MAX_BIRD_CROPS, min(_MAX_MAX_BIRD_CROPS, n))
 
 
-def filter_overlapping_detections(masks, pred_boxes, pred_class, pred_score, iou_threshold=0.5):
-    """Remove lower-confidence detections that overlap significantly with higher-confidence ones."""
+def _coerce_detector_name(value: str | None) -> str:
+    if value is None:
+        return DEFAULT_DETECTOR_NAME
+    norm = str(value).strip().lower()
+    if norm in DETECTOR_ONNX_PATHS:
+        return norm
+    supported = ", ".join(_SUPPORTED_DETECTOR_NAMES)
+    raise ValueError(f"Unsupported detector name '{value}'. Supported values: {supported}")
+
+
+def _resolve_detector_onnx_path(detector_name: str) -> Path:
+    name = _coerce_detector_name(detector_name)
+    path = DETECTOR_ONNX_PATHS[name]
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Detector ONNX not found for '{name}': {path}\n"
+            f"Place the selected detector .onnx and .onnx.data files under: {path.parent}"
+        )
+    return path
+
+
+def _box_iou(box_a, box_b) -> float:
+    """Compute IoU between pipeline-format boxes ``((x1, y1), (x2, y2))``."""
+    (ax1, ay1), (ax2, ay2) = box_a
+    (bx1, by1), (bx2, by2) = box_b
+
+    inter_w = max(0.0, min(float(ax2), float(bx2)) - max(float(ax1), float(bx1)))
+    inter_h = max(0.0, min(float(ay2), float(by2)) - max(float(ay1), float(by1)))
+    inter = inter_w * inter_h
+    if inter <= 0.0:
+        return 0.0
+
+    area_a = max(0.0, float(ax2) - float(ax1)) * max(0.0, float(ay2) - float(ay1))
+    area_b = max(0.0, float(bx2) - float(bx1)) * max(0.0, float(by2) - float(by1))
+    union = area_a + area_b - inter
+    if union <= 0.0:
+        return 0.0
+    return float(inter / union)
+
+
+def filter_overlapping_detections(
+    masks,
+    pred_boxes,
+    pred_class,
+    pred_score,
+    heavy_overlap_iou: float = _HEAVY_OVERLAP_IOU,
+    overlap_rank_scores: Optional[list[float]] = None,
+):
+    """Remove lower-confidence detections when boxes/masks heavily overlap.
+
+    ``overlap_rank_scores`` controls suppression priority only. Returned
+    ``pred_score`` values are preserved for downstream reporting.
+    """
     if masks is None or len(masks) == 0:
         return masks, pred_boxes, pred_class, pred_score
 
     n = len(pred_score)
     keep = [True] * n
-    sorted_indices = sorted(range(n), key=lambda i: pred_score[i], reverse=True)
+    rank_scores = overlap_rank_scores if overlap_rank_scores is not None else pred_score
+    if len(rank_scores) != n:
+        raise ValueError("overlap_rank_scores length must match pred_score length")
+
+    sorted_indices = sorted(
+        range(n),
+        key=lambda i: (float(rank_scores[i]), float(pred_score[i])),
+        reverse=True,
+    )
 
     for i_idx, i in enumerate(sorted_indices):
         if not keep[i]:
@@ -47,7 +115,9 @@ def filter_overlapping_detections(masks, pred_boxes, pred_class, pred_score, iou
                 continue
             intersection = np.logical_and(masks[i], masks[j]).sum()
             union = np.logical_or(masks[i], masks[j]).sum()
-            if union > 0 and intersection / union > iou_threshold:
+            mask_iou = float(intersection / union) if union > 0 else 0.0
+            box_iou = _box_iou(pred_boxes[i], pred_boxes[j])
+            if max(mask_iou, box_iou) >= heavy_overlap_iou:
                 keep[j] = False
 
     indices = [i for i in range(n) if keep[i]]
@@ -249,6 +319,395 @@ class OnnxMDv6Detector:
         return {"filepath": filepath, "detections": detections}
 
 
+class OnnxMDv5Detector:
+    """
+    MegaDetector v5a (YOLO-style) via ONNX Runtime.
+
+    Interface matches OnnxMDv6Detector:
+        preprocess(img_pil)          → (img_tensor, orig_w, orig_h)
+        predict(filepath, det_input) → {"filepath": str,
+                                         "detections": [{"label": str,
+                                                          "conf": float,
+                                                          "bbox": [xmin,ymin,w,h]}]}
+    """
+
+    _LABEL_MAP: dict[int, str] = {0: "animal", 1: "person", 2: "vehicle"}
+    _INPUT_SIZE = 1280
+    _MIN_CONF = 0.01
+    _NMS_IOU = 0.5
+    _PRE_NMS_LIMIT = 4000
+
+    def __init__(self, onnx_path: Path, use_gpu: bool = False) -> None:
+        import onnxruntime as ort
+
+        onnx_path = Path(onnx_path)
+        if not onnx_path.is_file():
+            raise FileNotFoundError(
+                f"MDv5a weights not found: {onnx_path}\n"
+                "Place mdv5a.onnx (and mdv5a.onnx.data) under models/speciesnet/."
+            )
+        providers = (
+            ["DmlExecutionProvider", "CPUExecutionProvider"]
+            if use_gpu
+            else ["CPUExecutionProvider"]
+        )
+        self._session = ort.InferenceSession(str(onnx_path), providers=providers)
+        _provs = self._session.get_providers()
+        self.device = "ONNX/GPU" if "DmlExecutionProvider" in _provs else "ONNX/CPU"
+        print(f"[OnnxMDv5Detector] Loaded {onnx_path.name}  providers={_provs}")
+
+    def preprocess(self, img_pil: "Image.Image") -> tuple:
+        """Resize/squash image to 1280x1280 and normalize to [0,1]."""
+        orig_w, orig_h = img_pil.size
+        img_1280 = np.array(
+            img_pil.resize((self._INPUT_SIZE, self._INPUT_SIZE), Image.BILINEAR),
+            dtype=np.float32,
+        ) / 255.0
+        img_tensor = img_1280.transpose(2, 0, 1)[np.newaxis]
+        return (img_tensor, orig_w, orig_h)
+
+    @staticmethod
+    def _nms_xyxy(boxes: np.ndarray, scores: np.ndarray, iou_threshold: float) -> np.ndarray:
+        if boxes.size == 0:
+            return np.empty((0,), dtype=np.int64)
+
+        x1 = boxes[:, 0]
+        y1 = boxes[:, 1]
+        x2 = boxes[:, 2]
+        y2 = boxes[:, 3]
+        areas = np.maximum(0.0, x2 - x1) * np.maximum(0.0, y2 - y1)
+        order = np.argsort(scores)[::-1]
+
+        keep: list[int] = []
+        while order.size > 0:
+            i = int(order[0])
+            keep.append(i)
+            if order.size == 1:
+                break
+
+            rest = order[1:]
+            xx1 = np.maximum(x1[i], x1[rest])
+            yy1 = np.maximum(y1[i], y1[rest])
+            xx2 = np.minimum(x2[i], x2[rest])
+            yy2 = np.minimum(y2[i], y2[rest])
+
+            inter = np.maximum(0.0, xx2 - xx1) * np.maximum(0.0, yy2 - yy1)
+            union = areas[i] + areas[rest] - inter
+            iou = np.where(union > 0.0, inter / union, 0.0)
+            order = rest[iou <= iou_threshold]
+
+        return np.array(keep, dtype=np.int64)
+
+    def predict(self, filepath: str, det_input: tuple) -> dict:
+        """ONNX inference + decode YOLO-style predictions to normalized xywh."""
+        img_tensor, _orig_w, _orig_h = det_input
+        raw = self._session.run(None, {"images": img_tensor})
+        if not raw:
+            return {"filepath": filepath, "detections": []}
+
+        preds = raw[0]
+        if preds.ndim != 3 or preds.shape[2] < 8:
+            raise RuntimeError(f"Unexpected mdv5a output shape: {preds.shape}")
+
+        pred = preds[0]
+        obj = pred[:, 4]
+        cls_scores = pred[:, 5:8]
+        cls_idx = np.argmax(cls_scores, axis=1).astype(np.int64)
+        best_cls = cls_scores[np.arange(cls_scores.shape[0]), cls_idx]
+        conf = obj * best_cls
+
+        keep = conf >= self._MIN_CONF
+        if not np.any(keep):
+            return {"filepath": filepath, "detections": []}
+
+        pred = pred[keep]
+        cls_idx = cls_idx[keep]
+        conf = conf[keep]
+
+        max_coord = float(np.max(pred[:, :4]))
+        coord_scale = float(self._INPUT_SIZE if max_coord > 2.0 else 1.0)
+        cx = pred[:, 0] / coord_scale
+        cy = pred[:, 1] / coord_scale
+        bw = pred[:, 2] / coord_scale
+        bh = pred[:, 3] / coord_scale
+
+        x1 = np.clip(cx - (bw / 2.0), 0.0, 1.0)
+        y1 = np.clip(cy - (bh / 2.0), 0.0, 1.0)
+        x2 = np.clip(cx + (bw / 2.0), 0.0, 1.0)
+        y2 = np.clip(cy + (bh / 2.0), 0.0, 1.0)
+        boxes = np.stack([x1, y1, x2, y2], axis=1).astype(np.float32)
+
+        selected: list[int] = []
+        for class_id in np.unique(cls_idx):
+            class_indices = np.where(cls_idx == class_id)[0]
+            class_scores = conf[class_indices]
+            if class_scores.size == 0:
+                continue
+
+            if class_scores.size > self._PRE_NMS_LIMIT:
+                top_local = np.argsort(class_scores)[-self._PRE_NMS_LIMIT:]
+                class_indices = class_indices[top_local]
+                class_scores = conf[class_indices]
+
+            keep_local = self._nms_xyxy(
+                boxes[class_indices],
+                class_scores.astype(np.float32),
+                iou_threshold=self._NMS_IOU,
+            )
+            selected.extend(class_indices[keep_local].tolist())
+
+        if not selected:
+            return {"filepath": filepath, "detections": []}
+
+        selected_arr = np.array(selected, dtype=np.int64)
+        order = np.argsort(conf[selected_arr])[::-1]
+        selected_arr = selected_arr[order]
+
+        detections: list[dict] = []
+        for i in selected_arr:
+            cls_id = int(cls_idx[i])
+            label = self._LABEL_MAP.get(cls_id, "unknown")
+            if label == "unknown":
+                continue
+
+            bx1, by1, bx2, by2 = [float(v) for v in boxes[i]]
+            detections.append(
+                {
+                    "label": label,
+                    "conf": float(conf[i]),
+                    "bbox": [
+                        bx1,
+                        by1,
+                        max(0.0, bx2 - bx1),
+                        max(0.0, by2 - by1),
+                    ],
+                }
+            )
+
+        return {"filepath": filepath, "detections": detections}
+
+
+class OnnxMDv6MitYoloV9Detector:
+    """
+    MegaDetector v6 MIT YOLOv9 variants via ONNX Runtime.
+
+    The exported ONNX graph expects two inputs:
+        images    : [1, 3, 640, 640] float32 in [0,1]
+        rev_tensor: [1, 5] = [scale, pad_left, pad_top, pad_left, pad_top]
+
+    It outputs raw class logits and decoded boxes. The graph already applies
+    reverse letterbox transform using ``rev_tensor``, so output boxes are in
+    the original image coordinate space.
+    """
+
+    _LABEL_MAP: dict[int, str] = {0: "animal", 1: "person", 2: "vehicle"}
+    _INPUT_SIZE = 640
+    _MIN_CONF = 0.01
+    _NMS_IOU = 0.5
+    _MAX_BBOX_PER_CLASS = 300
+    _PRE_NMS_LIMIT = 4000
+    _PAD_COLOR = (114, 114, 114)
+
+    def __init__(self, onnx_path: Path, use_gpu: bool = False) -> None:
+        import onnxruntime as ort
+
+        onnx_path = Path(onnx_path)
+        if not onnx_path.is_file():
+            raise FileNotFoundError(
+                f"MDv6 MIT YOLOv9 weights not found: {onnx_path}\n"
+                "Place mdv6-mit-yolov9-*.onnx (and .onnx.data) under models/speciesnet/."
+            )
+
+        providers = (
+            ["DmlExecutionProvider", "CPUExecutionProvider"]
+            if use_gpu
+            else ["CPUExecutionProvider"]
+        )
+        self._session = ort.InferenceSession(str(onnx_path), providers=providers)
+
+        inputs = self._session.get_inputs()
+        outputs = self._session.get_outputs()
+        self._images_input_name = self._pick_io_name(inputs, preferred=("images", "image", "input"))
+        self._rev_input_name = self._pick_io_name(
+            inputs,
+            preferred=("rev_tensor", "rev"),
+            exclude={self._images_input_name},
+        )
+        self._logits_output_name = self._pick_io_name(
+            outputs,
+            preferred=("raw_class_logits", "class", "logits"),
+        )
+        self._boxes_output_name = self._pick_io_name(
+            outputs,
+            preferred=("raw_boxes", "boxes", "bbox"),
+            exclude={self._logits_output_name},
+        )
+
+        _provs = self._session.get_providers()
+        self.device = "ONNX/GPU" if "DmlExecutionProvider" in _provs else "ONNX/CPU"
+        print(
+            f"[OnnxMDv6MitYoloV9Detector] Loaded {onnx_path.name}  providers={_provs}"
+            f"  inputs=({self._images_input_name}, {self._rev_input_name})"
+            f"  outputs=({self._logits_output_name}, {self._boxes_output_name})"
+        )
+
+    @staticmethod
+    def _pick_io_name(
+        io_nodes,
+        preferred: tuple[str, ...],
+        exclude: Optional[set[str]] = None,
+    ) -> str:
+        excluded = exclude or set()
+        names = [node.name for node in io_nodes if node.name not in excluded]
+        if not names:
+            raise RuntimeError("Failed to resolve ONNX input/output names.")
+
+        lowered = [name.lower() for name in names]
+        for token in preferred:
+            token = token.lower()
+            for idx, lname in enumerate(lowered):
+                if token in lname:
+                    return names[idx]
+        return names[0]
+
+    @staticmethod
+    def _nms_xyxy(boxes: np.ndarray, scores: np.ndarray, iou_threshold: float) -> np.ndarray:
+        if boxes.size == 0:
+            return np.empty((0,), dtype=np.int64)
+
+        x1 = boxes[:, 0]
+        y1 = boxes[:, 1]
+        x2 = boxes[:, 2]
+        y2 = boxes[:, 3]
+        areas = np.maximum(0.0, x2 - x1) * np.maximum(0.0, y2 - y1)
+        order = np.argsort(scores)[::-1]
+
+        keep: list[int] = []
+        while order.size > 0:
+            i = int(order[0])
+            keep.append(i)
+            if order.size == 1:
+                break
+
+            rest = order[1:]
+            xx1 = np.maximum(x1[i], x1[rest])
+            yy1 = np.maximum(y1[i], y1[rest])
+            xx2 = np.minimum(x2[i], x2[rest])
+            yy2 = np.minimum(y2[i], y2[rest])
+
+            inter = np.maximum(0.0, xx2 - xx1) * np.maximum(0.0, yy2 - yy1)
+            union = areas[i] + areas[rest] - inter
+            iou = np.where(union > 0.0, inter / union, 0.0)
+            order = rest[iou <= iou_threshold]
+
+        return np.array(keep, dtype=np.int64)
+
+    @staticmethod
+    def _sigmoid(x: np.ndarray) -> np.ndarray:
+        x = np.clip(x, -50.0, 50.0)
+        return 1.0 / (1.0 + np.exp(-x))
+
+    def preprocess(self, img_pil: "Image.Image") -> tuple:
+        """Pad-resize image to 640x640 and build rev_tensor expected by the ONNX graph."""
+        orig_w, orig_h = img_pil.size
+
+        scale = min(self._INPUT_SIZE / float(orig_w), self._INPUT_SIZE / float(orig_h))
+        new_w = max(1, int(orig_w * scale))
+        new_h = max(1, int(orig_h * scale))
+
+        resized = img_pil.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        pad_left = (self._INPUT_SIZE - new_w) // 2
+        pad_top = (self._INPUT_SIZE - new_h) // 2
+
+        canvas = Image.new("RGB", (self._INPUT_SIZE, self._INPUT_SIZE), self._PAD_COLOR)
+        canvas.paste(resized, (pad_left, pad_top))
+
+        img_np = np.asarray(canvas, dtype=np.float32) / 255.0
+        img_tensor = img_np.transpose(2, 0, 1)[np.newaxis]
+        rev_tensor = np.array(
+            [[scale, float(pad_left), float(pad_top), float(pad_left), float(pad_top)]],
+            dtype=np.float32,
+        )
+        return (img_tensor, rev_tensor, orig_w, orig_h)
+
+    def predict(self, filepath: str, det_input: tuple) -> dict:
+        """ONNX inference + sigmoid + class-wise NMS, returned as normalized xywh detections."""
+        img_tensor, rev_tensor, orig_w, orig_h = det_input
+        raw = self._session.run(
+            [self._logits_output_name, self._boxes_output_name],
+            {
+                self._images_input_name: img_tensor,
+                self._rev_input_name: rev_tensor,
+            },
+        )
+        if not raw:
+            return {"filepath": filepath, "detections": []}
+
+        class_logits, boxes_b = raw
+        if class_logits.ndim != 3 or boxes_b.ndim != 3:
+            raise RuntimeError(
+                f"Unexpected mdv6-mit-yolov9 output shapes: logits={class_logits.shape}, boxes={boxes_b.shape}"
+            )
+
+        class_probs = self._sigmoid(class_logits[0])
+        boxes = boxes_b[0]
+        if boxes.shape[1] != 4 or class_probs.shape[0] != boxes.shape[0]:
+            raise RuntimeError(
+                f"Unexpected mdv6-mit-yolov9 tensor dimensions: probs={class_probs.shape}, boxes={boxes.shape}"
+            )
+
+        detections: list[dict] = []
+        n_classes = min(class_probs.shape[1], len(self._LABEL_MAP))
+        for class_id in range(n_classes):
+            label = self._LABEL_MAP.get(class_id)
+            if label is None:
+                continue
+
+            scores = class_probs[:, class_id]
+            class_indices = np.where(scores >= self._MIN_CONF)[0]
+            if class_indices.size == 0:
+                continue
+
+            if class_indices.size > self._PRE_NMS_LIMIT:
+                top_local = np.argsort(scores[class_indices])[-self._PRE_NMS_LIMIT:]
+                class_indices = class_indices[top_local]
+
+            keep_local = self._nms_xyxy(
+                boxes[class_indices],
+                scores[class_indices].astype(np.float32),
+                iou_threshold=self._NMS_IOU,
+            )
+            kept_indices = class_indices[keep_local]
+            if kept_indices.size > self._MAX_BBOX_PER_CLASS:
+                top_by_score = np.argsort(scores[kept_indices])[::-1][: self._MAX_BBOX_PER_CLASS]
+                kept_indices = kept_indices[top_by_score]
+
+            for i in kept_indices:
+                x1, y1, x2, y2 = [float(v) for v in boxes[i]]
+                x1 = float(np.clip(x1, 0.0, float(orig_w)))
+                y1 = float(np.clip(y1, 0.0, float(orig_h)))
+                x2 = float(np.clip(x2, 0.0, float(orig_w)))
+                y2 = float(np.clip(y2, 0.0, float(orig_h)))
+                if x2 <= x1 or y2 <= y1:
+                    continue
+
+                detections.append(
+                    {
+                        "label": label,
+                        "conf": float(scores[i]),
+                        "bbox": [
+                            x1 / float(orig_w),
+                            y1 / float(orig_h),
+                            (x2 - x1) / float(orig_w),
+                            (y2 - y1) / float(orig_h),
+                        ],
+                    }
+                )
+
+        detections.sort(key=lambda d: float(d.get("conf", 0.0)), reverse=True)
+        return {"filepath": filepath, "detections": detections}
+
+
 class OnnxSamPredictor:
     """
     SAM-HQ ViT-Tiny via ONNX Runtime (split encoder + decoder).
@@ -362,11 +821,17 @@ class OnnxSamPredictor:
 class SpeciesNetSAMHQWrapper:
     """Detector/classifier/ensemble from SpeciesNet; masks from SAM-HQ (ViT-Tiny ONNX) box prompts."""
 
-    def __init__(self, max_bird_crops: int = _DEFAULT_MAX_BIRD_CROPS, use_gpu: bool = True):
+    def __init__(
+        self,
+        max_bird_crops: int = _DEFAULT_MAX_BIRD_CROPS,
+        use_gpu: bool = True,
+        detector_name: str = DEFAULT_DETECTOR_NAME,
+    ):
         self.max_bird_crops = _coerce_max_bird_crops(max_bird_crops)
         self.use_gpu = bool(use_gpu)
+        self.detector_name = _coerce_detector_name(detector_name)
         self.predictor: Optional[OnnxSamPredictor] = None
-        self.detector: Optional[OnnxMDv6Detector] = None
+        self.detector: Optional[Any] = None
         self.classifier: Optional[OnnxClassifier] = None
         self.ensemble = None
         self.model_name: Optional[str] = None
@@ -376,10 +841,17 @@ class SpeciesNetSAMHQWrapper:
 
         if self.detector is None or self.classifier is None:
             self.model_name = _speciesnet_bundle_model_name()
-            self.detector = OnnxMDv6Detector(MDV6_ONNX_PATH, use_gpu=self.use_gpu)
+            detector_path = _resolve_detector_onnx_path(self.detector_name)
+            if self.detector_name == "mdv5a":
+                self.detector = OnnxMDv5Detector(detector_path, use_gpu=self.use_gpu)
+            elif self.detector_name in _YOLOV9_DETECTOR_NAMES:
+                self.detector = OnnxMDv6MitYoloV9Detector(detector_path, use_gpu=self.use_gpu)
+            else:
+                self.detector = OnnxMDv6Detector(detector_path, use_gpu=self.use_gpu)
             onnx_path   = SPECIESNET_MODEL_DIR / "speciesNet_v4.0.1a.onnx"
             labels_path = SPECIESNET_MODEL_DIR / "always_crop_99710272_22x8_v12_epoch_00148.labels.20251208.txt"
             self.classifier = OnnxClassifier(onnx_path, labels_path, use_gpu=self.use_gpu)
+            print(f"[SpeciesNetSAMHQ] Detector model    : {self.detector_name} ({detector_path.name})")
             print(f"[SpeciesNetSAMHQ] Detector          : {self.detector.device}")
             print(f"[SpeciesNetSAMHQ] Classifier        : ONNX  providers={self.classifier.providers_used}")
         if self.ensemble is None:
@@ -552,6 +1024,7 @@ class SpeciesNetSAMHQWrapper:
                 "pred_boxes": _pixel_box_to_pipeline_box(x1, y1, x2, y2),
                 "pred_class": pred_label if route == "wildlife" else "bird",
                 "pred_score": pred_score,
+                "detector_confidence": conf,
             }
             if route == "bird":
                 bird_rows.append(row)
@@ -569,10 +1042,16 @@ class SpeciesNetSAMHQWrapper:
         pred_boxes = [r["pred_boxes"] for r in combined]
         pred_class = [r["pred_class"] for r in combined]
         pred_score = [r["pred_score"] for r in combined]
+        overlap_rank_scores = [r["detector_confidence"] for r in combined]
 
         masks_arr = np.stack(masks_list, axis=0)
         return filter_overlapping_detections(
-            masks_arr, pred_boxes, pred_class, pred_score, iou_threshold=0.5
+            masks_arr,
+            pred_boxes,
+            pred_class,
+            pred_score,
+            heavy_overlap_iou=_HEAVY_OVERLAP_IOU,
+            overlap_rank_scores=overlap_rank_scores,
         )
 
     # --- Geometry (aligned with MaskRCNNWrapper) for square crops and species bbox ---

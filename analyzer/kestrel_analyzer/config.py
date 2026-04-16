@@ -3,6 +3,10 @@ from pathlib import Path
 VERSION = "1.7.0"
 
 ANALYZER_DIR = Path(__file__).resolve().parents[1]
+REPO_ROOT = ANALYZER_DIR.parent
+DOCUMENTATION_DIR = REPO_ROOT / "documentation"
+MODEL_CANDIDATE_DIR = DOCUMENTATION_DIR / "model_candidates"
+MODEL_CANDIDATE_WEIGHTS_DIR = MODEL_CANDIDATE_DIR / "weights"
 MODELS_DIR = ANALYZER_DIR / "models"
 
 SPECIESCLASSIFIER_PATH = MODELS_DIR / "model.onnx"
@@ -17,8 +21,19 @@ SAM_HQ_MODEL_KEY = "vit_tiny"  # segment_anything_hq.sam_model_registry
 # SpeciesNet: bundled Kaggle-style folder (info.json + .pt + taxonomy). Passed as local model_name to speciesnet.ModelInfo.
 SPECIESNET_MODEL_DIR = MODELS_DIR / "speciesnet"
 
-# MegaDetector v6: ONNX weights (also requires .onnx.data sidecar file).
-MDV6_ONNX_PATH = SPECIESNET_MODEL_DIR / "mdv6-apa-rtdetr-c.onnx"
+# Runtime-selectable MegaDetector ONNX variants (all require .onnx.data sidecar files).
+# mdv6-c/e stay under models/speciesnet; experimental candidates are archived under documentation/model_candidates/weights.
+DEFAULT_DETECTOR_NAME = "mdv6-e"
+DETECTOR_ONNX_PATHS = {
+    "mdv6-c": SPECIESNET_MODEL_DIR / "mdv6-apa-rtdetr-c.onnx",
+    "mdv6-e": SPECIESNET_MODEL_DIR / "mdv6-apa-rtdetr-e.onnx",
+    "mdv5a": MODEL_CANDIDATE_WEIGHTS_DIR / "mdv5a.onnx",
+    "mdv6-mit-yolov9-c": MODEL_CANDIDATE_WEIGHTS_DIR / "mdv6-mit-yolov9-c.onnx",
+    "mdv6-mit-yolov9-e": MODEL_CANDIDATE_WEIGHTS_DIR / "mdv6-mit-yolov9-e.onnx",
+}
+
+# Backward-compatible alias used by existing call sites.
+MDV6_ONNX_PATH = DETECTOR_ONNX_PATHS[DEFAULT_DETECTOR_NAME]
 
 # SAM-HQ ViT-Tiny: split encoder + decoder ONNX files.
 SAM_ENC_ONNX_PATH = SPECIESNET_MODEL_DIR / "sam_hq_vit_tiny_encoder.onnx"

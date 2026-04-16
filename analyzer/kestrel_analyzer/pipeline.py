@@ -12,6 +12,7 @@ import numpy as np
 import pandas as pd
 
 from .config import (
+    DEFAULT_DETECTOR_NAME,
     JPEG_EXTENSIONS,
     RAW_EXTENSIONS,
     SPECIESCLASSIFIER_LABELS,
@@ -56,8 +57,9 @@ from .ml.quality import QualityClassifier
 
 
 class AnalysisPipeline:
-    def __init__(self, use_gpu: bool):
+    def __init__(self, use_gpu: bool, detector_name: str = DEFAULT_DETECTOR_NAME):
         self.use_gpu = use_gpu
+        self.detector_name = str(detector_name)
         self.sn_sam: Optional[SpeciesNetSAMHQWrapper] = None
         self.species_clf: Optional[BirdSpeciesClassifier] = None
         self.quality_clf: Optional[QualityClassifier] = None
@@ -240,15 +242,19 @@ class AnalysisPipeline:
             self.sn_sam
             and int(getattr(self.sn_sam, "max_bird_crops", 5)) == max_bird_crops
             and getattr(self.sn_sam, "use_gpu", None) == self.use_gpu
+            and str(getattr(self.sn_sam, "detector_name", DEFAULT_DETECTOR_NAME)) == self.detector_name
         )
         if mask_ready_for_cap and self.species_clf and self.quality_clf:
             return
         if status_cb:
-            status_cb("Loading models... This may take a while on first run.")
+            status_cb(
+                f"Loading models (detector={self.detector_name})... This may take a while on first run."
+            )
         if not mask_ready_for_cap:
             self.sn_sam = SpeciesNetSAMHQWrapper(
                 max_bird_crops=max_bird_crops,
                 use_gpu=self.use_gpu,
+                detector_name=self.detector_name,
             )
         if not self.species_clf:
             self.species_clf = BirdSpeciesClassifier(
@@ -366,6 +372,8 @@ class AnalysisPipeline:
                     "analyzer": analyzer_name,
                     "folder": folder,
                     "file_count": len(files),
+                    "detector_name": self.detector_name,
+                    "detection_threshold": float(detection_threshold),
                 },
             )
 

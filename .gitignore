@@ -43,3 +43,5 @@ tmp*
 documentation/
 .claude*
 EXPCOMP_tests/
+_kestrel*
+.tmp*
