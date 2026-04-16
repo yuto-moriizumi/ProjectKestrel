@@ -903,10 +903,23 @@ class SpeciesNetSAMHQWrapper:
                 f"SAM-HQ decoder ONNX not found at: {SAM_DEC_ONNX_PATH}\n"
                 "Place sam_hq_vit_tiny_decoder.onnx under models/speciesnet/."
             )
-        # SAM-HQ always runs on CPU: DirectML does not correctly implement all
-        # SAM-HQ ops on Windows (produces all-True masks → full-image crops).
-        # The encode-once pattern means this is ~200–500 ms per image, which is fine.
-        self.predictor = OnnxSamPredictor(SAM_ENC_ONNX_PATH, SAM_DEC_ONNX_PATH, use_gpu=False)
+        # Prefer SAM-HQ on DirectML when GPU is enabled; fallback to CPU only if
+        # DML session initialization fails in the local runtime environment.
+        try:
+            self.predictor = OnnxSamPredictor(
+                SAM_ENC_ONNX_PATH,
+                SAM_DEC_ONNX_PATH,
+                use_gpu=self.use_gpu,
+            )
+        except Exception as e:
+            if not self.use_gpu:
+                raise
+            print(f"[SpeciesNetSAMHQ] SAM-HQ DML init failed, falling back to CPU: {e}")
+            self.predictor = OnnxSamPredictor(
+                SAM_ENC_ONNX_PATH,
+                SAM_DEC_ONNX_PATH,
+                use_gpu=False,
+            )
         print(f"[SpeciesNetSAMHQ] SAM-HQ            : {self.predictor.device}")
 
     def _run_ensemble_for_item(
