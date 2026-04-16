@@ -27,6 +27,8 @@ _DEFAULT_MAX_BIRD_CROPS = 5
 _MIN_MAX_BIRD_CROPS = 1
 _MAX_MAX_BIRD_CROPS = 20
 _HEAVY_OVERLAP_IOU = 0.75
+_HEAVY_OVERLAP_CONTAINMENT = 0.90
+_MIN_CONF_FOR_CLASSIFIER_SAM = 0.50
 _SUPPORTED_DETECTOR_NAMES = tuple(DETECTOR_ONNX_PATHS.keys())
 _YOLOV9_DETECTOR_NAMES = {"mdv6-mit-yolov9-c", "mdv6-mit-yolov9-e"}
 
@@ -79,12 +81,32 @@ def _box_iou(box_a, box_b) -> float:
     return float(inter / union)
 
 
+def _box_intersection_over_min_area(box_a, box_b) -> float:
+    """Compute containment overlap: intersection / min(area_a, area_b)."""
+    (ax1, ay1), (ax2, ay2) = box_a
+    (bx1, by1), (bx2, by2) = box_b
+
+    inter_w = max(0.0, min(float(ax2), float(bx2)) - max(float(ax1), float(bx1)))
+    inter_h = max(0.0, min(float(ay2), float(by2)) - max(float(ay1), float(by1)))
+    inter = inter_w * inter_h
+    if inter <= 0.0:
+        return 0.0
+
+    area_a = max(0.0, float(ax2) - float(ax1)) * max(0.0, float(ay2) - float(ay1))
+    area_b = max(0.0, float(bx2) - float(bx1)) * max(0.0, float(by2) - float(by1))
+    min_area = min(area_a, area_b)
+    if min_area <= 0.0:
+        return 0.0
+    return float(inter / min_area)
+
+
 def filter_overlapping_detections(
     masks,
     pred_boxes,
     pred_class,
     pred_score,
     heavy_overlap_iou: float = _HEAVY_OVERLAP_IOU,
+    heavy_overlap_containment: float = _HEAVY_OVERLAP_CONTAINMENT,
     overlap_rank_scores: Optional[list[float]] = None,
 ):
     """Remove lower-confidence detections when boxes/masks heavily overlap.
@@ -115,9 +137,15 @@ def filter_overlapping_detections(
                 continue
             intersection = np.logical_and(masks[i], masks[j]).sum()
             union = np.logical_or(masks[i], masks[j]).sum()
+            min_mask_area = min(float(masks[i].sum()), float(masks[j].sum()))
             mask_iou = float(intersection / union) if union > 0 else 0.0
+            mask_containment = float(intersection / min_mask_area) if min_mask_area > 0.0 else 0.0
             box_iou = _box_iou(pred_boxes[i], pred_boxes[j])
-            if max(mask_iou, box_iou) >= heavy_overlap_iou:
+            box_containment = _box_intersection_over_min_area(pred_boxes[i], pred_boxes[j])
+            if (
+                max(mask_iou, box_iou) >= heavy_overlap_iou
+                or max(mask_containment, box_containment) >= heavy_overlap_containment
+            ):
                 keep[j] = False
 
     indices = [i for i in range(n) if keep[i]]
@@ -934,19 +962,30 @@ class SpeciesNetSAMHQWrapper:
         det_result = self.detector.predict(fp, detector_input)
         detections = det_result.get("detections", []) or []
 
+        detector_threshold = float(threshold)
+        classifier_sam_threshold = max(detector_threshold, _MIN_CONF_FOR_CLASSIFIER_SAM)
+
+        animal_dets_above_threshold: list[dict[str, Any]] = []
         animal_dets: list[dict[str, Any]] = []
         for det in detections:
             label = str(det.get("label", ""))
             conf = float(det.get("conf", 0.0))
             if label != "animal":
                 continue
-            if conf < float(threshold):
+            if conf < detector_threshold:
+                continue
+            animal_dets_above_threshold.append(det)
+            if conf < classifier_sam_threshold:
                 continue
             animal_dets.append(det)
 
+        animal_dets_above_threshold.sort(key=lambda d: float(d.get("conf", 0.0)), reverse=True)
         animal_dets.sort(key=lambda d: float(d.get("conf", 0.0)), reverse=True)
-        print(f"[SpeciesNet] {os.path.basename(fp)}  animals above threshold: {len(animal_dets)}"
-              f"  (threshold={threshold:.2f}, total proposals={len(detections)})")
+        print(
+            f"[SpeciesNet] {os.path.basename(fp)}  animals above threshold: {len(animal_dets_above_threshold)}"
+            f"  (threshold={detector_threshold:.2f}, postprocess_threshold={classifier_sam_threshold:.2f},"
+            f" postprocess_candidates={len(animal_dets)}, total proposals={len(detections)})"
+        )
 
         bird_rows: list[dict[str, Any]] = []
         wildlife_rows: list[dict[str, Any]] = []
@@ -1051,6 +1090,7 @@ class SpeciesNetSAMHQWrapper:
             pred_class,
             pred_score,
             heavy_overlap_iou=_HEAVY_OVERLAP_IOU,
+            heavy_overlap_containment=_HEAVY_OVERLAP_CONTAINMENT,
             overlap_rank_scores=overlap_rank_scores,
         )
 
