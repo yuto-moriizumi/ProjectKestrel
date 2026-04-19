@@ -22,6 +22,8 @@ TODO:
 * Add ability to change which XML fields are written (ex. exclude ratings, labels).
 * Upgrade terms of service version retrieval to prompt updated terms warnings + Clarify file and folder names may be sent with crash reports that are automatic and non-opt-out.
 * Upgrade Kestrel Telemetry/Required Usage Data Collection
+* Improve exposure compensation algorithm to fix dark birds against bright backlit sky edge case.
+
 
 TESTING:
 * Continue to test pipeline v2 and performance with wildlife detections enabled.

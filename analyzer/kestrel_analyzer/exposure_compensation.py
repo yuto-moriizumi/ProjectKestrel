@@ -2,6 +2,7 @@ from __future__ import annotations
 
 from typing import Any, Dict, Optional, Tuple
 
+import cv2
 import numpy as np
 
 
@@ -166,12 +167,40 @@ def build_metered_detection_image(
 
 _MAX_SOLVER_PX = 384  # downsample crop to this size for fast solver iterations
 
+# Clip-ratio statistics use only pixels at least this many px inside the mask boundary
+# (L2 distanceTransform). Percentile targets still use the full mask. ``None`` = legacy
+# behavior (clip evaluated on entire mask, including edge/sky leakage).
+DEFAULT_CLIP_IGNORE_EDGE_PX = 2.0
+
+
+def _core_mask_for_clip(mask_bool: np.ndarray, clip_ignore_edge_px: float | None) -> np.ndarray:
+    """Pixels at least *clip_ignore_edge_px* away from the mask boundary (L2 distance).
+
+    Used only for **clip ratio** statistics so bright boundary/sky leakage deprioritizes
+    less than the interior. Percentile targets still use the full mask.
+
+    If *clip_ignore_edge_px* is None or <= 0, returns *mask_bool* unchanged.
+    If erosion would remove all pixels, falls back to *mask_bool*.
+    """
+    if clip_ignore_edge_px is None or float(clip_ignore_edge_px) <= 0:
+        return mask_bool
+
+    m = (mask_bool.astype(np.uint8) * 255)
+    if not m.any():
+        return mask_bool
+    dist = cv2.distanceTransform(m, cv2.DIST_L2, 5)
+    core = (dist >= float(clip_ignore_edge_px)) & mask_bool
+    if not core.any():
+        return mask_bool
+    return core
+
 
 def compute_stops_numpy_solver(
     noauto_linear: np.ndarray,
     mask: np.ndarray,
     meter_scale: float,
     quality: str = "balanced",
+    clip_ignore_edge_px: float | None = DEFAULT_CLIP_IGNORE_EDGE_PX,
 ) -> float:
     """Compute per-bird exposure correction stops using numpy only.
 
@@ -181,6 +210,13 @@ def compute_stops_numpy_solver(
        (all iterations at full solver strength — no dampening during loop).
     3. Apply BRIGHTEN_STRENGTH / DARKEN_STRENGTH and stop limits once,
        post-convergence.
+
+    clip_ignore_edge_px:
+        Defaults to :data:`DEFAULT_CLIP_IGNORE_EDGE_PX` (2px): highlight **clip ratio**
+        uses only mask pixels at least this far inside the boundary (``cv2.distanceTransform``),
+        reducing bias from bright sky at the segmentation edge. **Percentile** targets (p10/p95/p98)
+        still use the full mask.
+        Pass ``None`` or ``<= 0`` for legacy behavior: clip ratio on the full mask.
 
     Returns stops (float) to apply via apply_exposure_crop_numpy.
     """
@@ -221,7 +257,6 @@ def compute_stops_numpy_solver(
             scale_factor = _MAX_SOLVER_PX / max(ch, cw)
             new_h = max(1, int(ch * scale_factor))
             new_w = max(1, int(cw * scale_factor))
-            import cv2
             crop_small = cv2.resize(crop_linear, (new_w, new_h), interpolation=cv2.INTER_AREA)
             mask_small = cv2.resize(
                 crop_mask.astype(np.uint8), (new_w, new_h), interpolation=cv2.INTER_NEAREST
@@ -233,29 +268,34 @@ def compute_stops_numpy_solver(
         if not mask_small.any():
             mask_small = np.ones(crop_small.shape[:2], dtype=bool)
 
+        mask_clip = _core_mask_for_clip(mask_small, clip_ignore_edge_px)
+
         def _lum_pixels(arr: np.ndarray, msk: np.ndarray) -> np.ndarray:
             px = arr[msk]
             lum = 0.2126 * px[:, 0] + 0.7152 * px[:, 1] + 0.0722 * px[:, 2]
             return lum[np.isfinite(lum)]
 
-        def _clip_ratio(lum: np.ndarray, stops_val: float) -> float:
-            return float(np.mean((lum * (2.0 ** stops_val)) >= CLIP_THRESH))
+        def _clip_ratio(lum_clip_1d: np.ndarray, stops_val: float) -> float:
+            return float(np.mean((lum_clip_1d * (2.0 ** stops_val)) >= CLIP_THRESH))
 
-        # base luminance (at meter_scale)
+        # base luminance at meter_scale — full mask for percentiles, core (optional) for clip
         base_lum = _lum_pixels(crop_small * meter_scale, mask_small)
         if base_lum.size == 0:
             return 0.0
+        base_lum_clip = _lum_pixels(crop_small * meter_scale, mask_clip)
+        if base_lum_clip.size == 0:
+            base_lum_clip = base_lum
 
-        # clip ceiling (binary search)
-        if _clip_ratio(base_lum, MAX_DARKEN) > MAX_CLIP_RATIO:
+        # clip ceiling (binary search) — uses interior/core pixels only when clip_ignore_edge_px set
+        if _clip_ratio(base_lum_clip, MAX_DARKEN) > MAX_CLIP_RATIO:
             clip_ceiling = MAX_DARKEN
-        elif _clip_ratio(base_lum, MAX_BRIGHTEN) <= MAX_CLIP_RATIO:
+        elif _clip_ratio(base_lum_clip, MAX_BRIGHTEN) <= MAX_CLIP_RATIO:
             clip_ceiling = MAX_BRIGHTEN
         else:
             lo, hi = MAX_DARKEN, MAX_BRIGHTEN
             for _ in range(20):
                 mid = (lo + hi) / 2.0
-                if _clip_ratio(base_lum, mid) <= MAX_CLIP_RATIO:
+                if _clip_ratio(base_lum_clip, mid) <= MAX_CLIP_RATIO:
                     lo = mid
                 else:
                     hi = mid
@@ -335,3 +375,75 @@ def compose_total_stops(subject_stops: float, meter_scale: float) -> float:
     """Combine meter_scale with per-bird subject_stops into a total stops value."""
     meter_scale = float(max(meter_scale, 1e-6))
     return float(np.log2(meter_scale) + float(subject_stops))
+
+
+def compute_exposure_stops(
+    img_u8: np.ndarray,
+    mask: np.ndarray,
+    quality: str = "balanced",
+) -> float:
+    """One-step ideal / residual stops from sRGB uint8 crop and mask (legacy helper).
+
+    Kept for older call sites; production path uses :func:`compute_stops_numpy_solver`.
+    """
+    quality_name = normalize_quality_name(quality)
+    cfg = _EXPOSURE_QUALITY_PROFILES[quality_name]
+    eps = 1e-3
+    max_brighten_solve = 8.0
+    max_darken_solve = -3.0
+    target_p95 = float(cfg["TARGET_HI_P95"])
+    target_p98 = float(cfg["TARGET_HI_P98"])
+    target_p10 = float(cfg["TARGET_SHADOW_P10"])
+    clip_thresh = float(cfg["CLIP_THRESH"])
+    max_clip = float(cfg["MAX_CLIP_RATIO"])
+
+    img_f = img_u8.astype(np.float32) / 255.0
+    mask_b = np.asarray(mask, dtype=bool)
+    pixels = img_f[mask_b] if mask_b.any() else img_f.reshape(-1, 3)
+    lum = 0.2126 * pixels[:, 0] + 0.7152 * pixels[:, 1] + 0.0722 * pixels[:, 2]
+    lum = lum[np.isfinite(lum)]
+    if lum.size == 0:
+        return 0.0
+    p10, p95, p98 = np.percentile(lum, [10, 95, 98])
+
+    if float(np.mean((lum * 2.0**max_darken_solve) >= clip_thresh)) > max_clip:
+        clip_ceil = max_darken_solve
+    elif float(np.mean((lum * 2.0**max_brighten_solve) >= clip_thresh)) <= max_clip:
+        clip_ceil = max_brighten_solve
+    else:
+        lo, hi = max_darken_solve, max_brighten_solve
+        for _ in range(20):
+            mid = (lo + hi) / 2.0
+            if float(np.mean((lum * 2.0**mid) >= clip_thresh)) <= max_clip:
+                lo = mid
+            else:
+                hi = mid
+        clip_ceil = lo
+
+    hi95 = float(np.log2(target_p95 / max(float(p95), eps)))
+    hi98 = float(np.log2(target_p98 / max(float(p98), eps)))
+    hl_ceil = min(hi95, hi98, clip_ceil, max_brighten_solve)
+
+    shad = float(np.log2(target_p10 / max(float(p10), eps)))
+    if hl_ceil >= 0.0:
+        s = hl_ceil
+        if shad > 0.0:
+            s = max(s, min(shad, hl_ceil))
+    else:
+        s = hl_ceil
+    return float(np.clip(s, max_darken_solve, max_brighten_solve))
+
+
+def preserve_highlights_for_stops(stops: float, profile: Optional[str] = None) -> float:
+    """Map subject stops to rawpy ``exp_preserve_highlights`` (0..1).
+
+    *profile* is accepted for call-site compatibility but is not used.
+    """
+    del profile  # unused — kept for API compatibility with older call sites
+    if stops > 1.0:
+        return 0.95
+    if stops > 0.4:
+        return 0.9
+    if stops > 0.0:
+        return 0.85
+    return 0.0

@@ -33,10 +33,10 @@ from .database import (
     update_scenedata_with_database,
 )
 from .exposure_compensation import (
+    apply_exposure_crop_numpy,
     build_metered_detection_image,
     compose_total_stops as ec_compose_total_stops,
     compute_stops_numpy_solver,
-    apply_exposure_crop_numpy,
 )
 from .image_utils import read_image, read_image_for_pipeline
 from .ratings import quality_to_rating, get_profile_thresholds
@@ -1089,7 +1089,7 @@ class AnalysisPipeline:
 
                         _meta["quality_distribution"] = distribution
                         _meta["quality_distribution_stored"] = True
-                        _meta["exposure_pipeline_version"] = 2
+                        _meta["exposure_pipeline_version"] = 3
                         _meta["exposure_render_mode"] = render_mode_meta
                         _meta["exposure_quality"] = exposure_quality
                         with open(metadata_path, "w", encoding="utf-8") as mf:
