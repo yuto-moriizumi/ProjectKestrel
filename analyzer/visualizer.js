@@ -1441,6 +1441,8 @@
         ));
         th.appendChild(img);
         if (showBirdThumbs && s.representative?.crop_path && s.representative?.export_path) {
+          const row = document.createElement('div');
+          row.className = 'thumb-row';
           const cropWrap = document.createElement('div');
           cropWrap.className = 'thumb-bird-crop';
           const cropImg = document.createElement('img');
@@ -1450,9 +1452,12 @@
             s.representative.__rootPath
           ));
           cropWrap.appendChild(cropImg);
-          th.appendChild(cropWrap);
+          row.appendChild(th);
+          row.appendChild(cropWrap);
+          card.appendChild(row);
+        } else {
+          card.appendChild(th);
         }
-        card.appendChild(th);
 
         const body = document.createElement('div');
         body.className = 'body';
