@@ -1434,6 +1434,7 @@
         th.className = 'thumb';
         const img = document.createElement('img');
         img.alt = s.representative?.filename || '';
+        applyThumbnailExposureToImg(img, s.representative);
         lazyLoadImg(img, () => getBlobUrlForPath(
           s.representative?.export_path || s.representative?.crop_path,
           s.representative?.__rootPath
@@ -1889,6 +1890,74 @@
       return Math.max(-2.0, Math.min(3.0, meterStops));
     }
 
+    /**
+     * Stops to use for thumbnail CSS (approximate full-frame preview vs bird crop).
+     *
+     * Pipeline stores exposure_correction = log2(meter_scale) + subject_stops (see compose_total_stops).
+     * Export JPEGs are built from the meter-balanced full frame *before* subject-only linear
+     * correction is applied to crops — so applying 2^total EV via brightness() re-applies meter
+     * on already-metered sRGB and blows highlights.
+     *
+     * For metered paths we therefore use **subject stops only** (optionally derived from total − meter).
+     * CSS brightness() still operates on gamma-encoded values; we dampen and cap in stopsToThumbnailBrightnessMultiplier.
+     *
+     * Future: analysis will standardize on the numpy linear exposure path only (`numpy_linear_v2`);
+     * other `exposure_pipeline` values may remain only in older `.kestrel` data until a migration/cleanup pass.
+     */
+    function getThumbnailExposureStopsForCss(row) {
+      if (!getSetting('exposure_corrected_thumbs', true)) return 0;
+      if (getSetting('raw_exposure_correction_disabled', false)) return 0;
+
+      const mode = String(row?.exposure_pipeline || '').trim().toLowerCase();
+      // Canonical metered path is numpy_linear_v2; keep legacy strings for old databases.
+      const meteredModes = new Set(['numpy_linear_v2', 'no_auto_bright_metered_v1']);
+
+      if (meteredModes.has(mode)) {
+        let subj = _numberOr(row?.exposure_subject_stops, NaN);
+        if (!Number.isFinite(subj)) {
+          const tot = parseFloat(row?.exposure_correction) || 0;
+          const m = _numberOr(row?.exposure_meter_scale, 1);
+          const meterSt = Math.log2(Math.max(1e-6, m));
+          subj = tot - meterSt;
+        }
+        return Math.max(-4.0, Math.min(4.0, subj));
+      }
+
+      // Legacy / non-metered: single stored EV is the best available hint (no separate meter term).
+      const eff = getRowRawPreviewEffectiveStops(row, false);
+      return Math.max(-4.0, Math.min(4.0, eff));
+    }
+
+    /**
+     * Map stops → CSS brightness() multiplier. Browser brightness scales sRGB channels roughly
+     * linearly in display space; it is **not** linear-light exposure + highlight roll-off like
+     * crop processing. Use gentler gain on brightening and a modest ceiling to limit clipped highlights.
+     */
+    function stopsToThumbnailBrightnessMultiplier(stops) {
+      if (!Number.isFinite(stops) || Math.abs(stops) < 0.0005) return 1;
+      if (stops > 0) {
+        const dampened = stops * 0.62;
+        const mult = Math.pow(2, dampened);
+        return Math.max(0.35, Math.min(2.05, mult));
+      }
+      const mult = Math.pow(2, stops);
+      return Math.max(0.35, Math.min(2.85, mult));
+    }
+
+    function getThumbnailExposureFilterStyle(row) {
+      const stops = getThumbnailExposureStopsForCss(row);
+      if (!Number.isFinite(stops) || Math.abs(stops) < 0.0005) return '';
+      const mult = stopsToThumbnailBrightnessMultiplier(stops);
+      if (Math.abs(mult - 1) < 0.002) return '';
+      return `brightness(${mult})`;
+    }
+
+    function applyThumbnailExposureToImg(imgEl, row) {
+      if (!imgEl || !row) return;
+      const f = getThumbnailExposureFilterStyle(row);
+      imgEl.style.filter = f || '';
+    }
+
     function getSceneRawCacheKey(row) {
       const disabled = getSetting('raw_exposure_correction_disabled', false);
       const expCorr = getRowRawPreviewEffectiveStops(row, disabled);
@@ -2020,11 +2089,13 @@
       zoomLastY = mouseEv.clientY;
 
       // Step 1: Immediately show the already-loaded thumbnail as a placeholder
-      const thumbImgSrc = thumbEl.querySelector('img')?.src;
+      const thumbImgEl = thumbEl.querySelector('img');
+      const thumbImgSrc = thumbImgEl?.src;
       if (thumbImgSrc) {
         _clearScenePreviewBox(previewBox);
         const stub = document.createElement('img');
         stub.src = thumbImgSrc;
+        stub.style.filter = thumbImgEl?.style?.filter || '';
         stub.style.imageRendering = 'crisp-edges';
         stub.onload = () => {
           if (sceneZoomActive && sceneZoomRow === row && sceneZoomThumbEl === thumbEl) {
@@ -2345,6 +2416,7 @@
         const img = document.createElement('img');
         img.alt = r.filename || '';
         img.loading = 'lazy';
+        applyThumbnailExposureToImg(img, r);
         lazyLoadImg(img, () => getBlobUrlForPath(r.export_path || r.crop_path, r.__rootPath));
         th.appendChild(img);
         card.appendChild(th);
@@ -2470,6 +2542,7 @@
         if (eurl) {
           const eimg = document.createElement('img');
           eimg.src = eurl;
+          applyThumbnailExposureToImg(eimg, r);
           exportBox.appendChild(eimg);
         } else {
           const muted = document.createElement('span');
@@ -3583,6 +3656,7 @@
         const img = document.createElement('img');
         img.alt = r.filename || '';
         img.loading = 'lazy';
+        applyThumbnailExposureToImg(img, r);
         lazyLoadImg(img, () => getBlobUrlForPath(r.export_path || r.crop_path, r.__rootPath));
         th.appendChild(img);
         card.appendChild(th);
@@ -4051,7 +4125,9 @@
 
       const rawExpDisableCb = document.getElementById('rawExposureCorrectionDisabled');
       if (rawExpDisableCb) rawExpDisableCb.checked = getSetting('raw_exposure_correction_disabled', false);
-      
+      const ectSettings = document.getElementById('settingsExposureCorrectedThumbs');
+      if (ectSettings) ectSettings.checked = !!getSetting('exposure_corrected_thumbs', true);
+
       dlg.showModal();
     }
     async function applySettings() {
@@ -4069,13 +4145,20 @@
       // Merge into existing settings so keys like machine_id / analytics_consent_shown are preserved
       const existing = loadSettings();
       const prevProfile = existing.rating_profile || 'balanced';
+      const ectCb = document.getElementById('settingsExposureCorrectedThumbs');
+      const exposureCorrectedThumbs = ectCb ? !!ectCb.checked : getSetting('exposure_corrected_thumbs', true);
+      const prevExposureThumbs = getSetting('exposure_corrected_thumbs', true);
+      const rawExpEl = document.getElementById('rawExposureCorrectionDisabled');
+      const rawExposureCorrectionDisabled = rawExpEl ? !!rawExpEl.checked : !!existing.raw_exposure_correction_disabled;
+      const prevRawExposureDisabled = !!existing.raw_exposure_correction_disabled;
       const settings = {
         ...existing, editor, customEditorPath, treeScanDepth,
         analytics_opted_in: analyticsOptIn, analytics_consent_shown: true,
         rating_profile: ratingProfile,
         raw_preview_cache_enabled: rawPreviewCacheEnabled,
         auto_save_enabled: autoSaveEnabled,
-        raw_exposure_correction_disabled: document.getElementById('rawExposureCorrectionDisabled').checked,
+        raw_exposure_correction_disabled: rawExposureCorrectionDisabled,
+        exposure_corrected_thumbs: exposureCorrectedThumbs,
       };
       _autoSaveEnabled = autoSaveEnabled;
       if (!_autoSaveEnabled) {
@@ -4092,6 +4175,15 @@
       // If rating profile changed and folders are loaded, reapply immediately
       if (ratingProfile !== prevProfile && rows.length > 0) {
         await reapplyNormalizationForLoadedFolders();
+      }
+      const thumbPreviewChanged =
+        exposureCorrectedThumbs !== prevExposureThumbs || rawExposureCorrectionDisabled !== prevRawExposureDisabled;
+      if (thumbPreviewChanged && rows.length > 0) {
+        await renderScenes();
+        if (sceneDlg?.open && _currentScene) {
+          renderFilmstrip(_currentScene);
+          await selectFilmstripImage(currentImageIndex, _currentScene, false, false);
+        }
       }
     }
 
@@ -5411,8 +5503,6 @@
       if (_adlgSt) _adlgSt.value = getSetting('scene_time_threshold', 1.0);
       const _adlgPp = document.getElementById('adlgParallelPrefetch');
       if (_adlgPp) _adlgPp.value = getSetting('parallel_prefetch', 3);
-      const _adlgEct = document.getElementById('adlgExposureCorrectedThumbs');
-      if (_adlgEct) _adlgEct.checked = !!getSetting('exposure_corrected_thumbs', false);
 
       const treeEl = document.getElementById('analyzeDlgTree');
       treeEl.innerHTML = '';
@@ -7330,14 +7420,12 @@
           const stVal = Math.max(0, parseFloat(document.getElementById('adlgSceneTime')?.value) || 1.0);
           const ppRaw = parseInt(document.getElementById('adlgParallelPrefetch')?.value, 10);
           const ppVal = Math.max(1, Math.min(5, Number.isFinite(ppRaw) ? ppRaw : 3));
-          const ectVal = !!document.getElementById('adlgExposureCorrectedThumbs')?.checked;
           const adlgSettings = loadSettings();
           adlgSettings.detection_threshold = dtVal;
           adlgSettings.max_bird_crops = mbcVal;
           adlgSettings.exposure_quality = eqVal;
           adlgSettings.scene_time_threshold = stVal;
           adlgSettings.parallel_prefetch = ppVal;
-          adlgSettings.exposure_corrected_thumbs = ectVal;
           saveSettings(adlgSettings);
           if (hasPywebviewApi && window.pywebview?.api?.save_settings_data) {
             try { await window.pywebview.api.save_settings_data(adlgSettings); } catch (_) { }

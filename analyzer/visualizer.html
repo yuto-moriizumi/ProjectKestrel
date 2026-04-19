@@ -450,6 +450,15 @@
       <div class="muted" style="font-size:12px;margin-top:-6px;margin-bottom:8px">By default, Kestrel applies a calculated exposure boost to RAW previews to match the processed JPEG. Enable this to view the RAW data without correction.</div>
 
       <div class="row">
+        <label for="settingsExposureCorrectedThumbs" style="flex:1">Exposure-corrected thumbnails</label>
+        <label class="inline" style="gap:6px">
+          <input type="checkbox" id="settingsExposureCorrectedThumbs" checked />
+          <span class="muted">Enable</span>
+        </label>
+      </div>
+      <div class="muted" style="font-size:12px;margin-top:-6px;margin-bottom:8px">Display only: approximate subject EV on full-frame thumbnails (grid &amp; scene dialog) with CSS. On by default; turn off for a neutral export preview. Does not affect analysis.</div>
+
+      <div class="row">
         <label for="settingsAutoSave" style="flex:1">Auto-Save Changes</label>
         <label class="inline" style="gap:6px">
           <input type="checkbox" id="settingsAutoSave" checked />
@@ -616,15 +625,6 @@
               style="width:80px" title="Number of images to read ahead in parallel (1–5)" />
           </div>
           <div class="muted" style="font-size:11px;margin-top:-2px">Number of images to read ahead to sustain the processing queue (1–5). Lower this if your computer slows down too much during analysis.</div>
-
-          <div class="adlg-setting-row" style="margin-top:6px">
-            <label for="adlgExposureCorrectedThumbs" style="flex:1">Exposure-corrected thumbnails</label>
-            <label class="inline" style="gap:6px">
-              <input type="checkbox" id="adlgExposureCorrectedThumbs" />
-              <span class="muted">Enable</span>
-            </label>
-          </div>
-          <div class="muted" style="font-size:11px;margin-top:-2px">Apply bird exposure correction to the full-image thumbnail. Produces more accurate previews for RAW files but increases memory usage during analysis.</div>
         </div>
       </details>
       <div class="analyze-dlg-footer">
