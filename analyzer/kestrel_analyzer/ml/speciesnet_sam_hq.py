@@ -31,7 +31,6 @@ _MIN_MAX_BIRD_CROPS = 1
 _MAX_MAX_BIRD_CROPS = 20
 _HEAVY_OVERLAP_IOU = 0.75
 _HEAVY_OVERLAP_CONTAINMENT = 0.90
-_MIN_CONF_FOR_CLASSIFIER_SAM = 0.50
 _SUPPORTED_DETECTOR_NAMES = tuple(DETECTOR_ONNX_PATHS.keys())
 _YOLOV9_DETECTOR_NAMES = {"mdv6-mit-yolov9-c", "mdv6-mit-yolov9-e"}
 
@@ -959,9 +958,11 @@ class SpeciesNetSAMHQWrapper:
         detections = det_result.get("detections", []) or []
 
         detector_threshold = float(threshold)
-        classifier_sam_threshold = max(detector_threshold, _MIN_CONF_FOR_CLASSIFIER_SAM)
 
-        animal_dets_above_threshold: list[dict[str, Any]] = []
+        # Every MegaDetector "animal" above *detector_threshold* goes to SpeciesNet ensemble + SAM-HQ.
+        # We do not apply a second (higher) confidence gate here — low-confidence boxes can still
+        # produce useful crops; classifier "blank" / vehicle / human routes are dropped per-detection
+        # below via ``is_ignored_prediction`` / ``route == "ignore"``.
         animal_dets: list[dict[str, Any]] = []
         for det in detections:
             label = str(det.get("label", ""))
@@ -970,31 +971,13 @@ class SpeciesNetSAMHQWrapper:
                 continue
             if conf < detector_threshold:
                 continue
-            animal_dets_above_threshold.append(det)
-            if conf < classifier_sam_threshold:
-                continue
             animal_dets.append(det)
 
-        animal_dets_above_threshold.sort(key=lambda d: float(d.get("conf", 0.0)), reverse=True)
         animal_dets.sort(key=lambda d: float(d.get("conf", 0.0)), reverse=True)
-        below_postprocess = len(animal_dets_above_threshold) - len(animal_dets)
         print(
-            f"[SpeciesNet] {os.path.basename(fp)}  animals above threshold: {len(animal_dets_above_threshold)}"
-            f"  (threshold={detector_threshold:.2f}, postprocess_threshold={classifier_sam_threshold:.2f},"
-            f" postprocess_candidates={len(animal_dets)}, total proposals={len(detections)})"
+            f"[SpeciesNet] {os.path.basename(fp)}  animals -> classifier/SAM: {len(animal_dets)}"
+            f"  (detector_threshold={detector_threshold:.2f}, total proposals={len(detections)})"
         )
-        if below_postprocess > 0:
-            skipped_confs = [
-                f"{float(d.get('conf', 0.0)):.2f}"
-                for d in animal_dets_above_threshold
-                if float(d.get("conf", 0.0)) < classifier_sam_threshold
-            ]
-            print(
-                f"[SpeciesNet] {below_postprocess} detection(s) SKIPPED — above"
-                f" detector threshold ({detector_threshold:.2f}) but below"
-                f" classifier threshold ({classifier_sam_threshold:.2f}):"
-                f" conf={', '.join(skipped_confs)}"
-            )
 
         bird_rows: list[dict[str, Any]] = []
         wildlife_rows: list[dict[str, Any]] = []
