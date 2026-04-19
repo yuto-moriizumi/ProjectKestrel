@@ -1340,6 +1340,7 @@
       const onlyReviewedScenes = !!document.getElementById('filterScenesManualRated')?.checked;
       const groupByFolder = document.getElementById('groupByFolder')?.checked ?? getSetting('groupByFolder', true);
       const groupByTime = document.getElementById('groupByTime')?.checked ?? getSetting('groupByTime', true);
+      const showBirdThumbs = document.getElementById('showBirdThumbs')?.checked ?? getSetting('showBirdThumbs', false);
       const includeSecondaryCheckbox = document.getElementById('includeSecondarySpecies');
       const includeSecondary = includeSecondaryCheckbox ? includeSecondaryCheckbox.checked : !!getSetting('includeSecondarySpecies', false);
       const includeFamilies = true;
@@ -1428,6 +1429,18 @@
           s.representative?.__rootPath
         ));
         th.appendChild(img);
+        if (showBirdThumbs && s.representative?.crop_path && s.representative?.export_path) {
+          const cropWrap = document.createElement('div');
+          cropWrap.className = 'thumb-bird-crop';
+          const cropImg = document.createElement('img');
+          cropImg.alt = 'Bird crop';
+          lazyLoadImg(cropImg, () => getBlobUrlForPath(
+            s.representative.crop_path,
+            s.representative.__rootPath
+          ));
+          cropWrap.appendChild(cropImg);
+          th.appendChild(cropWrap);
+        }
         card.appendChild(th);
 
         const body = document.createElement('div');
@@ -6800,6 +6813,16 @@
       try { t.checked = getSetting('groupByTime', true); } catch { }
       t.addEventListener('change', () => {
         const s = loadSettings(); s.groupByTime = !!t.checked; saveSettings(s); renderScenes();
+      });
+    })();
+
+    // Show bird thumbnails toggle
+    (function initShowBirdThumbs() {
+      const t = document.getElementById('showBirdThumbs');
+      if (!t) return;
+      try { t.checked = getSetting('showBirdThumbs', false); } catch { }
+      t.addEventListener('change', () => {
+        const s = loadSettings(); s.showBirdThumbs = !!t.checked; saveSettings(s); renderScenes();
       });
     })();
 

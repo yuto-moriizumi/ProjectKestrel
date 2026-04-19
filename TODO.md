@@ -10,10 +10,11 @@ TODO:
         * Exposure Compensation Quality: Default = Balanced
         * Scene Grouping Time: Default = 1 second
     - Add a new setting "Parallel Processing" that specifies how many images to read to sustain the queue at once (Default = 3) with note to lower if your computer slows down too much and a maximum of 5. 
-* Add settings to control thumbnail behavior. specifically, whether it is also exposure-corrected before being saved. and maybe also whether it is denoised.
+* Add settings to control thumbnail behavior. specifically, whether it is also exposure-corrected before being saved. this may require some pipeline reworking to persist the thumbnail data in memory, which can be expensive so make it false by default until we benchmark performance changes.
+* Add a check box near "group by folder" that controls whether each scene card is expanded to also show the square bird thumbnail of the image next to it.
 * Scrutinize settings schema validation and reproduce error with overwriting previous settings from earlier versions. Enforce some kind of never-overwrite-always-upgrade logic and tolerate additional fields being in the kestrel settings file.
     > Related "* Fix "Dropped unsupported keys (1): culling_tutorial_seen\n127.0.0.1 - - [06/Apr/2026 13:13:59] \"GET / HTTP/1.1\" 200 -\n127.0.0.1 - - [06/Apr/2026 13:13:59]" tutorial keeps showing up."
-* Add "Mark as Reviewed" system for labels/etc.
+* Add "Mark as Reviewed" button next to the species/family labels that marks those labels as "Reviewed". Right now it is only considered reviewed if the user interacts with those labels by deleting/re-adding some; there's no way to mark something that kestrel got right as 'reviewed'
 * Scrutinize database overwrites that are potentially leading to inconsistent behavior while analysis is still in progress getting rid of manually inputted data
 * Upgrade to enable experimental wildlife detection by default + Test
 * Remove additional model weights from Git repo + verify LFS assets
