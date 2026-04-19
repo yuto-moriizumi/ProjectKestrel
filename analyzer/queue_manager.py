@@ -169,10 +169,11 @@ class QueueManager:
         self._pipeline = None
         self._use_gpu = True
         self._wildlife_enabled = True
-        self._detection_threshold = 0.75
+        self._detection_threshold = 0.25
         self._scene_time_threshold = 1.0
         self._mask_threshold = 0.5
-        self._max_bird_crops = 5
+        self._max_bird_crops = 10
+        self._parallel_prefetch = 3
 
     def _collect_restore_paths_locked(self) -> list:
         restore_statuses = {'pending', 'running', 'cancelled'}
@@ -201,6 +202,7 @@ class QueueManager:
                 'scene_time_threshold': float(self._scene_time_threshold),
                 'mask_threshold': float(self._mask_threshold),
                 'max_bird_crops': int(self._max_bird_crops),
+                'parallel_prefetch': int(self._parallel_prefetch),
             },
             'items': [
                 {
@@ -289,10 +291,11 @@ class QueueManager:
             restore_paths,
             use_gpu=bool(options.get('use_gpu', True)),
             wildlife_enabled=bool(options.get('wildlife_enabled', True)),
-            detection_threshold=_safe_float(options.get('detection_threshold', 0.75), 0.75),
+            detection_threshold=_safe_float(options.get('detection_threshold', 0.25), 0.25),
             scene_time_threshold=_safe_float(options.get('scene_time_threshold', 1.0), 1.0),
             mask_threshold=_safe_float(options.get('mask_threshold', 0.5), 0.5),
-            max_bird_crops=_safe_int(options.get('max_bird_crops', 5), 5),
+            max_bird_crops=_safe_int(options.get('max_bird_crops', 10), 10),
+            parallel_prefetch=_safe_int(options.get('parallel_prefetch', 3), 3, min_value=1, max_value=5),
         )
         if result.get('success'):
             result['restored'] = len(restore_paths)
@@ -336,10 +339,11 @@ class QueueManager:
         paths: list,
         use_gpu: bool = True,
         wildlife_enabled: bool = True,
-        detection_threshold: float = 0.75,
+        detection_threshold: float = 0.25,
         scene_time_threshold: float = 1.0,
         mask_threshold: float = 0.5,
-        max_bird_crops: int = 5,
+        max_bird_crops: int = 10,
+        parallel_prefetch: int = 3,
     ) -> dict:
         if not _PIPELINE_AVAILABLE:
             return {'success': False, 'error': f'Analyzer unavailable: {_pipeline_import_error}'}
@@ -386,8 +390,13 @@ class QueueManager:
             try:
                 max_bird_crops_num = int(float(max_bird_crops))
             except (TypeError, ValueError):
-                max_bird_crops_num = 5
+                max_bird_crops_num = 10
             self._max_bird_crops = max(1, min(20, max_bird_crops_num))
+            try:
+                parallel_prefetch_num = int(float(parallel_prefetch))
+            except (TypeError, ValueError):
+                parallel_prefetch_num = 3
+            self._parallel_prefetch = max(1, min(5, parallel_prefetch_num))
             self._thread = threading.Thread(target=self._run, daemon=True, name='kestrel-queue')
             self._thread.start()
         self._persist_recovery_state()

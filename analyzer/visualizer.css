@@ -2389,6 +2389,48 @@
       font-size: 13px;
     }
 
+    /* Advanced Analysis Settings (collapsible) */
+    .analyze-dlg-advanced {
+      border: 1px solid #1d2230;
+      border-radius: 8px;
+      background: #0d1017;
+      font-size: 13px;
+    }
+
+    .analyze-dlg-advanced summary {
+      cursor: pointer;
+      padding: 7px 12px;
+      color: #a0a8b8;
+      font-weight: 600;
+      font-size: 12px;
+      text-transform: uppercase;
+      letter-spacing: 0.5px;
+      user-select: none;
+    }
+    .analyze-dlg-advanced summary:hover { color: #c8cdd8; }
+
+    .analyze-dlg-advanced-body {
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+      padding: 0 12px 10px;
+    }
+
+    .adlg-setting-row {
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      margin-top: 4px;
+    }
+    .adlg-setting-row label {
+      flex: 1;
+      font-size: 13px;
+    }
+    .adlg-setting-row input[type="number"],
+    .adlg-setting-row select {
+      flex-shrink: 0;
+    }
+
     .analyze-dlg-footer {
       display: flex;
       gap: 8px;

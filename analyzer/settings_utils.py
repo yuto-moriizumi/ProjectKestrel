@@ -215,10 +215,11 @@ def _sanitize_queue_recovery_state(value: Any) -> dict | None:
     state['options'] = {
         'use_gpu': _coerce_bool(opts.get('use_gpu', True), default=True),
         'wildlife_enabled': _coerce_bool(opts.get('wildlife_enabled', True), default=True),
-        'detection_threshold': _coerce_float(opts.get('detection_threshold', 0.75), 0.75, min_value=0.1, max_value=0.99),
+        'detection_threshold': _coerce_float(opts.get('detection_threshold', 0.25), 0.25, min_value=0.1, max_value=0.99),
         'scene_time_threshold': _coerce_float(opts.get('scene_time_threshold', 1.0), 1.0, min_value=0.0, max_value=60.0),
         'mask_threshold': _coerce_float(opts.get('mask_threshold', 0.5), 0.5, min_value=0.5, max_value=0.95),
-        'max_bird_crops': _coerce_int(opts.get('max_bird_crops', 5), 5, min_value=1, max_value=20),
+        'max_bird_crops': _coerce_int(opts.get('max_bird_crops', 10), 10, min_value=1, max_value=20),
+        'parallel_prefetch': _coerce_int(opts.get('parallel_prefetch', 3), 3, min_value=1, max_value=5),
     }
 
     items_out: list[dict[str, Any]] = []
@@ -288,10 +289,11 @@ def _sanitize_settings_payload(data: dict, emit_log: bool = False) -> dict:
 
     if 'rating_profile' in data:
         out['rating_profile'] = _coerce_enum(data.get('rating_profile'), _ALLOWED_RATING_PROFILES, default='balanced')
-    _set_float('detection_threshold', default=0.75, min_value=0.1, max_value=0.99, digits=4)
+    _set_float('detection_threshold', default=0.25, min_value=0.1, max_value=0.99, digits=4)
     _set_float('scene_time_threshold', default=1.0, min_value=0.0, max_value=60.0, digits=4)
     _set_float('mask_threshold', default=0.5, min_value=0.5, max_value=0.95, digits=4)
-    _set_int('max_bird_crops', default=5, min_value=1, max_value=20)
+    _set_int('max_bird_crops', default=10, min_value=1, max_value=20)
+    _set_int('parallel_prefetch', default=3, min_value=1, max_value=5)
 
     if 'exposure_quality' in data:
         out['exposure_quality'] = _coerce_enum(

@@ -423,51 +423,6 @@
         converted to star ratings. Each profile uses fixed quality-score thresholds — stricter profiles require
         a higher score to earn 4 or 5 stars. Changes take effect immediately for loaded folders.</div>
 
-      <h4 style="margin:12px 0 8px;padding-top:8px;border-top:1px solid #1d2230;color:#a0a8b8;font-size:13px;text-transform:uppercase;letter-spacing:0.5px">Analysis Settings</h4>
-
-      <div class="row">
-        <label for="detectionThreshold">Detection Confidence Threshold</label>
-        <input id="detectionThreshold" type="number" min="0.1" max="0.99" step="0.05" value="0.75"
-          style="width:80px" title="Minimum MegaDetector animal confidence (0.10–0.99) required to count as a true detection (SpeciesNet)" />
-      </div>
-      <div class="muted" style="font-size:12px;margin-top:-6px;margin-bottom:8px">Minimum confidence score
-        (0.10–0.99) that the SpeciesNet MegaDetector must reach on an <b>animal</b> box before Kestrel keeps that detection. Lowering
-        this value may increase <b>false positive</b> detections on difficult images. Requires re-analysis to
-        take effect. Also filters which species and family tags are shown in scene dialogs.</div>
-
-      <div style="border-top:1px solid #1d2230;margin:4px 0 2px"></div>
-      <div class="row">
-        <label for="sceneTimeThreshold">Scene Grouping Time Threshold (seconds)</label>
-        <input id="sceneTimeThreshold" type="number" min="0" max="60" step="0.5" value="1.0"
-          style="width:80px" title="Images captured within this many seconds of each other are considered part of the same scene burst" />
-      </div>
-      <div class="muted" style="font-size:12px;margin-top:-6px;margin-bottom:8px">Images captured within this
-        many seconds of each other are treated as the same burst/scene (using EXIF timestamp). Requires
-        re-analysis to take effect.</div>
-
-      <div class="row">
-        <label for="maskThreshold">Mask Segmentation Threshold (legacy)</label>
-        <input id="maskThreshold" type="number" min="0.5" max="0.95" step="0.05" value="0.5"
-          style="width:80px" title="Not used by the SpeciesNet + SAM-HQ pipeline (kept for settings compatibility). Previously: Mask R-CNN mask pixel threshold." />
-      </div>
-      <div class="muted" style="font-size:12px;margin-top:-6px;margin-bottom:8px">The current analyzer uses SAM-HQ for masks; this control is <b>not applied</b>. It remains so older saved settings still load. Requires re-analysis only when other analysis settings change.</div>
-
-      <div class="row">
-        <label for="maxBirdCrops">Max Bird Crops Saved Per Image</label>
-        <input id="maxBirdCrops" type="number" min="1" max="20" step="1" value="5"
-          style="width:80px" title="Maximum number of bird crops Kestrel saves per image (1-20)." />
-      </div>
-      <div class="muted" style="font-size:12px;margin-top:-6px;margin-bottom:8px">Maximum number of <b>bird</b> (aves) and <b>non-bird wildlife</b> subjects saved per image (each list capped separately). <b style="color:#e0a34a">Warning: increasing this value (for example to 20) can substantially increase compute time and memory overhead.</b> Requires re-analysis to take effect.</div>
-
-      <div class="row">
-        <label for="exposureQuality">Exposure Quality</label>
-        <select id="exposureQuality">
-          <option value="lenient">Lenient &mdash; gentle 50% nudge toward target, up to &plusmn;3 stops</option>
-          <option value="balanced" selected>Balanced &mdash; 75% correction strength, up to &plusmn;5 stops (recommended)</option>
-          <option value="aggressive">Aggressive &mdash; full 100% correction, up to &plusmn;8 stops</option>
-        </select>
-      </div>
-      <div class="muted" style="font-size:12px;margin-top:-6px;margin-bottom:8px">Controls how strongly Kestrel corrects bird exposure. Balanced is recommended for most images. Aggressive is best for heavily backlit or very dark scenes. Lenient makes subtle adjustments to already well-lit shots. Requires re-analysis to take effect.</div>
 
       <h4 style="margin:12px 0 8px;padding-top:8px;border-top:1px solid #1d2230;color:#a0a8b8;font-size:13px;text-transform:uppercase;letter-spacing:0.5px">Data &amp; Preview</h4>
 
@@ -617,6 +572,48 @@
           <span class="muted">(Experimental) Check for other wildlife species in addition to birds</span>
         </label>
       </div>
+      <details class="analyze-dlg-advanced" id="analyzeAdvancedDetails">
+        <summary>Advanced Analysis Settings</summary>
+        <div class="analyze-dlg-advanced-body">
+          <div class="adlg-setting-row">
+            <label for="adlgDetectionThreshold">Animal Detection Confidence</label>
+            <input id="adlgDetectionThreshold" type="number" min="0.1" max="0.99" step="0.05" value="0.25"
+              style="width:80px" title="Minimum MegaDetector animal confidence (0.10–0.99)" />
+          </div>
+          <div class="muted" style="font-size:11px;margin-top:-2px">Minimum confidence score (0.10–0.99) for animal detections. Lower values may increase false positives.</div>
+
+          <div class="adlg-setting-row">
+            <label for="adlgMaxBirdCrops">Max Birds Detected Per Image</label>
+            <input id="adlgMaxBirdCrops" type="number" min="1" max="20" step="1" value="10"
+              style="width:80px" title="Maximum number of bird/wildlife subjects saved per image (1–20)" />
+          </div>
+          <div class="muted" style="font-size:11px;margin-top:-2px">Maximum bird (aves) and non-bird wildlife subjects saved per image (each list capped separately).</div>
+
+          <div class="adlg-setting-row">
+            <label for="adlgExposureQuality">Exposure Compensation Quality</label>
+            <select id="adlgExposureQuality" style="flex:1;max-width:340px">
+              <option value="lenient">Lenient &mdash; gentle 50% nudge, up to &plusmn;3 stops</option>
+              <option value="balanced" selected>Balanced &mdash; 75% correction, up to &plusmn;5 stops</option>
+              <option value="aggressive">Aggressive &mdash; full 100%, up to &plusmn;8 stops</option>
+            </select>
+          </div>
+          <div class="muted" style="font-size:11px;margin-top:-2px">Controls how strongly Kestrel corrects bird exposure. Balanced is recommended for most images.</div>
+
+          <div class="adlg-setting-row">
+            <label for="adlgSceneTime">Scene Grouping Time (seconds)</label>
+            <input id="adlgSceneTime" type="number" min="0" max="60" step="0.5" value="1.0"
+              style="width:80px" title="Images within this many seconds are grouped as one scene burst" />
+          </div>
+          <div class="muted" style="font-size:11px;margin-top:-2px">Images captured within this many seconds of each other are treated as the same burst/scene.</div>
+
+          <div class="adlg-setting-row">
+            <label for="adlgParallelPrefetch">Parallel Processing</label>
+            <input id="adlgParallelPrefetch" type="number" min="1" max="5" step="1" value="3"
+              style="width:80px" title="Number of images to read ahead in parallel (1–5)" />
+          </div>
+          <div class="muted" style="font-size:11px;margin-top:-2px">Number of images to read ahead to sustain the processing queue (1–5). Lower this if your computer slows down too much during analysis.</div>
+        </div>
+      </details>
       <div class="analyze-dlg-footer">
         <span class="analyze-dlg-selected-count" id="analyzeDlgCount">0 folders selected</span>
         <button id="analyzeDlgRestoreQueue" style="display:none;font-size:11px;padding:4px 8px;background:#5a4a7a;color:#d0b8ff;border:1px solid #7a6a9a;" title="Restore the queue from last time you cancelled">🔄 Restore Queue?</button>

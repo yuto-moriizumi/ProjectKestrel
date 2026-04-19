@@ -9,7 +9,8 @@ TODO:
         * Max Birds Detected Per Image: Default = 10 + remove warning about memory overhead
         * Exposure Compensation Quality: Default = Balanced
         * Scene Grouping Time: Default = 1 second
-    - Add a new setting "Parallel Processing" that specifies how many images to read at once (Default = 3) with note to lower if your computer slows down too much and a maximum of 5. 
+    - Add a new setting "Parallel Processing" that specifies how many images to read to sustain the queue at once (Default = 3) with note to lower if your computer slows down too much and a maximum of 5. 
+* Add settings to control thumbnail behavior. specifically, whether it is also exposure-corrected before being saved. and maybe also whether it is denoised.
 * Scrutinize settings schema validation and reproduce error with overwriting previous settings from earlier versions. Enforce some kind of never-overwrite-always-upgrade logic and tolerate additional fields being in the kestrel settings file.
     > Related "* Fix "Dropped unsupported keys (1): culling_tutorial_seen\n127.0.0.1 - - [06/Apr/2026 13:13:59] \"GET / HTTP/1.1\" 200 -\n127.0.0.1 - - [06/Apr/2026 13:13:59]" tutorial keeps showing up."
 * Add "Mark as Reviewed" system for labels/etc.

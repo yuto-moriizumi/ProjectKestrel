@@ -3978,23 +3978,6 @@
       // Rating profile
       const profileSelect = document.getElementById('ratingProfile');
       if (profileSelect) profileSelect.value = getSetting('rating_profile', 'balanced');
-      // Detection confidence threshold
-      const dtEl = document.getElementById('detectionThreshold');
-      if (dtEl) dtEl.value = getSetting('detection_threshold', 0.75);
-      // Scene grouping time threshold
-      const sttEl = document.getElementById('sceneTimeThreshold');
-      if (sttEl) sttEl.value = getSetting('scene_time_threshold', 1.0);
-      // Mask threshold
-      const maskThEl = document.getElementById('maskThreshold');
-      if (maskThEl) maskThEl.value = getSetting('mask_threshold', 0.5);
-      const maxBirdCropsEl = document.getElementById('maxBirdCrops');
-      if (maxBirdCropsEl) maxBirdCropsEl.value = getSetting('max_bird_crops', 5);
-      // Exposure quality
-      const expQualityEl = document.getElementById('exposureQuality');
-      if (expQualityEl) {
-        const savedExpQuality = String(getSetting('exposure_quality', 'balanced') || 'balanced').toLowerCase();
-        expQualityEl.value = ['lenient', 'balanced', 'aggressive'].includes(savedExpQuality) ? savedExpQuality : 'balanced';
-      }
       // RAW preview cache
       const rawCacheCb = document.getElementById('rawPreviewCacheEnabled');
       if (rawCacheCb) rawCacheCb.checked = getSetting('raw_preview_cache_enabled', true);
@@ -4031,24 +4014,6 @@
       const analyticsOptIn = document.getElementById('settingsAnalyticsOptIn').checked;
       const profileEl = document.getElementById('ratingProfile');
       const ratingProfile = profileEl ? profileEl.value : 'balanced';
-      const dtEl2 = document.getElementById('detectionThreshold');
-      const detectionThreshold = dtEl2 ? Math.max(0.1, Math.min(0.99, parseFloat(dtEl2.value) || 0.75)) : 0.75;
-      const sttEl2 = document.getElementById('sceneTimeThreshold');
-      const sceneTimeThreshold = sttEl2 ? Math.max(0, parseFloat(sttEl2.value) || 1.0) : 1.0;
-      const maskThEl2 = document.getElementById('maskThreshold');
-      const maskThreshold = maskThEl2 ? Math.max(0.5, Math.min(0.95, parseFloat(maskThEl2.value) || 0.5)) : 0.5;
-      const maxBirdCropsEl2 = document.getElementById('maxBirdCrops');
-      let maxBirdCrops = 5;
-      if (maxBirdCropsEl2) {
-        const parsedMaxBirdCrops = parseInt(maxBirdCropsEl2.value, 10);
-        maxBirdCrops = Number.isFinite(parsedMaxBirdCrops) ? parsedMaxBirdCrops : 5;
-      }
-      maxBirdCrops = Math.max(1, Math.min(20, maxBirdCrops));
-      const expQualityEl2 = document.getElementById('exposureQuality');
-      const exposureQualityRaw = (expQualityEl2 ? String(expQualityEl2.value || 'balanced') : 'balanced').toLowerCase();
-      const exposureQualitySafe = ['lenient', 'balanced', 'aggressive'].includes(exposureQualityRaw)
-        ? exposureQualityRaw
-        : 'balanced';
       const rawCacheCb2 = document.getElementById('rawPreviewCacheEnabled');
       const rawPreviewCacheEnabled = rawCacheCb2 ? rawCacheCb2.checked : true;
       const autoSaveCb = document.getElementById('settingsAutoSave');
@@ -4056,25 +4021,10 @@
       // Merge into existing settings so keys like machine_id / analytics_consent_shown are preserved
       const existing = loadSettings();
       const prevProfile = existing.rating_profile || 'balanced';
-      const prevMaxBirdCropsRaw = parseInt(existing.max_bird_crops, 10);
-      const prevMaxBirdCrops = Number.isFinite(prevMaxBirdCropsRaw)
-        ? Math.max(1, Math.min(20, prevMaxBirdCropsRaw))
-        : 5;
-      if (maxBirdCrops > 10 && maxBirdCrops !== prevMaxBirdCrops) {
-        const confirmed = confirm(
-          'Raising "Max Bird Crops Saved Per Image" above 10 can substantially increase compute time and memory overhead. Continue?'
-        );
-        if (!confirmed) return;
-      }
       const settings = {
         ...existing, editor, customEditorPath, treeScanDepth,
         analytics_opted_in: analyticsOptIn, analytics_consent_shown: true,
         rating_profile: ratingProfile,
-        detection_threshold: detectionThreshold,
-        scene_time_threshold: sceneTimeThreshold,
-        mask_threshold: maskThreshold,
-        max_bird_crops: maxBirdCrops,
-        exposure_quality: exposureQualitySafe,
         raw_preview_cache_enabled: rawPreviewCacheEnabled,
         auto_save_enabled: autoSaveEnabled,
         raw_exposure_correction_disabled: document.getElementById('rawExposureCorrectionDisabled').checked,
@@ -5398,6 +5348,21 @@
         if (addBtn) addBtn.disabled = _dlgSelected.size === 0;
         _refreshAnalyzeDlgQueuePreview();
       }
+
+      // Hydrate advanced analysis settings from persisted values
+      const _adlgDt = document.getElementById('adlgDetectionThreshold');
+      if (_adlgDt) _adlgDt.value = getSetting('detection_threshold', 0.25);
+      const _adlgMbc = document.getElementById('adlgMaxBirdCrops');
+      if (_adlgMbc) _adlgMbc.value = getSetting('max_bird_crops', 10);
+      const _adlgEq = document.getElementById('adlgExposureQuality');
+      if (_adlgEq) {
+        const savedEq = String(getSetting('exposure_quality', 'balanced') || 'balanced').toLowerCase();
+        _adlgEq.value = ['lenient', 'balanced', 'aggressive'].includes(savedEq) ? savedEq : 'balanced';
+      }
+      const _adlgSt = document.getElementById('adlgSceneTime');
+      if (_adlgSt) _adlgSt.value = getSetting('scene_time_threshold', 1.0);
+      const _adlgPp = document.getElementById('adlgParallelPrefetch');
+      if (_adlgPp) _adlgPp.value = getSetting('parallel_prefetch', 3);
 
       const treeEl = document.getElementById('analyzeDlgTree');
       treeEl.innerHTML = '';
@@ -7166,6 +7131,28 @@
             if (node) { node.has_kestrel = false; node.kestrel_version = ''; }
           } catch (e) {
             console.warn('Failed to clear kestrel data for re-analyze', p, e);
+          }
+        }
+
+        // Persist advanced analysis settings before starting the queue
+        {
+          const dtVal = Math.max(0.1, Math.min(0.99, parseFloat(document.getElementById('adlgDetectionThreshold')?.value) || 0.25));
+          const mbcRaw = parseInt(document.getElementById('adlgMaxBirdCrops')?.value, 10);
+          const mbcVal = Math.max(1, Math.min(20, Number.isFinite(mbcRaw) ? mbcRaw : 10));
+          const eqRaw = String(document.getElementById('adlgExposureQuality')?.value || 'balanced').toLowerCase();
+          const eqVal = ['lenient', 'balanced', 'aggressive'].includes(eqRaw) ? eqRaw : 'balanced';
+          const stVal = Math.max(0, parseFloat(document.getElementById('adlgSceneTime')?.value) || 1.0);
+          const ppRaw = parseInt(document.getElementById('adlgParallelPrefetch')?.value, 10);
+          const ppVal = Math.max(1, Math.min(5, Number.isFinite(ppRaw) ? ppRaw : 3));
+          const adlgSettings = loadSettings();
+          adlgSettings.detection_threshold = dtVal;
+          adlgSettings.max_bird_crops = mbcVal;
+          adlgSettings.exposure_quality = eqVal;
+          adlgSettings.scene_time_threshold = stVal;
+          adlgSettings.parallel_prefetch = ppVal;
+          saveSettings(adlgSettings);
+          if (hasPywebviewApi && window.pywebview?.api?.save_settings_data) {
+            try { await window.pywebview.api.save_settings_data(adlgSettings); } catch (_) { }
           }
         }
 
