@@ -2510,6 +2510,12 @@
       grid.scrollTo({ left: targetScrollLeft, behavior: 'smooth' });
     }
 
+    // Monotonic token used to invalidate stale async preview loads triggered
+    // by rapid filmstrip hovers. Without this, two `await`-ing invocations
+    // could each append an <img> to the preview boxes, producing a
+    // "split in half" rendering as flex layout shrinks both side-by-side.
+    let _filmstripPreviewToken = 0;
+
     async function selectFilmstripImage(idx, scene, isHover = false, overlayActiveCrop = false) {
       if (!scene || !scene.images || idx < 0 || idx >= scene.images.length) return;
       if (!isHover) {
@@ -2520,6 +2526,7 @@
         }
         currentImageIndex = idx;
       }
+      const myToken = ++_filmstripPreviewToken;
       const r = scene.images[idx];
       const cropState = getRowActiveCropState(r);
       const activeCrop = cropState.activeCrop;
@@ -2544,6 +2551,10 @@
       if (exportBox) {
         _clearScenePreviewBox(exportBox);
         const eurl = await getBlobUrlForPath(r.export_path, r.__rootPath);
+        // Bail out if a newer hover/selection has superseded this load.
+        if (myToken !== _filmstripPreviewToken) return;
+        // Re-clear in case other code added children while we were awaiting.
+        _clearScenePreviewBox(exportBox);
         if (eurl) {
           const eimg = document.createElement('img');
           eimg.src = eurl;
@@ -2562,6 +2573,8 @@
       if (cropBox) {
         _clearScenePreviewBox(cropBox);
         const curl = await getBlobUrlForPath(activeCropPath, r.__rootPath);
+        if (myToken !== _filmstripPreviewToken) return;
+        _clearScenePreviewBox(cropBox);
         if (curl) {
           const cimg = document.createElement('img');
           cimg.src = curl;

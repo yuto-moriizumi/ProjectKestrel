@@ -26,7 +26,11 @@ TODO:
 * Upgrade tutorial workflow: Simple and advanced version. Potentially also inform the user how they can integrate Kestrel into their workflows.
 * Remove "Unknown" from becoming a dedicated species label.
 * Website: Add sign-up list for cloud analysis or beta testing.
-* Improve 'show bird thumbnail' behavior.
+* Improve 'show bird thumbnail' behavior. [DONE]
+* Fix bug where the image is like half-split for some reason. [DONE]
+* Improve UI: Add "Open in [photo editor]" button; along with buttons to switch between the multiple bird crops. Near the right side.
+* Improve timeline: more granular detail than just grouping by capture hour. Also maybe add a "Adjust Capture Time" button that lets you add some hour offsets/change the capture time to sync it better.
+
 
 TESTING:
 * Continue to test pipeline v2 and performance with wildlife detections enabled. - check detection sensitivity thresholds, exposure compensation performance, and overall performance.
