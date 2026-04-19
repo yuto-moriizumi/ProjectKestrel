@@ -1362,6 +1362,16 @@
       const visibleScenes = onlyReviewedScenes ? scenes.filter(isManuallyReviewedScene) : scenes;
 
       updateStatusBar(visibleScenes);
+
+      // Prevent flash-of-empty-content: lock the grid's current height as a
+      // minimum so the page layout doesn't collapse while we rebuild the DOM,
+      // and save the scroll position of the main container for restoration.
+      const mainEl = document.querySelector('main');
+      const savedScrollTop = mainEl ? mainEl.scrollTop : 0;
+      const currentHeight = sceneGrid.offsetHeight;
+      if (currentHeight > 0) {
+        sceneGrid.style.minHeight = currentHeight + 'px';
+      }
       sceneGrid.innerHTML = '';
 
       // Show welcome panel when no data is loaded; hide it once a folder is open
@@ -1575,7 +1585,7 @@
           timelineEl.appendChild(nodeEl);
 
           for (let i = 0; i < tbScenes.length; i += batch) {
-            if (myVer !== _renderScenesVersion) return;
+            if (myVer !== _renderScenesVersion) { sceneGrid.style.minHeight = ''; return; }
             const slice = tbScenes.slice(i, i + batch);
             const frag = document.createDocumentFragment();
             for (const s of slice) frag.appendChild(buildCard(s));
@@ -1671,13 +1681,20 @@
           gridEl.className = 'folder-group-grid grid';
           bodyEl.appendChild(gridEl);
           for (let i = 0; i < allScenesInFolder.length; i += batch) {
-            if (myVer !== _renderScenesVersion) return;
+            if (myVer !== _renderScenesVersion) { sceneGrid.style.minHeight = ''; return; }
             const slice = allScenesInFolder.slice(i, i + batch);
             const frag = document.createDocumentFragment();
             for (const s of slice) frag.appendChild(buildCard(s));
             gridEl.appendChild(frag);
           }
         }
+      }
+
+      // Restore scroll position and release the minimum-height lock now that
+      // the grid is rebuilt, preventing flash-of-empty-content.
+      sceneGrid.style.minHeight = '';
+      if (mainEl && savedScrollTop > 0) {
+        mainEl.scrollTop = savedScrollTop;
       }
     }
 
@@ -6233,7 +6250,22 @@
       if (_autoRefreshTimer) { clearInterval(_autoRefreshTimer); _autoRefreshTimer = null; }
     }
 
-    /** Silently reload CSV data for any paths in _autoRefreshPendingPaths that are checked. */
+    // User-editable row fields that must survive auto-refresh merges.
+    // Pipeline-written columns are updated from disk; these are kept from memory.
+    const _USER_EDITABLE_FIELDS = [
+      'rating', 'rating_origin', 'normalized_rating',
+      'culled', 'culled_origin',
+      'scene_name',
+    ];
+
+    /** Silently reload CSV data for any paths in _autoRefreshPendingPaths that are checked.
+     *
+     *  Merges new pipeline data into existing in-memory rows instead of replacing
+     *  them wholesale, so unsaved user edits (ratings, culling, scene names) are
+     *  preserved.  Only genuinely new images (not yet in memory) are appended.
+     *  Scenedata is merged additively: new scenes are added but user-edited
+     *  scenes are never overwritten.
+     */
     async function silentRefreshPending() {
       if (_autoRefreshPendingPaths.size === 0) return;
       if (_silentRefreshRunning) return;
@@ -6244,48 +6276,157 @@
         if (toRefresh.length === 0) return;
 
         const normPath = p => (p || '').replace(/\\/g, '/');
-        let changed = false;
+        let hasNewRows = false;
+        let hasUpdates = false;
         for (const p of toRefresh) {
           try {
             if (!hasPywebviewApi || !window.pywebview?.api?.read_kestrel_csv) continue;
             const result = await window.pywebview.api.read_kestrel_csv(p);
             if (!result.success) continue;
             const parsed = parseCsvText(result.data);
-            const newRows = parsed.data || [];
+            const diskRows = parsed.data || [];
             const newFields = parsed.meta.fields || [];
             const root = result.root || p;
             const rootN = normPath(root);
             for (const f of newFields) if (!header.includes(f)) header.push(f);
+
+            // Build a lookup of existing in-memory rows for this folder by filename
+            const existingByName = new Map();
+            for (const r of rows) {
+              if (normPath(r.__rootPath) === rootN && r.filename) {
+                existingByName.set(r.filename, r);
+              }
+            }
+
             const sample = rows.find(r => normPath(r.__rootPath) === rootN);
             const slot = sample ? sample.__folderSlot : rows.length;
-            rows = rows.filter(r => normPath(r.__rootPath) !== rootN);
-            for (const r of newRows) { r.__rootPath = root; r.__folderSlot = slot; }
-            rows = rows.concat(newRows);
+            const addedRows = [];
+
+            for (const diskRow of diskRows) {
+              const fname = diskRow.filename;
+              if (!fname) continue;
+              const existing = existingByName.get(fname);
+              if (existing) {
+                // Merge: update pipeline-written fields from disk, keep user edits
+                const savedEdits = {};
+                for (const field of _USER_EDITABLE_FIELDS) {
+                  if (field in existing) savedEdits[field] = existing[field];
+                }
+                // Also preserve internal UI fields
+                const savedInternal = {
+                  __rootPath: existing.__rootPath,
+                  __folderSlot: existing.__folderSlot,
+                  __normalized_rating: existing.__normalized_rating,
+                };
+
+                // Update pipeline fields from disk
+                for (const key of Object.keys(diskRow)) {
+                  if (key.startsWith('__')) continue;
+                  if (!_USER_EDITABLE_FIELDS.includes(key)) {
+                    existing[key] = diskRow[key];
+                  }
+                }
+
+                // Restore user edits
+                for (const [field, val] of Object.entries(savedEdits)) {
+                  // Only restore if the user actually set something
+                  if (val !== undefined && val !== '') existing[field] = val;
+                }
+                // Restore internal fields
+                Object.assign(existing, savedInternal);
+                hasUpdates = true;
+              } else {
+                // Genuinely new row from pipeline — append it
+                diskRow.__rootPath = root;
+                diskRow.__folderSlot = slot;
+                addedRows.push(diskRow);
+              }
+            }
+
+            if (addedRows.length > 0) {
+              rows = rows.concat(addedRows);
+              hasNewRows = true;
+            }
+
+            // Merge scenedata: add new scenes from disk without overwriting user-edited ones
             if (hasPywebviewApi && window.pywebview?.api?.read_kestrel_scenedata) {
               try {
                 const sdRes = await window.pywebview.api.read_kestrel_scenedata(root);
-                if (sdRes?.success) _scenedata[root] = sdRes.data;
+                if (sdRes?.success && sdRes.data) {
+                  const diskSd = sdRes.data;
+                  const memSd = _scenedata[root] || { version: '2.0', image_ratings: {}, scenes: {} };
+
+                  // Merge image_ratings: disk values only for images without user edits
+                  if (diskSd.image_ratings) {
+                    if (!memSd.image_ratings) memSd.image_ratings = {};
+                    for (const [fname, rating] of Object.entries(diskSd.image_ratings)) {
+                      if (!(fname in memSd.image_ratings)) {
+                        memSd.image_ratings[fname] = rating;
+                      }
+                    }
+                  }
+
+                  // Merge scenes: add new scenes, update non-user-edited scenes
+                  if (diskSd.scenes) {
+                    if (!memSd.scenes) memSd.scenes = {};
+                    for (const [sceneId, diskScene] of Object.entries(diskSd.scenes)) {
+                      const memScene = memSd.scenes[sceneId];
+                      if (!memScene) {
+                        // New scene from pipeline — add it
+                        memSd.scenes[sceneId] = diskScene;
+                      } else {
+                        // Existing scene — only update image list, keep user edits
+                        const userFinalized = memScene.user_tags && memScene.user_tags.finalized;
+                        const userRenamed = memScene.name && memScene.name.trim() !== '';
+                        const userAccepted = memScene.status === 'accepted';
+                        if (!userFinalized && !userRenamed && !userAccepted) {
+                          // No user edits — safe to update from disk
+                          // But still merge image_filenames additively
+                          const existingFiles = new Set(memScene.image_filenames || []);
+                          for (const f of (diskScene.image_filenames || [])) {
+                            if (!existingFiles.has(f)) {
+                              memScene.image_filenames.push(f);
+                            }
+                          }
+                        } else {
+                          // User has edited this scene — only add new filenames
+                          const existingFiles = new Set(memScene.image_filenames || []);
+                          for (const f of (diskScene.image_filenames || [])) {
+                            if (!existingFiles.has(f)) {
+                              memScene.image_filenames.push(f);
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+
+                  _scenedata[root] = memSd;
+                }
               } catch (_) {}
             }
-            if (hasPywebviewApi && window.pywebview?.api?.apply_normalization) {
+
+            // Apply normalization to new rows only
+            if (addedRows.length > 0 && hasPywebviewApi && window.pywebview?.api?.apply_normalization) {
               try {
                 const normRes = await window.pywebview.api.apply_normalization(root);
                 if (normRes?.success && normRes?.normalized_ratings) {
                   const mapping = normRes.normalized_ratings;
-                  for (const r of newRows) {
+                  for (const r of addedRows) {
                     if (r.filename in mapping) r.__normalized_rating = mapping[r.filename];
                   }
                 }
               } catch (_) {}
             }
-            changed = true;
           } catch (e) {
             console.warn('[autorefresh]', p, e);
           }
         }
 
-        if (changed) {
-          ensureSceneNameColumn();        ensureRatingColumns();        await renderScenes();
+        if (hasNewRows || hasUpdates) {
+          ensureSceneNameColumn();
+          ensureRatingColumns();
+          await renderScenes();
           // If a scene dialog is open, its filmstrip is stale after renderScenes
           // rebuilt the scenes array with fresh row objects — re-render it now.
           if (_currentScene) {
@@ -6293,7 +6434,9 @@
             const safeIdx = Math.max(0, Math.min(currentImageIndex, _currentScene.images.length - 1));
             await selectFilmstripImage(safeIdx, _currentScene);
           }
-          setStatus(`Auto-refreshed ${toRefresh.length} newly-analyzed folder(s)`);
+          if (hasNewRows) {
+            setStatus(`Auto-refreshed: new images added from analysis`);
+          }
         }
       } finally {
         _silentRefreshRunning = false;
