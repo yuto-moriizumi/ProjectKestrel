@@ -23,6 +23,7 @@ from .speciesnet_taxonomy import (
     is_ambiguous_generic_taxonomy,
     is_ignored_prediction,
     route_with_classifier_tiebreak,
+    should_skip_confident_no_cv_classifier,
     split_taxonomy,
 )
 
@@ -1021,6 +1022,16 @@ class SpeciesNetSAMHQWrapper:
                 cls_info,
                 wildlife_enabled=wildlife_enabled,
             )
+
+            if should_skip_confident_no_cv_classifier(cls_info, detector_threshold):
+                cutoff = 1.0 - float(detector_threshold)
+                print(
+                    f"[SpeciesNet] det {det_idx}  SKIPPED — top classifier label is"
+                    f" 'no cv result' with score > {cutoff:.2f} (1 − detector threshold)"
+                    f"  (detector conf={conf:.2f})"
+                )
+                continue
+
             if is_ambiguous_generic_taxonomy(pred_raw):
                 bb, bo = bird_vs_wildlife_classifier_scores(cls_info)
                 print(

@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import math
 from typing import Any
 
 from speciesnet.constants import Classification
@@ -83,6 +84,49 @@ def is_no_cv_result(raw: str) -> bool:
     parts_lower = [p.lower() for p in split_taxonomy(s) if p]
     last = parts_lower[-1] if parts_lower else ""
     return last == "no cv result"
+
+
+def should_skip_confident_no_cv_classifier(
+    classifications: dict[str, Any],
+    detector_threshold: float,
+) -> bool:
+    """True when the classifier's **highest-scoring** label is ``no cv result`` with
+    score **strictly greater than** ``(1 - detector_threshold)``.
+
+    MegaDetector can still fire on clutter; if SpeciesNet is very confident the crop
+    is unclassifiable (``no cv result``), we skip SAM and downstream crops. The cutoff
+    tracks the user-facing detection threshold (e.g. threshold 0.25 → ignore when
+    no-cv score > 0.75).
+    """
+    classes = classifications.get("classes") or []
+    scores = classifications.get("scores") or []
+    n = min(len(classes), len(scores))
+    if n <= 0:
+        return False
+    best_i = -1
+    best_sc: float | None = None
+    for i in range(n):
+        try:
+            sc = float(scores[i])
+        except (TypeError, ValueError):
+            continue
+        if not math.isfinite(sc):
+            continue
+        if best_sc is None or sc > best_sc:
+            best_sc = sc
+            best_i = i
+    if best_i < 0 or best_sc is None:
+        return False
+    best_raw = str(classes[best_i])
+    if not is_no_cv_result(best_raw):
+        return False
+    try:
+        dt = float(detector_threshold)
+    except (TypeError, ValueError):
+        dt = 0.25
+    dt = max(0.05, min(0.95, dt))
+    score_floor = 1.0 - dt
+    return best_sc > score_floor
 
 
 def is_bird_taxon(raw: str) -> bool:
