@@ -21,7 +21,9 @@ from . import gpu_providers, is_gpu_active
 from .speciesnet_taxonomy import (
     bird_vs_wildlife_classifier_scores,
     is_ambiguous_generic_taxonomy,
+    is_ignored_prediction,
     route_with_classifier_tiebreak,
+    split_taxonomy,
 )
 
 _DEFAULT_MAX_BIRD_CROPS = 5
@@ -975,11 +977,24 @@ class SpeciesNetSAMHQWrapper:
 
         animal_dets_above_threshold.sort(key=lambda d: float(d.get("conf", 0.0)), reverse=True)
         animal_dets.sort(key=lambda d: float(d.get("conf", 0.0)), reverse=True)
+        below_postprocess = len(animal_dets_above_threshold) - len(animal_dets)
         print(
             f"[SpeciesNet] {os.path.basename(fp)}  animals above threshold: {len(animal_dets_above_threshold)}"
             f"  (threshold={detector_threshold:.2f}, postprocess_threshold={classifier_sam_threshold:.2f},"
             f" postprocess_candidates={len(animal_dets)}, total proposals={len(detections)})"
         )
+        if below_postprocess > 0:
+            skipped_confs = [
+                f"{float(d.get('conf', 0.0)):.2f}"
+                for d in animal_dets_above_threshold
+                if float(d.get("conf", 0.0)) < classifier_sam_threshold
+            ]
+            print(
+                f"[SpeciesNet] {below_postprocess} detection(s) SKIPPED — above"
+                f" detector threshold ({detector_threshold:.2f}) but below"
+                f" classifier threshold ({classifier_sam_threshold:.2f}):"
+                f" conf={', '.join(skipped_confs)}"
+            )
 
         bird_rows: list[dict[str, Any]] = []
         wildlife_rows: list[dict[str, Any]] = []
@@ -1038,6 +1053,17 @@ class SpeciesNetSAMHQWrapper:
                 )
 
             if route == "ignore" or pred_label is None:
+                reason = "taxonomy routed to ignore"
+                if is_ignored_prediction(pred_raw):
+                    parts = [p.lower() for p in split_taxonomy(pred_raw) if p]
+                    last = parts[-1] if parts else pred_raw
+                    reason = f"ignored class: {last}"
+                elif not wildlife_enabled:
+                    reason = "non-bird wildlife disabled"
+                print(
+                    f"[SpeciesNet] det {det_idx}  SKIPPED — {reason}"
+                    f"  (conf={conf:.2f}, pred={pred_raw!r})"
+                )
                 continue
 
             x1, y1, x2, y2 = _md_bbox_to_pixel_box(md_bbox, w, h)
@@ -1064,6 +1090,16 @@ class SpeciesNetSAMHQWrapper:
             else:
                 wildlife_rows.append(row)
 
+        if len(bird_rows) > self.max_bird_crops:
+            print(
+                f"[SpeciesNet] crop limit: keeping {self.max_bird_crops} of"
+                f" {len(bird_rows)} bird detections"
+            )
+        if len(wildlife_rows) > self.max_bird_crops:
+            print(
+                f"[SpeciesNet] crop limit: keeping {self.max_bird_crops} of"
+                f" {len(wildlife_rows)} wildlife detections"
+            )
         bird_rows = bird_rows[: self.max_bird_crops]
         wildlife_rows = wildlife_rows[: self.max_bird_crops]
 
@@ -1078,7 +1114,8 @@ class SpeciesNetSAMHQWrapper:
         overlap_rank_scores = [r["detector_confidence"] for r in combined]
 
         masks_arr = np.stack(masks_list, axis=0)
-        return filter_overlapping_detections(
+        pre_overlap_count = len(combined)
+        result = filter_overlapping_detections(
             masks_arr,
             pred_boxes,
             pred_class,
@@ -1087,6 +1124,14 @@ class SpeciesNetSAMHQWrapper:
             heavy_overlap_containment=_HEAVY_OVERLAP_CONTAINMENT,
             overlap_rank_scores=overlap_rank_scores,
         )
+        post_overlap_count = len(result[2]) if result[2] is not None else 0
+        if post_overlap_count < pre_overlap_count:
+            print(
+                f"[SpeciesNet] overlap filter: removed {pre_overlap_count - post_overlap_count}"
+                f" of {pre_overlap_count} detections (IoU>={_HEAVY_OVERLAP_IOU}"
+                f" or containment>={_HEAVY_OVERLAP_CONTAINMENT})"
+            )
+        return result
 
     # --- Geometry (aligned with MaskRCNNWrapper) for square crops and species bbox ---
 

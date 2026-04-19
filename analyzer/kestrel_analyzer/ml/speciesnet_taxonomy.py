@@ -51,7 +51,12 @@ def wildlife_display_name(raw: str) -> str:
 
 
 def is_ignored_prediction(raw: str) -> bool:
-    """blank, vehicle, human, no cv result — skip for downstream processing."""
+    """blank, vehicle, human — skip for downstream processing.
+
+    "no cv result" is intentionally NOT ignored: SpeciesNet could not classify
+    the detection, but MegaDetector still found an animal. These are routed as
+    wildlife with an "Unknown" label so the user sees the crop.
+    """
     if not raw or not str(raw).strip():
         return True
     s = str(raw).strip()
@@ -61,13 +66,23 @@ def is_ignored_prediction(raw: str) -> bool:
         return True
     if s == _SPECIESNET_HUMAN:
         return True
+    parts_lower = [p.lower() for p in split_taxonomy(s) if p]
+    last = parts_lower[-1] if parts_lower else ""
+    if last in ("blank", "vehicle", "human"):
+        return True
+    return False
+
+
+def is_no_cv_result(raw: str) -> bool:
+    """True when SpeciesNet returned 'no cv result' — detected animal, unclassifiable."""
+    if not raw or not str(raw).strip():
+        return False
+    s = str(raw).strip()
     if s == Classification.UNKNOWN.value:
         return True
     parts_lower = [p.lower() for p in split_taxonomy(s) if p]
     last = parts_lower[-1] if parts_lower else ""
-    if last in ("blank", "vehicle", "human", "no cv result"):
-        return True
-    return False
+    return last == "no cv result"
 
 
 def is_bird_taxon(raw: str) -> bool:
@@ -90,6 +105,10 @@ def route_prediction(
         return "ignore", None
     if is_bird_taxon(raw_prediction):
         return "bird", "bird"
+    # "no cv result" — MegaDetector found an animal but SpeciesNet could not
+    # classify it.  Route as wildlife so the crop is still saved.
+    if is_no_cv_result(raw_prediction):
+        return "wildlife", "Unknown"
     if not wildlife_enabled:
         return "ignore", None
     return "wildlife", wildlife_display_name(raw_prediction)
@@ -127,6 +146,8 @@ def is_ambiguous_generic_taxonomy(raw_prediction: str) -> bool:
         return True
     s = str(raw_prediction).strip()
     if s == Classification.ANIMAL.value or s == Classification.UNKNOWN.value:
+        return True
+    if is_no_cv_result(s):
         return True
     last = wildlife_display_name(s).lower()
     return last == "animal"
