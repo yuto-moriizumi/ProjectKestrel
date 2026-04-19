@@ -31,8 +31,14 @@ def parse_args():
     parser.add_argument(
         "--detection-threshold",
         type=float,
-        default=0.75,
-        help="Minimum detection confidence threshold (0.10-0.99).",
+        default=0.25,
+        help="Minimum detection confidence threshold (0.10-0.99); matches desktop default.",
+    )
+    parser.add_argument(
+        "--parallel-prefetch",
+        type=int,
+        default=3,
+        help="Parallel RAW decode workers (1-5); matches desktop 'parallel prefetch' setting.",
     )
     parser.add_argument(
         "--smoke",
@@ -68,6 +74,7 @@ def main():
     try:
         args = parse_args()
         detection_threshold = max(0.10, min(0.99, float(args.detection_threshold)))
+        parallel_pf = max(1, min(5, int(float(args.parallel_prefetch))))
         log_path = get_log_path(args.folder)
         if args.smoke:
             log_event(
@@ -115,6 +122,7 @@ def main():
                 "use_gpu": args.use_gpu,
                 "detector_name": args.detector_name,
                 "detection_threshold": detection_threshold,
+                "parallel_prefetch": parallel_pf,
             },
         )
 
@@ -126,6 +134,7 @@ def main():
             },
             analyzer_name="cli",
             detection_threshold=detection_threshold,
+            parallel_prefetch=parallel_pf,
         )
         print()
     except Exception as e:

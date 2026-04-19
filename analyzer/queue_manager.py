@@ -629,6 +629,7 @@ class QueueManager:
                     scene_time_threshold=self._scene_time_threshold,
                     mask_threshold=self._mask_threshold,
                     max_bird_crops=self._max_bird_crops,
+                    parallel_prefetch=self._parallel_prefetch,
                 )
                 with self._lock:
                     if self._cancel_event.is_set():

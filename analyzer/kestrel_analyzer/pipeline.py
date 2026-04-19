@@ -118,9 +118,8 @@ class AnalysisPipeline:
             return "landscape"
         return "square"
 
-    # Number of parallel RAW decode threads.  3 keeps 3 files decoding concurrently
-    # while the main analysis thread runs inference; raises total CPU + RAM modestly.
-    _N_DECODE_WORKERS: int = 3
+    # Default parallel RAW decode workers when caller omits parallel_prefetch (matches settings default).
+    _DEFAULT_DECODE_WORKERS: int = 3
 
     def _decode_image(self, image_path: str, raw_file: str) -> dict:
         """Decode one image.  Safe to call from a worker thread.
@@ -279,10 +278,11 @@ class AnalysisPipeline:
         callbacks: Optional[Dict[str, Callable]] = None,
         analyzer_name: str = "pipeline",
         wildlife_enabled: bool = True,
-        detection_threshold: float = 0.75,
+        detection_threshold: float = 0.25,
         scene_time_threshold: float = 1.0,
         mask_threshold: float = 0.5,
         max_bird_crops: int = 5,
+        parallel_prefetch: int = 3,
     ) -> None:
         callbacks = callbacks or {}
         status_cb = callbacks.get("on_status")
@@ -300,6 +300,12 @@ class AnalysisPipeline:
         except (TypeError, ValueError):
             max_bird_crops = 5
         max_bird_crops = max(1, min(20, max_bird_crops))
+
+        try:
+            decode_workers = int(parallel_prefetch)
+        except (TypeError, ValueError):
+            decode_workers = self._DEFAULT_DECODE_WORKERS
+        decode_workers = max(1, min(5, decode_workers))
 
         rating_thresholds = None
         exposure_quality = "balanced"
@@ -374,6 +380,7 @@ class AnalysisPipeline:
                     "file_count": len(files),
                     "detector_name": self.detector_name,
                     "detection_threshold": float(detection_threshold),
+                    "parallel_prefetch": int(decode_workers),
                 },
             )
 
@@ -421,7 +428,7 @@ class AnalysisPipeline:
             scene_count = database["scene_count"].max() if not database.empty else 0
 
             for idx, decoded in enumerate(
-                self._iter_decoded(new_files, folder, max_workers=self._N_DECODE_WORKERS),
+                self._iter_decoded(new_files, folder, max_workers=decode_workers),
                 start=1,
             ):
                 raw_file = decoded["file_name"]

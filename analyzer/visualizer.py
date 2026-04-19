@@ -8,12 +8,12 @@ Features:
  - Intended to be frozen into a single executable with PyInstaller.
 
 Usage (development):
-    python visualizer/visualizer.py --port 8765 --root C:/Photos/Trip
+    python analyzer/visualizer.py --port 8765 --root C:/Photos/Trip
 
 After starting it will open the desktop UI (pywebview) at http://127.0.0.1:<port>/ .
 
 Build single-file EXE (example):
-    pyinstaller --onefile --name kestrel_viz visualizer/visualizer.py
+    pyinstaller --onefile --name kestrel_viz analyzer/visualizer.py
 
 Optionally set env vars (same as editor_bridge):
         KESTREL_ALLOWED_ROOT=C:/Photos/Trip  (restrict paths)

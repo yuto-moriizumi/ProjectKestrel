@@ -18,7 +18,7 @@ TODO:
 * Review speciesnet model; look at NO CV RESULT and change it to not be ignored. also print the reasons that any particuar bounding box is ignored; there are some images that say there are 1-3 animals above confidence threshold but none of them are evaluated any further. [DONE]
 * Scrutinize database overwrites that are potentially leading to inconsistent behavior while analysis is still in progress getting rid of manually inputted data [DONE]
 * Upgrade to enable experimental wildlife detection by default + Test
-* Remove additional model weights from Git repo + verify LFS assets
+* Remove additional model weights from Git repo + verify LFS assets [DONE]
 * Add ability to change which XML fields are written (ex. exclude ratings, labels).
 * Upgrade terms of service version retrieval to prompt updated terms warnings + Clarify file and folder names may be sent with crash reports that are automatic and non-opt-out.
 * Upgrade Kestrel Telemetry/Required Usage Data Collection
