@@ -174,6 +174,7 @@ class QueueManager:
         self._mask_threshold = 0.5
         self._max_bird_crops = 10
         self._parallel_prefetch = 3
+        self._exposure_corrected_thumbs = False
 
     def _collect_restore_paths_locked(self) -> list:
         restore_statuses = {'pending', 'running', 'cancelled'}
@@ -203,6 +204,7 @@ class QueueManager:
                 'mask_threshold': float(self._mask_threshold),
                 'max_bird_crops': int(self._max_bird_crops),
                 'parallel_prefetch': int(self._parallel_prefetch),
+                'exposure_corrected_thumbs': bool(self._exposure_corrected_thumbs),
             },
             'items': [
                 {
@@ -296,6 +298,7 @@ class QueueManager:
             mask_threshold=_safe_float(options.get('mask_threshold', 0.5), 0.5),
             max_bird_crops=_safe_int(options.get('max_bird_crops', 10), 10),
             parallel_prefetch=_safe_int(options.get('parallel_prefetch', 3), 3, min_value=1, max_value=5),
+            exposure_corrected_thumbs=bool(options.get('exposure_corrected_thumbs', False)),
         )
         if result.get('success'):
             result['restored'] = len(restore_paths)
@@ -344,6 +347,7 @@ class QueueManager:
         mask_threshold: float = 0.5,
         max_bird_crops: int = 10,
         parallel_prefetch: int = 3,
+        exposure_corrected_thumbs: bool = False,
     ) -> dict:
         if not _PIPELINE_AVAILABLE:
             return {'success': False, 'error': f'Analyzer unavailable: {_pipeline_import_error}'}
@@ -397,6 +401,7 @@ class QueueManager:
             except (TypeError, ValueError):
                 parallel_prefetch_num = 3
             self._parallel_prefetch = max(1, min(5, parallel_prefetch_num))
+            self._exposure_corrected_thumbs = bool(exposure_corrected_thumbs)
             self._thread = threading.Thread(target=self._run, daemon=True, name='kestrel-queue')
             self._thread.start()
         self._persist_recovery_state()
@@ -629,6 +634,7 @@ class QueueManager:
                     scene_time_threshold=self._scene_time_threshold,
                     mask_threshold=self._mask_threshold,
                     max_bird_crops=self._max_bird_crops,
+                    exposure_corrected_thumbs=self._exposure_corrected_thumbs,
                 )
                 with self._lock:
                     if self._cancel_event.is_set():

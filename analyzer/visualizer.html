@@ -616,6 +616,15 @@
               style="width:80px" title="Number of images to read ahead in parallel (1–5)" />
           </div>
           <div class="muted" style="font-size:11px;margin-top:-2px">Number of images to read ahead to sustain the processing queue (1–5). Lower this if your computer slows down too much during analysis.</div>
+
+          <div class="adlg-setting-row" style="margin-top:6px">
+            <label for="adlgExposureCorrectedThumbs" style="flex:1">Exposure-corrected thumbnails</label>
+            <label class="inline" style="gap:6px">
+              <input type="checkbox" id="adlgExposureCorrectedThumbs" />
+              <span class="muted">Enable</span>
+            </label>
+          </div>
+          <div class="muted" style="font-size:11px;margin-top:-2px">Apply bird exposure correction to the full-image thumbnail. Produces more accurate previews for RAW files but increases memory usage during analysis.</div>
         </div>
       </details>
       <div class="analyze-dlg-footer">

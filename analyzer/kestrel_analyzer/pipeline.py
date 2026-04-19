@@ -37,6 +37,7 @@ from .exposure_compensation import (
     compose_total_stops as ec_compose_total_stops,
     compute_stops_numpy_solver,
     apply_exposure_crop_numpy,
+    linear_to_srgb_u8,
 )
 from .image_utils import read_image, read_image_for_pipeline
 from .ratings import quality_to_rating, get_profile_thresholds
@@ -283,6 +284,7 @@ class AnalysisPipeline:
         scene_time_threshold: float = 1.0,
         mask_threshold: float = 0.5,
         max_bird_crops: int = 5,
+        exposure_corrected_thumbs: bool = False,
     ) -> None:
         callbacks = callbacks or {}
         status_cb = callbacks.get("on_status")
@@ -854,6 +856,26 @@ class AnalysisPipeline:
                             }
                         )
                         crop_items_for_write = crop_data
+                        # Re-render the export thumbnail with the primary bird's
+                        # exposure correction applied, if the user opted in.
+                        if exposure_corrected_thumbs and noauto_linear is not None:
+                            try:
+                                total_stops = float(primary_row.get("exposure_correction", 0.0))
+                                if abs(total_stops) > 0.01:
+                                    total_scale = 2.0 ** total_stops
+                                    corrected_full = np.clip(
+                                        noauto_linear * float(total_scale), 0.0, 1.0
+                                    )
+                                    corrected_u8 = linear_to_srgb_u8(corrected_full)
+                                    thumb_h = int(1200 * corrected_u8.shape[0] / corrected_u8.shape[1])
+                                    img_small = cv2.resize(corrected_u8, (1200, thumb_h))
+                                    cv2.imwrite(
+                                        export_path,
+                                        cv2.cvtColor(img_small, cv2.COLOR_RGB2BGR),
+                                    )
+                                    del corrected_full, corrected_u8
+                            except Exception:
+                                pass  # fall back to the already-saved metered export
                         # Release full-res buffers now that all crops are extracted as
                         # self-contained uint8 arrays.  img_h/img_w are already scalars;
                         # img_small is a separate 1200px array and is unaffected.

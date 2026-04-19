@@ -1443,13 +1443,15 @@ class Api:
             except (TypeError, ValueError):
                 parallel_prefetch = 3
             parallel_prefetch = max(1, min(5, parallel_prefetch))
+            exposure_corrected_thumbs = bool(sett.get('exposure_corrected_thumbs', False))
             return _queue_manager.enqueue(validated_paths, use_gpu=bool(use_gpu),
                                           wildlife_enabled=bool(wildlife_enabled),
                                           detection_threshold=detection_threshold,
                                           scene_time_threshold=scene_time_threshold,
                                           mask_threshold=mask_threshold,
                                           max_bird_crops=max_bird_crops,
-                                          parallel_prefetch=parallel_prefetch)
+                                          parallel_prefetch=parallel_prefetch,
+                                          exposure_corrected_thumbs=exposure_corrected_thumbs)
         except Exception as e:
             print(f'[API] start_analysis_queue() -> Error: {e}', flush=True)
             return {'success': False, 'error': str(e)}

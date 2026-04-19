@@ -220,6 +220,7 @@ def _sanitize_queue_recovery_state(value: Any) -> dict | None:
         'mask_threshold': _coerce_float(opts.get('mask_threshold', 0.5), 0.5, min_value=0.5, max_value=0.95),
         'max_bird_crops': _coerce_int(opts.get('max_bird_crops', 10), 10, min_value=1, max_value=20),
         'parallel_prefetch': _coerce_int(opts.get('parallel_prefetch', 3), 3, min_value=1, max_value=5),
+        'exposure_corrected_thumbs': _coerce_bool(opts.get('exposure_corrected_thumbs', False), default=False),
     }
 
     items_out: list[dict[str, Any]] = []
@@ -294,6 +295,7 @@ def _sanitize_settings_payload(data: dict, emit_log: bool = False) -> dict:
     _set_float('mask_threshold', default=0.5, min_value=0.5, max_value=0.95, digits=4)
     _set_int('max_bird_crops', default=10, min_value=1, max_value=20)
     _set_int('parallel_prefetch', default=3, min_value=1, max_value=5)
+    _set_bool('exposure_corrected_thumbs', default=False)
 
     if 'exposure_quality' in data:
         out['exposure_quality'] = _coerce_enum(

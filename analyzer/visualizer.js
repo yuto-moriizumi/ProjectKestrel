@@ -5394,6 +5394,8 @@
       if (_adlgSt) _adlgSt.value = getSetting('scene_time_threshold', 1.0);
       const _adlgPp = document.getElementById('adlgParallelPrefetch');
       if (_adlgPp) _adlgPp.value = getSetting('parallel_prefetch', 3);
+      const _adlgEct = document.getElementById('adlgExposureCorrectedThumbs');
+      if (_adlgEct) _adlgEct.checked = !!getSetting('exposure_corrected_thumbs', false);
 
       const treeEl = document.getElementById('analyzeDlgTree');
       treeEl.innerHTML = '';
@@ -7185,12 +7187,14 @@
           const stVal = Math.max(0, parseFloat(document.getElementById('adlgSceneTime')?.value) || 1.0);
           const ppRaw = parseInt(document.getElementById('adlgParallelPrefetch')?.value, 10);
           const ppVal = Math.max(1, Math.min(5, Number.isFinite(ppRaw) ? ppRaw : 3));
+          const ectVal = !!document.getElementById('adlgExposureCorrectedThumbs')?.checked;
           const adlgSettings = loadSettings();
           adlgSettings.detection_threshold = dtVal;
           adlgSettings.max_bird_crops = mbcVal;
           adlgSettings.exposure_quality = eqVal;
           adlgSettings.scene_time_threshold = stVal;
           adlgSettings.parallel_prefetch = ppVal;
+          adlgSettings.exposure_corrected_thumbs = ectVal;
           saveSettings(adlgSettings);
           if (hasPywebviewApi && window.pywebview?.api?.save_settings_data) {
             try { await window.pywebview.api.save_settings_data(adlgSettings); } catch (_) { }
