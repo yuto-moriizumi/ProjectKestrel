@@ -3,9 +3,16 @@
 from __future__ import annotations
 
 import json
+import math
 import os
 import sys
 from typing import Any
+
+# Forward-compatible / unknown keys (e.g. tutorial flags from newer builds) — size limits only.
+_PASSTHROUGH_MAX_STR = 16384
+_PASSTHROUGH_MAX_LIST_LEN = 512
+_PASSTHROUGH_MAX_DICT_KEYS = 256
+_PASSTHROUGH_MAX_DEPTH = 8
 
 SETTINGS_FILENAME = 'settings.json'
 _MAX_PATH_CHARS = 4096
@@ -249,6 +256,68 @@ def _sanitize_queue_recovery_state(value: Any) -> dict | None:
     return state
 
 
+def _passthrough_setting_value(value: Any, depth: int = 0) -> Any | None:
+    """Copy a JSON-like value for persisting unknown settings keys.
+
+    Only bool, None, numbers, strings, lists, and dicts are allowed (same as JSON).
+    Used so newer app versions can add keys without updating this module, and older
+    builds preserve them on load/save instead of dropping them as 'unsupported'.
+    """
+    if depth > _PASSTHROUGH_MAX_DEPTH:
+        return None
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        if abs(value) > 9_007_199_254_740_991:  # practical JS-safe integer range
+            return None
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return None
+        return value
+    if isinstance(value, str):
+        if len(value) > _PASSTHROUGH_MAX_STR:
+            return value[:_PASSTHROUGH_MAX_STR]
+        return value
+    if isinstance(value, list):
+        out: list[Any] = []
+        for item in value[:_PASSTHROUGH_MAX_LIST_LEN]:
+            pv = _passthrough_setting_value(item, depth + 1)
+            if pv is not None:
+                out.append(pv)
+        return out
+    if isinstance(value, dict):
+        out_d: dict[str, Any] = {}
+        for i, (k, v) in enumerate(value.items()):
+            if i >= _PASSTHROUGH_MAX_DICT_KEYS:
+                break
+            if not isinstance(k, str):
+                continue
+            ks = k[:256] if len(k) > 256 else k
+            pv = _passthrough_setting_value(v, depth + 1)
+            if pv is not None:
+                out_d[ks] = pv
+        return out_d
+    return None
+
+
+def _merge_forward_compatible_keys(out: dict[str, Any], data: dict, emit_log: bool) -> None:
+    """Attach unknown keys from *data* onto *out* (keys not already set by core sanitization)."""
+    skipped: list[str] = []
+    for k, v in data.items():
+        if k in out:
+            continue
+        pv = _passthrough_setting_value(v)
+        if pv is not None:
+            out[k] = pv
+        else:
+            skipped.append(k)
+    if emit_log and skipped:
+        sample = ', '.join(skipped[:12])
+        suffix = ' ...' if len(skipped) > 12 else ''
+        log(f'[settings] Could not preserve {len(skipped)} key(s) (unsupported type): {sample}{suffix}')
+
+
 def _sanitize_settings_payload(data: dict, emit_log: bool = False) -> dict:
     if not isinstance(data, dict):
         return {}
@@ -372,11 +441,16 @@ def _sanitize_settings_payload(data: dict, emit_log: bool = False) -> dict:
 
 
 def load_persisted_settings() -> dict:
+    """Load ``settings.json`` from the user data directory.
+
+    Core keys are validated/coerced; any additional keys present in the file are
+    preserved when JSON-safe (forward compatibility across app versions).
+    """
     path = _get_settings_path()
     try:
         with open(path, 'r', encoding='utf-8') as f:
             data = json.load(f)
-            return _sanitize_settings_payload(data) if isinstance(data, dict) else {}
+            return _sanitize_settings_payload(data, emit_log=False) if isinstance(data, dict) else {}
     except FileNotFoundError:
         return {}
     except Exception:
@@ -386,6 +460,8 @@ def load_persisted_settings() -> dict:
 def save_persisted_settings(data: dict) -> None:
     if not isinstance(data, dict):
         raise ValueError('Settings payload must be an object')
+    # Re-sanitize while preserving forward-compatible keys so merges from the UI
+    # cannot strip unknown keys that were loaded from disk.
     data = _sanitize_settings_payload(data, emit_log=True)
         
     # --- Flush pending analytics on consent ---

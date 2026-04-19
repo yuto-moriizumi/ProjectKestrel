@@ -22,11 +22,16 @@ TODO:
 * Add ability to change which XML fields are written (ex. exclude ratings, labels).
 * Upgrade terms of service version retrieval to prompt updated terms warnings + Clarify file and folder names may be sent with crash reports that are automatic and non-opt-out.
 * Upgrade Kestrel Telemetry/Required Usage Data Collection
-* Improve exposure compensation algorithm to fix dark birds against bright backlit sky edge case.
+* Improve exposure compensation algorithm to fix dark birds against bright backlit sky edge case. [DONE]
+* Upgrade tutorial workflow: Simple and advanced version. Potentially also inform the user how they can integrate Kestrel into their workflows.
+* Remove "Unknown" from becoming a dedicated species label.
+* Website: Add sign-up list for cloud analysis or beta testing.
+
+
 
 
 TESTING:
-* Continue to test pipeline v2 and performance with wildlife detections enabled.
+* Continue to test pipeline v2 and performance with wildlife detections enabled. - check detection sensitivity thresholds, exposure compensation performance, and overall performance.
 * Test whether recent metering/camera-white-balance changes have fixed reported errors from Reddit users.
 
 DEFERRED TODO:
