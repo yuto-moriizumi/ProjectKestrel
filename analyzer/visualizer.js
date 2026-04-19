@@ -2765,6 +2765,8 @@
 
       if (approved) {
         html += '<span class="scene-tag-sep"></span><span class="approval-note" style="font-size:11px">✓ Reviewed</span>';
+      } else {
+        html += '<span class="scene-tag-sep"></span><button class="mark-reviewed-btn" id="markReviewedBtn" title="Confirm that Kestrel\'s tags are correct and mark this scene as reviewed">✓ Mark as Reviewed</button>';
       }
 
       tagsEl.innerHTML = html;
@@ -2846,6 +2848,22 @@
           renderScenes();
         };
       });
+
+      // Wire "Mark as Reviewed" button
+      const markReviewedBtn = tagsEl.querySelector('#markReviewedBtn');
+      if (markReviewedBtn) {
+        markReviewedBtn.onclick = () => {
+          _beginSceneEditDraft(scene.id);
+          _sceneEditMode = true;
+          _finalizeSceneReview(scene.id);
+          _sceneEditMode = false;
+          _sceneEditDraft = null;
+          const updatedScene = reloadScene(scene.id) || scene;
+          renderTopbarTags(updatedScene);
+          renderScenes();
+          showToast('Scene tags marked as reviewed', 2000);
+        };
+      }
 
       // Wire inline input
       const inp = el('#inlineTagInput');

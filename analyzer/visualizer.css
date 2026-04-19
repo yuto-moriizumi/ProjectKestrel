@@ -574,6 +574,23 @@
       font-weight: 600;
     }
 
+    .mark-reviewed-btn {
+      cursor: pointer;
+      background: rgba(245, 197, 66, 0.08);
+      border: 1px solid rgba(245, 197, 66, 0.3);
+      color: #f7dda0;
+      font-size: 11px;
+      font-weight: 600;
+      padding: 2px 10px;
+      border-radius: 12px;
+      white-space: nowrap;
+      line-height: 1.4;
+    }
+    .mark-reviewed-btn:hover {
+      background: rgba(245, 197, 66, 0.18);
+      border-color: rgba(245, 197, 66, 0.5);
+    }
+
     /* Improve chip rendering & truncation */
     .chip {
       display: inline-flex;
