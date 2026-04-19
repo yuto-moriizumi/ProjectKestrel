@@ -3,6 +3,8 @@ import csv
 import cv2
 import numpy as np
 
+from . import gpu_providers
+
 
 class QualityClassifier:
     def __init__(
@@ -14,11 +16,7 @@ class QualityClassifier:
     ):
         import onnxruntime as ort
 
-        providers = (
-            ["DmlExecutionProvider", "CPUExecutionProvider"]
-            if use_gpu
-            else ["CPUExecutionProvider"]
-        )
+        providers = gpu_providers() if use_gpu else ["CPUExecutionProvider"]
         try:
             self.session = ort.InferenceSession(model_path, providers=providers)
         except Exception as e:

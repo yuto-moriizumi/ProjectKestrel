@@ -4515,6 +4515,7 @@
     let _treeFlatOrder = [];           // flat ordered list of visible tree paths for range-select
     let _appVersion = '';              // current app version, fetched once
     let _isFrozenApp = false;          // whether running as frozen (PyInstaller) build
+    let _appPlatform = 'windows';      // 'windows' | 'macos' | 'linux'
 
     async function scanFolderTree(rootPath) {
       if (!hasPywebviewApi || !window.pywebview?.api?.list_subfolders) return false;
@@ -4532,6 +4533,12 @@
         try {
           const fr = await window.pywebview.api.is_frozen_app();
           _isFrozenApp = !!(fr && fr.frozen);
+        } catch (e) { /* ignore */ }
+      }
+      // Fetch platform once
+      if (_appPlatform === 'windows') {
+        try {
+          _appPlatform = await getPlatformInfo();
         } catch (e) { /* ignore */ }
       }
 
@@ -5347,11 +5354,14 @@
         await scanFolderTree(fp);
         if (!folderTreeRootNode) return;
       }
-      // Hide GPU checkbox in frozen (PyInstaller) builds — GPU not supported there
+      // GPU checkbox: hide on Windows frozen builds (DirectML requires separate
+      // onnxruntime-directml package not bundled); show on macOS frozen builds
+      // where CoreML is included in the standard onnxruntime package.
       const gpuLabel = document.getElementById('analyzeGpuLabel');
+      const hideGpu = _isFrozenApp && _appPlatform !== 'macos';
       if (gpuLabel) {
-        gpuLabel.style.display = _isFrozenApp ? 'none' : '';
-        if (_isFrozenApp) {
+        gpuLabel.style.display = hideGpu ? 'none' : '';
+        if (hideGpu) {
           const gpuCb = document.getElementById('analyzeUseGpu');
           if (gpuCb) gpuCb.checked = false;
         }

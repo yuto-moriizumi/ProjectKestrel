@@ -4,6 +4,7 @@ import numpy as np
 import pandas as pd
 
 from ..config import MODELS_DIR
+from . import gpu_providers
 
 
 class BirdSpeciesClassifier:
@@ -17,7 +18,7 @@ class BirdSpeciesClassifier:
             ) from e
         with open(labels_path, "r") as f:
             self.labels = np.array([l.strip() for l in f.readlines()])
-        providers = ["DmlExecutionProvider", "CPUExecutionProvider"] if use_gpu else ["CPUExecutionProvider"]
+        providers = gpu_providers() if use_gpu else ["CPUExecutionProvider"]
         try:
             self.session = ort.InferenceSession(model_path, providers=providers)
         except Exception as e:

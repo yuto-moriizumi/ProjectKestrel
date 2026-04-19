@@ -20,7 +20,7 @@ def parse_args():
     detector_choices = sorted(DETECTOR_ONNX_PATHS.keys())
     parser = argparse.ArgumentParser(description="Kestrel Analyzer CLI")
     parser.add_argument("folder", help="Folder with RAW/JPEG images")
-    parser.add_argument("--gpu", dest="use_gpu", action="store_true", help="Use GPU (DirectML) for ONNX")
+    parser.add_argument("--gpu", dest="use_gpu", action="store_true", help="Use GPU (DirectML on Windows, CoreML on macOS) for ONNX")
     parser.add_argument("--no-gpu", dest="use_gpu", action="store_false", help="Force CPU for ONNX")
     parser.add_argument(
         "--detector-name",

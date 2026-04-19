@@ -17,6 +17,7 @@ from ..config import (
     SAM_ENC_ONNX_PATH,
     SPECIESNET_MODEL_DIR,
 )
+from . import gpu_providers, is_gpu_active
 from .speciesnet_taxonomy import (
     bird_vs_wildlife_classifier_scores,
     is_ambiguous_generic_taxonomy,
@@ -213,11 +214,7 @@ class OnnxClassifier:
     def __init__(self, onnx_path: Path, labels_path: Path, use_gpu: bool = False):
         import onnxruntime as ort
 
-        providers = (
-            ["DmlExecutionProvider", "CPUExecutionProvider"]
-            if use_gpu
-            else ["CPUExecutionProvider"]
-        )
+        providers = gpu_providers() if use_gpu else ["CPUExecutionProvider"]
         self._session = ort.InferenceSession(str(onnx_path), providers=providers)
         self.providers_used = self._session.get_providers()
         with open(labels_path) as f:
@@ -298,14 +295,10 @@ class OnnxMDv6Detector:
                 "Place mdv6-apa-rtdetr-c.onnx (and mdv6-apa-rtdetr-c.onnx.data) "
                 "under models/speciesnet/."
             )
-        providers = (
-            ["DmlExecutionProvider", "CPUExecutionProvider"]
-            if use_gpu
-            else ["CPUExecutionProvider"]
-        )
+        providers = gpu_providers() if use_gpu else ["CPUExecutionProvider"]
         self._session = ort.InferenceSession(str(onnx_path), providers=providers)
         _provs = self._session.get_providers()
-        self.device = "ONNX/GPU" if "DmlExecutionProvider" in _provs else "ONNX/CPU"
+        self.device = "ONNX/GPU" if is_gpu_active(_provs) else "ONNX/CPU"
         print(f"[OnnxMDv6Detector] Loaded {onnx_path.name}  providers={_provs}")
 
     def preprocess(self, img_pil: "Image.Image") -> tuple:
@@ -374,14 +367,10 @@ class OnnxMDv5Detector:
                 f"MDv5a weights not found: {onnx_path}\n"
                 "Place mdv5a.onnx (and mdv5a.onnx.data) under models/speciesnet/."
             )
-        providers = (
-            ["DmlExecutionProvider", "CPUExecutionProvider"]
-            if use_gpu
-            else ["CPUExecutionProvider"]
-        )
+        providers = gpu_providers() if use_gpu else ["CPUExecutionProvider"]
         self._session = ort.InferenceSession(str(onnx_path), providers=providers)
         _provs = self._session.get_providers()
-        self.device = "ONNX/GPU" if "DmlExecutionProvider" in _provs else "ONNX/CPU"
+        self.device = "ONNX/GPU" if is_gpu_active(_provs) else "ONNX/CPU"
         print(f"[OnnxMDv5Detector] Loaded {onnx_path.name}  providers={_provs}")
 
     def preprocess(self, img_pil: "Image.Image") -> tuple:
@@ -546,11 +535,7 @@ class OnnxMDv6MitYoloV9Detector:
                 "Place mdv6-mit-yolov9-*.onnx (and .onnx.data) under models/speciesnet/."
             )
 
-        providers = (
-            ["DmlExecutionProvider", "CPUExecutionProvider"]
-            if use_gpu
-            else ["CPUExecutionProvider"]
-        )
+        providers = gpu_providers() if use_gpu else ["CPUExecutionProvider"]
         self._session = ort.InferenceSession(str(onnx_path), providers=providers)
 
         inputs = self._session.get_inputs()
@@ -572,7 +557,7 @@ class OnnxMDv6MitYoloV9Detector:
         )
 
         _provs = self._session.get_providers()
-        self.device = "ONNX/GPU" if "DmlExecutionProvider" in _provs else "ONNX/CPU"
+        self.device = "ONNX/GPU" if is_gpu_active(_provs) else "ONNX/CPU"
         print(
             f"[OnnxMDv6MitYoloV9Detector] Loaded {onnx_path.name}  providers={_provs}"
             f"  inputs=({self._images_input_name}, {self._rev_input_name})"
@@ -752,15 +737,11 @@ class OnnxSamPredictor:
     def __init__(self, enc_path: Path, dec_path: Path, use_gpu: bool = False) -> None:
         import onnxruntime as ort
 
-        providers = (
-            ["DmlExecutionProvider", "CPUExecutionProvider"]
-            if use_gpu
-            else ["CPUExecutionProvider"]
-        )
+        providers = gpu_providers() if use_gpu else ["CPUExecutionProvider"]
         self._enc_session = ort.InferenceSession(str(enc_path), providers=providers)
         self._dec_session = ort.InferenceSession(str(dec_path), providers=providers)
         _provs = self._enc_session.get_providers()
-        self.device = "ONNX/GPU" if "DmlExecutionProvider" in _provs else "ONNX/CPU"
+        self.device = "ONNX/GPU" if is_gpu_active(_provs) else "ONNX/CPU"
         print(f"[OnnxSamPredictor] Loaded encoder+decoder  providers={_provs}")
 
     @staticmethod
@@ -903,8 +884,8 @@ class SpeciesNetSAMHQWrapper:
                 f"SAM-HQ decoder ONNX not found at: {SAM_DEC_ONNX_PATH}\n"
                 "Place sam_hq_vit_tiny_decoder.onnx under models/speciesnet/."
             )
-        # Prefer SAM-HQ on DirectML when GPU is enabled; fallback to CPU only if
-        # DML session initialization fails in the local runtime environment.
+        # Prefer SAM-HQ on GPU (DirectML on Windows, CoreML on macOS) when enabled;
+        # fallback to CPU only if GPU session initialization fails.
         try:
             self.predictor = OnnxSamPredictor(
                 SAM_ENC_ONNX_PATH,
@@ -914,7 +895,7 @@ class SpeciesNetSAMHQWrapper:
         except Exception as e:
             if not self.use_gpu:
                 raise
-            print(f"[SpeciesNetSAMHQ] SAM-HQ DML init failed, falling back to CPU: {e}")
+            print(f"[SpeciesNetSAMHQ] SAM-HQ GPU init failed, falling back to CPU: {e}")
             self.predictor = OnnxSamPredictor(
                 SAM_ENC_ONNX_PATH,
                 SAM_DEC_ONNX_PATH,

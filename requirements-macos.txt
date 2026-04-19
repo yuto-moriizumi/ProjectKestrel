@@ -2,6 +2,8 @@
 torch==2.11.0
 torchvision==0.26.0
 tensorflow
+# onnxruntime on macOS includes CoreMLExecutionProvider for GPU/Neural Engine
+# acceleration via Apple Core ML. No separate package needed (unlike DirectML on Windows).
 onnxruntime==1.23.2
 
 numpy==2.1.3

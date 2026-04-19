@@ -1,27 +1,38 @@
 # Project Kestrel To-Do and Changelog
 
-Pipeline version 2.0 Notes
-* Upgrade pipeline to verify GPU support does not crash the platform. Verify the build works cross platform. 
-* Pipeline upgrade: veriy models are bundled correctly with the git repository and remove steps related to downloading mask-rcnn weights file - just use Git LFS.
-* Fix "Dropped unsupported keys (1): culling_tutorial_seen\n127.0.0.1 - - [06/Apr/2026 13:13:59] \"GET / HTTP/1.1\" 200 -\n127.0.0.1 - - [06/Apr/2026 13:13:59]" tutorial keeps showing up.
-* Add "2x speed" mode for attempted faster processing
-* Add ability to change what specific XML fields are written (no auto import of star ratings, etc.)
-* Upgrade exposure compensation methodology for improved performance, potentially via a metering system
-* Investigate hazy images from various reddit users
+
+TODO:
+* Implement and test distributed DirectML and CoreML Builds following pipeline v2.0 upgrade
+* Implement advanced analysis settings mode:
+    - Move the following analysis-related settings settings to be near the analyze folders dialog box.
+        * Animal Detection Confidence Threshold: Default = 0.25
+        * Max Birds Detected Per Image: Default = 10 + remove warning about memory overhead
+        * Exposure Compensation Quality: Default = Balanced
+        * Scene Grouping Time: Default = 1 second
+    - Add a new setting "Parallel Processing" that specifies how many images to read at once (Default = 3) with note to lower if your computer slows down too much and a maximum of 5. 
+* Scrutinize settings schema validation and reproduce error with overwriting previous settings from earlier versions. Enforce some kind of never-overwrite-always-upgrade logic and tolerate additional fields being in the kestrel settings file.
+    > Related "* Fix "Dropped unsupported keys (1): culling_tutorial_seen\n127.0.0.1 - - [06/Apr/2026 13:13:59] \"GET / HTTP/1.1\" 200 -\n127.0.0.1 - - [06/Apr/2026 13:13:59]" tutorial keeps showing up."
+* Add "Mark as Reviewed" system for labels/etc.
+* Scrutinize database overwrites that are potentially leading to inconsistent behavior while analysis is still in progress getting rid of manually inputted data
+* Upgrade to enable experimental wildlife detection by default + Test
+* Remove additional model weights from Git repo + verify LFS assets
+* Add ability to change which XML fields are written (ex. exclude ratings, labels).
+* Upgrade terms of service version retrieval to prompt updated terms warnings + Clarify file and folder names may be sent with crash reports that are automatic and non-opt-out.
+* Upgrade Kestrel Telemetry/Required Usage Data Collection
+
+TESTING:
+* Continue to test pipeline v2 and performance with wildlife detections enabled.
+* Test whether recent metering/camera-white-balance changes have fixed reported errors from Reddit users.
+
+DEFERRED TODO:
+* Implement a fully optional login-based system where we can share an 'outing summary' that gets uploaded to projectkestrel.org (this is a point of sharing the platform with others!) - Kestrel Perch
+    - will need to clarify terms and privacy policy here
+    - will need to make sure user data isn't scraped/used in search engines/etc... i dunno. 
+* Re-train quality classifier model on latest pipeline.
+* Consider oppotunities to defer modes to filtering options, so re-analysis is not required.
 * Investigate Sony HEIF image support
-* Update terms of service to clarify file and folder names may be sent with crash reports.
 * Implement Kestrel Quick Export system (see below)
-* Revise multi-subject mode to support both birds and wildlife via similar pipelines, with a "wildlife mode" toggle to decide whether to filter away from birds or not ?
-* Unknown error "Image build returned None" failure. 
-    -> ref IMG_8688-IMG_8717.CR3 in '4 3 2026 Wilsons Wabler
 
-
-Known issues:
-* Multi-subject mode crop promotion is a bit inconsistent --> doesn't seem to save changes properly. Look into and investigate this; might be an issue with folder being status analysis in progress (perhaps it overwrites entire database which contains crop promotion)
-* metering approach might be slightly reducing bird detection performance
-* fix telemetry issues - version not being sent
-* add versioned legal agreement checks so that terms of service can be updated.
-* fix "tutorial_seen" field causing problems.
 
 
 Features under consideration
@@ -36,7 +47,7 @@ Features under consideration
         - Pre-sets you can utilize (so you just tweak exposure, determine the crop)
         - maybe with AI denoise???
     Should take as little time as possible to export; then directly copies the exported photo into your clipboard and also features a way to access it again later.
-* eBird integration support via user-provided API keys. [potentially pushed for next release]
+* eBird integration support via user-provided API keys. [potentially pushed for next release] | STALLED due to no way to use api key to retrieve one's own checklists.
 
 
 
