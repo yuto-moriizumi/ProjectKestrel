@@ -140,7 +140,10 @@
         <img src="logo.png" alt="Kestrel Logo" style="height:150px; margin-bottom:8px; opacity:0.9;">
         <h2>Welcome to Kestrel</h2>
         <p class="welcome-subtitle">What would you like to do?</p>
-        <button class="welcome-action-btn" style="display:block; margin:12px auto 20px; width:100%; max-width:300px; font-size:14px; padding:10px 16px;" onclick="startMainTutorial(1, 0)">📖 Start Tutorial</button>
+        <button class="welcome-action-btn" style="display:block; margin:12px auto 20px; width:100%; max-width:300px; font-size:14px; padding:10px 16px;" onclick="openTutorialChooser()">📖 Start Tutorial</button>
+
+        <!-- "What's New" banner (populated + gated by JS via last_seen_whats_new_version setting) -->
+        <div id="welcomeWhatsNew" class="welcome-whats-new hidden" role="region" aria-label="What's new in this update"></div>
 
         <div class="welcome-cards">
           <div class="welcome-card">
@@ -159,26 +162,22 @@
           </div>
         </div>
 
-        <div class="welcome-tips">
-          <div class="welcome-tip">
-            <span class="welcome-tip-icon">&#x1F4A1;</span>
-            <span>Load multiple folders at once! Open a parent folder and explore your entire library using the
-              <b>Folder Tree</b> on the left.</span>
+        <!-- Rotating tip carousel (tip content authored in JS) -->
+        <div id="welcomeTipCarousel" class="welcome-tip-carousel" role="region" aria-label="Tips and tricks">
+          <button type="button" class="wtc-arrow wtc-prev" aria-label="Previous tip">&#x25C2;</button>
+          <div class="wtc-viewport">
+            <div class="wtc-card" id="wtcCard">
+              <div class="wtc-head">
+                <span class="wtc-icon" id="wtcIcon">&#x1F4A1;</span>
+                <span class="wtc-title" id="wtcTitle">Tip</span>
+                <span class="wtc-badge hidden" id="wtcBadge">New!</span>
+              </div>
+              <div class="wtc-body" id="wtcBody"></div>
+              <div class="wtc-action hidden" id="wtcAction"></div>
+            </div>
           </div>
-          <div class="welcome-tip">
-            <span class="welcome-tip-icon">&#x1F4A1;</span>
-            <span>Hold <kbd>Ctrl</kbd> and click scenes to select multiple &mdash; then merge them into a single scene
-              with one click.</span>
-          </div>
-          <div class="welcome-tip">
-            <span class="welcome-tip-icon">&#x1F4A1;</span>
-            <span>Not satisfied with Kestrel's star rating system? Configure your preferences via <span class="welcome-link" id="welcomeSettingsLink">Settings&hellip;</span></span>
-          </div>
-          <div class="welcome-tip">
-            <span class="welcome-tip-icon">&#x1F4A1;</span>
-            <span>Want to open photos in your preferred editor? Double-click any photo in a scene &mdash; or configure
-              your editor via <span class="welcome-link" id="welcomeSettingsLink">Settings&hellip;</span></span>
-          </div>
+          <button type="button" class="wtc-arrow wtc-next" aria-label="Next tip">&#x25B8;</button>
+          <div class="wtc-dots" id="wtcDots" aria-hidden="true"></div>
         </div>
 
         <div class="welcome-footer">
@@ -377,6 +376,29 @@
       </div>
     </div>
   </div>
+
+  <!-- Tutorial chooser dialog (opened by the Tutorial button & welcome Start Tutorial) -->
+  <dialog id="tutorialChooserDlg" class="dlg-compact tut-chooser-dlg">
+    <div class="tut-chooser-body">
+      <h3 class="tut-chooser-title">Which version of the tutorial would you like?</h3>
+      <p class="tut-chooser-sub">You can replay either one anytime from the <b>&#x1F4D6; Tutorial</b> button.</p>
+      <div class="tut-chooser-choices">
+        <button type="button" class="tut-chooser-choice" id="tutChooseBasics">
+          <span class="tut-chooser-icon">&#x1F331;</span>
+          <span class="tut-chooser-label">Just the basics</span>
+          <span class="tut-chooser-hint">~8 quick steps with sample photos. Covers scenes, ratings, filter, workflow, and picking your editor.</span>
+        </button>
+        <button type="button" class="tut-chooser-choice primary" id="tutChooseAdvanced">
+          <span class="tut-chooser-icon">&#x1F680;</span>
+          <span class="tut-chooser-label">Walk me through everything</span>
+          <span class="tut-chooser-hint">Full tour: crop navigation, RAW zoom, library-wide search, merging, Culling Assistant, metadata export, and more.</span>
+        </button>
+      </div>
+      <div class="tut-chooser-foot">
+        <button type="button" class="tut-chooser-cancel" id="tutChooseCancel">Cancel</button>
+      </div>
+    </div>
+  </dialog>
 
   <!-- Settings dialog -->
   <dialog id="settingsDlg" class="dlg-settings">
