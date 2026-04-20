@@ -7953,7 +7953,11 @@
         'min-width:440px',
         'max-width:540px',
         'width:90vw',
-        'height:auto',
+        // `fit-content` hugs the actual content; `auto` can render at the
+        // max-height on Chromium when combined with overflow-y:auto.
+        'height:fit-content',
+        'max-height:92vh',
+        'overflow-x:hidden',
         'overflow-y:auto',
         'box-shadow:0 8px 40px rgba(0,0,0,0.6)',
       ].join(';');
@@ -8124,6 +8128,12 @@
       dlg.style.cssText = [
         'border:1px solid #303a52', 'border-radius:12px', 'background:#141a24',
         'color:#e8f0f8', 'padding:0', 'width:min(540px,96vw)',
+        // `fit-content` rather than `auto` — on Chromium a dialog with
+        // `height:auto` + `max-height:Xvh` + `overflow-y:auto` can render
+        // at the full max-height instead of shrinking to content. Using
+        // `fit-content` consistently hugs the content.
+        'height:fit-content', 'max-height:92vh',
+        'overflow-x:hidden', 'overflow-y:auto',
         'box-shadow:0 8px 40px rgba(0,0,0,0.6)',
       ].join(';');
 
@@ -8169,28 +8179,38 @@
       document.body.appendChild(dlg);
       const closeAndRemove = () => { try { dlg.close(); } catch (_) {} if (dlg.parentNode) dlg.parentNode.removeChild(dlg); };
 
-      // Load the anchor photo thumbnail asynchronously (desktop only). If it
-      // fails we just leave the placeholder in place — not critical.
-      if (anchorRow && anchorRow.filename) {
-        (async () => {
-          try {
-            const url = await getBlobUrlForPath(anchorRow.filename, folderPath);
+      // Load the anchor photo thumbnail asynchronously (desktop only).
+      //
+      // Prefer `export_path` (the cached JPEG preview Kestrel generates for
+      // every image, including raws) and fall back to `crop_path`. Using
+      // `filename` alone fails silently for raw formats like CR3/NEF/ARW
+      // because the browser can't decode them directly — that's why the
+      // placeholder was stuck on "loading…".
+      if (anchorRow) {
+        const thumbRel = anchorRow.export_path || anchorRow.crop_path || anchorRow.filename || '';
+        if (thumbRel) {
+          (async () => {
             const imgEl = dlg.querySelector('#actThumb');
             const fbEl = dlg.querySelector('#actThumbFallback');
-            if (url && imgEl) {
-              imgEl.addEventListener('load', () => {
-                imgEl.style.display = 'block';
-                if (fbEl) fbEl.style.display = 'none';
-              });
-              imgEl.src = url;
-            } else if (fbEl) {
-              fbEl.textContent = '—';
+            try {
+              const url = await getBlobUrlForPath(thumbRel, folderPath);
+              if (url && imgEl) {
+                imgEl.addEventListener('load', () => {
+                  imgEl.style.display = 'block';
+                  if (fbEl) fbEl.style.display = 'none';
+                });
+                imgEl.addEventListener('error', () => {
+                  if (fbEl) fbEl.textContent = '—';
+                });
+                imgEl.src = url;
+              } else if (fbEl) {
+                fbEl.textContent = '—';
+              }
+            } catch (_) {
+              if (fbEl) fbEl.textContent = '—';
             }
-          } catch (_) {
-            const fbEl = dlg.querySelector('#actThumbFallback');
-            if (fbEl) fbEl.textContent = '—';
-          }
-        })();
+          })();
+        }
       }
 
       const dateInput = dlg.querySelector('#actDateInput');
@@ -8283,7 +8303,11 @@
       dlg.style.cssText = [
         'border:1px solid #303a52', 'border-radius:12px', 'background:#141a24',
         'color:#e8f0f8', 'padding:0', 'min-width:440px', 'max-width:560px',
-        'width:90vw', 'height:auto', 'overflow-y:auto',
+        'width:90vw',
+        // `fit-content` hugs the actual content (Chromium quirk: `auto` +
+        // `max-height` + `overflow-y:auto` can render at the max-height).
+        'height:fit-content', 'max-height:92vh',
+        'overflow-x:hidden', 'overflow-y:auto',
         'box-shadow:0 8px 40px rgba(0,0,0,0.6)',
       ].join(';');
 

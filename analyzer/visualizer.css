@@ -1062,15 +1062,21 @@
        need the full viewport (scene viewer, settings) opt in explicitly
        below. This keeps small dialogs (merge, info, adjust-time, etc.)
        from stretching to window width/height when they only have a few
-       rows of content. */
+       rows of content.
+
+       Note: we deliberately use `fit-content` rather than `auto` for both
+       dimensions. In Chromium, a centered <dialog> with `height:auto` +
+       `max-height:Xvh` + `overflow-y:auto` can end up rendering at the
+       max-height instead of shrinking to content — `fit-content`
+       consistently hugs the content. */
     dialog {
       border: 1px solid #2a3040;
       background: var(--panel);
       color: var(--text);
       border-radius: 14px;
-      width: auto;
+      width: fit-content;
       max-width: min(1200px, 96vw);
-      height: auto;
+      height: fit-content;
       max-height: 92vh;
       overflow-x: hidden;
       overflow-y: auto;
@@ -1083,8 +1089,8 @@
 
     /* Compact dialogs that should size to their content */
     dialog.dlg-compact {
-      width: auto;
-      height: auto;
+      width: fit-content;
+      height: fit-content;
       max-height: 92vh;
       overflow-x: hidden;
       overflow-y: auto;
