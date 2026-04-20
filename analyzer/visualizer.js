@@ -1356,6 +1356,10 @@
       const groupByFolder = document.getElementById('groupByFolder')?.checked ?? getSetting('groupByFolder', true);
       const groupByTime = document.getElementById('groupByTime')?.checked ?? getSetting('groupByTime', true);
       const showBirdThumbs = document.getElementById('showBirdThumbs')?.checked ?? getSetting('showBirdThumbs', false);
+      // Widen each card's grid track when bird-crop thumbs are shown, so the
+      // main thumb keeps its "no-crop" height and the crop slots into the
+      // extra width rather than stealing height from the main image.
+      sceneGrid.classList.toggle('grid--bird-thumbs', !!showBirdThumbs);
       const includeSecondaryCheckbox = document.getElementById('includeSecondarySpecies');
       const includeSecondary = includeSecondaryCheckbox ? includeSecondaryCheckbox.checked : !!getSetting('includeSecondarySpecies', false);
       const includeFamilies = true;
@@ -4302,6 +4306,17 @@
       // RAW preview cache
       const rawCacheCb = document.getElementById('rawPreviewCacheEnabled');
       if (rawCacheCb) rawCacheCb.checked = getSetting('raw_preview_cache_enabled', true);
+      // Thumbnail resolution + JPEG quality
+      const thumbWidthSel = document.getElementById('thumbnailMaxWidth');
+      if (thumbWidthSel) {
+        const curW = parseInt(getSetting('thumbnail_max_width', 1200), 10) || 1200;
+        // Snap to the nearest option if the stored value isn't in the list.
+        const opts = Array.from(thumbWidthSel.options).map(o => parseInt(o.value, 10));
+        const nearest = opts.reduce((a, b) => (Math.abs(b - curW) < Math.abs(a - curW) ? b : a), opts[0]);
+        thumbWidthSel.value = String(nearest);
+      }
+      const thumbQualInp = document.getElementById('thumbnailJpegQuality');
+      if (thumbQualInp) thumbQualInp.value = parseInt(getSetting('thumbnail_jpeg_quality', 95), 10) || 95;
       const optedIn = getSetting('analytics_opted_in', null);
       const consentShown = getSetting('analytics_consent_shown', false);
       const cb = document.getElementById('settingsAnalyticsOptIn');
@@ -4341,6 +4356,10 @@
       const rawPreviewCacheEnabled = rawCacheCb2 ? rawCacheCb2.checked : true;
       const autoSaveCb = document.getElementById('settingsAutoSave');
       const autoSaveEnabled = autoSaveCb ? autoSaveCb.checked : true;
+      const thumbWidthEl = document.getElementById('thumbnailMaxWidth');
+      const thumbnailMaxWidth = Math.max(400, Math.min(2400, parseInt(thumbWidthEl?.value, 10) || 1200));
+      const thumbQualEl = document.getElementById('thumbnailJpegQuality');
+      const thumbnailJpegQuality = Math.max(50, Math.min(100, parseInt(thumbQualEl?.value, 10) || 95));
       // Merge into existing settings so keys like machine_id / analytics_consent_shown are preserved
       const existing = loadSettings();
       const prevProfile = existing.rating_profile || 'balanced';
@@ -4358,6 +4377,8 @@
         auto_save_enabled: autoSaveEnabled,
         raw_exposure_correction_disabled: rawExposureCorrectionDisabled,
         exposure_corrected_thumbs: exposureCorrectedThumbs,
+        thumbnail_max_width: thumbnailMaxWidth,
+        thumbnail_jpeg_quality: thumbnailJpegQuality,
       };
       _autoSaveEnabled = autoSaveEnabled;
       if (!_autoSaveEnabled) {
@@ -7721,12 +7742,39 @@
     // ── Welcome Panel action wiring ──────────────────────────────────────────────
 
     // ── Legal Agreement Logic ──────────────────────────────────────────────
+    let _pendingLegalEffectiveDate = '';
+    const DEFAULT_TERMS_URL = 'https://projectkestrel.org/terms-of-use';
+    const DEFAULT_PRIVACY_URL = 'https://projectkestrel.org/privacy-policy';
+
+    function renderLegalBanner(status) {
+      const banner = document.getElementById('legalNotice');
+      const msgEl = document.getElementById('legalNoticeMsg');
+      const termsLink = document.getElementById('legalViewTerms');
+      const privacyLink = document.getElementById('legalViewPrivacy');
+      if (!banner || !msgEl) return;
+
+      const termsUrl = status?.terms_url || DEFAULT_TERMS_URL;
+      const privacyUrl = status?.privacy_url || DEFAULT_PRIVACY_URL;
+      if (termsLink) termsLink.href = termsUrl;
+      if (privacyLink) privacyLink.href = privacyUrl;
+
+      if (status?.reason === 'terms_updated') {
+        msgEl.textContent = 'The Privacy Policy and/or Terms of Use have been updated. Please review and accept to continue using Project Kestrel.';
+      } else {
+        msgEl.textContent = 'By using Project Kestrel you agree to our Terms of Use and Privacy Policy.';
+      }
+      banner.classList.remove('hidden');
+    }
+
     async function checkLegalAgreement() {
       if (!hasPywebviewApi || !window.pywebview?.api?.get_legal_status) return;
       try {
         const status = await window.pywebview.api.get_legal_status();
-        if (!status.agreed) {
-          document.getElementById('legalNotice')?.classList.remove('hidden');
+        _pendingLegalEffectiveDate = status?.effective_date || '';
+        if (!status?.agreed) {
+          renderLegalBanner(status);
+        } else {
+          document.getElementById('legalNotice')?.classList.add('hidden');
         }
       } catch (e) {
         console.error('Failed to check legal status', e);
@@ -7738,7 +7786,7 @@
       legalAgreeBtn.addEventListener('click', async () => {
         try {
           if (hasPywebviewApi && window.pywebview?.api?.agree_to_legal) {
-            await window.pywebview.api.agree_to_legal();
+            await window.pywebview.api.agree_to_legal(_pendingLegalEffectiveDate || '');
             // Keep local settings in sync immediately after consent so later
             // UI-driven settings writes include the persisted legal flags.
             await hydrateSettingsFromServer();

@@ -308,17 +308,31 @@ class AnalysisPipeline:
         decode_workers = max(1, min(5, decode_workers))
 
         rating_thresholds = None
+        rating_profile = "balanced"
         exposure_quality = "balanced"
+        thumbnail_max_width = 1200
+        thumbnail_jpeg_quality = 95
         if callable(load_persisted_settings):
             try:
                 sett = load_persisted_settings() or {}
-                profile = sett.get('rating_profile', 'balanced')
-                rating_thresholds = get_profile_thresholds(profile)
+                rating_profile = str(sett.get('rating_profile', 'balanced') or 'balanced').strip().lower() or 'balanced'
+                rating_thresholds = get_profile_thresholds(rating_profile)
                 raw_eq = str(sett.get('exposure_quality', 'balanced') or 'balanced').strip().lower()
                 if raw_eq in {'lenient', 'balanced', 'aggressive'}:
                     exposure_quality = raw_eq
+                try:
+                    thumbnail_max_width = int(sett.get('thumbnail_max_width', 1200))
+                except (TypeError, ValueError):
+                    thumbnail_max_width = 1200
+                try:
+                    thumbnail_jpeg_quality = int(sett.get('thumbnail_jpeg_quality', 95))
+                except (TypeError, ValueError):
+                    thumbnail_jpeg_quality = 95
             except Exception:
                 rating_thresholds = None
+        thumbnail_max_width = max(400, min(2400, thumbnail_max_width))
+        thumbnail_jpeg_quality = max(50, min(100, thumbnail_jpeg_quality))
+        jpeg_params = [int(cv2.IMWRITE_JPEG_QUALITY), thumbnail_jpeg_quality]
 
         self._log_path = get_log_path(folder)
         stage_ctx = {"stage": "startup", "file": None}
@@ -575,10 +589,13 @@ class AnalysisPipeline:
 
                     stage_ctx["stage"] = "export_image"
                     export_path = os.path.join(export_dir, f"{os.path.splitext(raw_file)[0]}_export.jpg")
-                    img_small = cv2.resize(img, (1200, int(1200 * img.shape[0] / img.shape[1])))
+                    _tgt_w = min(thumbnail_max_width, int(img.shape[1]))
+                    _tgt_h = max(1, int(_tgt_w * img.shape[0] / img.shape[1]))
+                    img_small = cv2.resize(img, (_tgt_w, _tgt_h))
                     cv2.imwrite(
                         export_path,
                         cv2.cvtColor(img_small, cv2.COLOR_RGB2BGR),
+                        jpeg_params,
                     )
                     # Store relative path for cross-platform compatibility
                     export_path_rel = os.path.relpath(export_path, folder)
@@ -620,6 +637,7 @@ class AnalysisPipeline:
                         cv2.imwrite(
                             crop_path,
                             cv2.cvtColor(img_small, cv2.COLOR_RGB2BGR),
+                            jpeg_params,
                         )
                         # Store relative path for cross-platform compatibility
                         crop_path_rel = os.path.relpath(crop_path, folder)
@@ -917,6 +935,7 @@ class AnalysisPipeline:
                         cv2.imwrite(
                             crop_path,
                             cv2.cvtColor(crop_img, cv2.COLOR_RGB2BGR),
+                            jpeg_params,
                         )
                         crop_path_rel = os.path.relpath(crop_path, folder)
                         bbox = crop_item.get("crop_bbox") or {
@@ -1066,6 +1085,7 @@ class AnalysisPipeline:
                     metadata_path = os.path.join(kestrel_dir, METADATA_FILENAME)
                     try:
                         import json as _json
+                        from datetime import datetime as _dt, timezone as _tz
                         if os.path.exists(metadata_path):
                             with open(metadata_path, "r", encoding="utf-8") as mf:
                                 _meta = _json.load(mf)
@@ -1092,6 +1112,30 @@ class AnalysisPipeline:
                         _meta["exposure_pipeline_version"] = 3
                         _meta["exposure_render_mode"] = render_mode_meta
                         _meta["exposure_quality"] = exposure_quality
+
+                        # Record the full set of settings used for THIS analysis
+                        # run so users can later see which parameters produced
+                        # the cached results (detection thresholds, rating
+                        # profile, detector variant, etc.). This is a snapshot
+                        # — re-running analysis overwrites it.
+                        _meta["analyzed_utc"] = _dt.now(_tz.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+                        _meta["kestrel_version"] = VERSION
+                        _meta["analysis_settings"] = {
+                            "detector_name": str(getattr(self, "detector_name", "") or ""),
+                            "use_gpu": bool(getattr(self, "use_gpu", False)),
+                            "wildlife_enabled": bool(wildlife_enabled),
+                            "detection_threshold": float(detection_threshold),
+                            "scene_time_threshold": float(scene_time_threshold),
+                            "mask_threshold": float(mask_threshold),
+                            "max_bird_crops": int(max_bird_crops),
+                            "parallel_prefetch": int(decode_workers),
+                            "rating_profile": rating_profile,
+                            "exposure_quality": exposure_quality,
+                            "exposure_render_mode": render_mode_meta,
+                            "exposure_pipeline_version": 3,
+                            "thumbnail_max_width": int(thumbnail_max_width),
+                            "thumbnail_jpeg_quality": int(thumbnail_jpeg_quality),
+                        }
                         with open(metadata_path, "w", encoding="utf-8") as mf:
                             _json.dump(_meta, mf, indent=2)
                     except Exception as _meta_e:

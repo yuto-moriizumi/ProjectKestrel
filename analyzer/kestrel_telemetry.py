@@ -275,6 +275,24 @@ def send_installation_telemetry(machine_id: str, version: str = '') -> None:
         pass
 
 
+def send_app_open_telemetry(machine_id: str, version: str = '') -> None:
+    """Send a lightweight ping when the app launches (failsafe).
+
+    Used for daily active user counts. The caller is responsible for rate
+    limiting (typically once per UTC day) by inspecting ``last_open_ping_utc``
+    in the persisted settings.
+    """
+    try:
+        payload = {
+            'machine_id': machine_id,
+            'version': version or _read_version(),
+            'os': _get_os_info(),
+        }
+        _post_json_async('/api/open', payload)
+    except Exception:
+        pass
+
+
 def send_analysis_completion_telemetry(
     files_analyzed: int,
     machine_id: str = '',

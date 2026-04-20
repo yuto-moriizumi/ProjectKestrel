@@ -27,9 +27,13 @@ TODO:
 * Fix bug where the image is like half-split for some reason. [DONE]
 * Improve UI: Add "Open in [photo editor]" button; along with buttons to switch between the multiple bird crops. Near the right side. [DONE]
 * Improve timeline: more granular detail than just grouping by capture hour. Also maybe add a "Adjust Capture Time" button that lets you add some hour offsets/change the capture time to sync it better. [DONE]
-* Upgrade terms of service version retrieval to prompt updated terms warnings + Clarify file and folder names may be sent with crash reports that are automatic and non-opt-out.
-* Upgrade Kestrel Telemetry/Required Usage Data Collection to fetch the data from the website if appropriate.
+* Upgrade terms of service version retrieval to prompt updated terms warnings + Clarify file and folder names may be sent with crash reports that are automatic and non-opt-out. [DONE]
+* Upgrade Kestrel Telemetry/Required Usage Data Collection to fetch the data from the website if appropriate. [DONE]
 * Upgrade tutorial workflow: Simple and advanced version. Potentially also inform the user how they can integrate Kestrel into their workflows.
+* Add thumbnail quality settings for storage control. [DONE]
+
+PRE-LAUNCH:
+- Update website, version.json, and internal "What's New" to reflect latest release notes.
 
 
 

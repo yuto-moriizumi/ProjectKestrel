@@ -175,7 +175,12 @@ def _utc_now_iso() -> str:
 
 
 def _mark_session_start() -> None:
-    """Mark this app session as active and detect unclean prior shutdown."""
+    """Mark this app session as active and detect unclean prior shutdown.
+
+    Also fires the once-per-UTC-day ``/api/open`` telemetry ping used for
+    daily active user counts. Only one ping is sent per install per UTC day;
+    the last send date is persisted in ``last_open_ping_utc``.
+    """
     try:
         settings = load_persisted_settings()
         prev_started = str(settings.get('app_session_started_utc', '') or '').strip()
@@ -185,6 +190,23 @@ def _mark_session_start() -> None:
         settings['app_session_started_utc'] = _utc_now_iso()
         settings['app_session_closed_cleanly'] = False
         settings['app_session_pid'] = int(os.getpid())
+
+        try:
+            today_utc = datetime.utcnow().strftime('%Y-%m-%d')
+            last_ping = str(settings.get('last_open_ping_utc', '') or '').strip()
+            legal_agreed = str(settings.get('legal_agreed_version', '') or '').strip()
+            if (
+                _telemetry is not None
+                and legal_agreed
+                and last_ping != today_utc
+            ):
+                mid = _telemetry.get_machine_id(settings)
+                version = _telemetry._read_version()
+                _telemetry.send_app_open_telemetry(mid, version=version)
+                settings['last_open_ping_utc'] = today_utc
+        except Exception:
+            pass
+
         save_persisted_settings(settings)
     except Exception:
         pass
@@ -203,28 +225,53 @@ def _mark_session_clean_exit() -> None:
 
 
 def _apply_legal_upgrade_self_heal(settings: dict, prev_version: str, current_version: str) -> bool:
-    """One-time migration for legacy installs that lost legal consent markers.
+    """One-time migrations for legacy installs that lost legal consent markers.
 
-    Returns True when the migration marker is updated in the settings payload.
+    Two migrations are applied here:
+
+    1. **Consent marker self-heal (2026-03)** — gated by
+       :data:`LEGAL_SELF_HEAL_MIGRATION_KEY`. Runs once on version change when
+       ``legal_agreed_version`` is missing, restoring the marker so the user
+       is not prompted as brand-new.
+
+    2. **Legal-agreed-date backfill** — not gated by the migration flag.
+       Whenever a user has an existing ``legal_agreed_version`` but no
+       ``legal_agreed_date``, backfill the date to ``2026-03-01`` (the
+       effective date of the previous published Terms/Privacy). This ensures
+       existing installs will correctly see the "terms updated" banner the
+       first time ``legal.json`` advertises a newer effective date, without
+       spuriously reprompting users.
+
+    Returns True when anything in the settings payload was mutated.
     """
     if not isinstance(settings, dict):
         return False
-    prev = str(prev_version or '').strip()
-    curr = str(current_version or '').strip()
-    if not prev or not curr or prev == curr:
-        return False
-    if settings.get(LEGAL_SELF_HEAL_MIGRATION_KEY, False):
-        return False
+
+    mutated = False
 
     legal_agreed = str(settings.get('legal_agreed_version', '') or '').strip()
-    if not legal_agreed:
-        settings['legal_agreed_version'] = prev or curr
-        if 'installed_telemetry_sent' not in settings:
-            settings['installed_telemetry_sent'] = True
-        log('[legal] Applied one-time upgrade self-heal for missing consent markers:', prev, '->', curr)
 
-    settings[LEGAL_SELF_HEAL_MIGRATION_KEY] = True
-    return True
+    prev = str(prev_version or '').strip()
+    curr = str(current_version or '').strip()
+    if (
+        prev and curr and prev != curr
+        and not settings.get(LEGAL_SELF_HEAL_MIGRATION_KEY, False)
+    ):
+        if not legal_agreed:
+            settings['legal_agreed_version'] = prev or curr
+            legal_agreed = settings['legal_agreed_version']
+            if 'installed_telemetry_sent' not in settings:
+                settings['installed_telemetry_sent'] = True
+            log('[legal] Applied one-time upgrade self-heal for missing consent markers:', prev, '->', curr)
+        settings[LEGAL_SELF_HEAL_MIGRATION_KEY] = True
+        mutated = True
+
+    if legal_agreed and not str(settings.get('legal_agreed_date', '') or '').strip():
+        settings['legal_agreed_date'] = '2026-03-01'
+        log('[legal] Backfilled legal_agreed_date to 2026-03-01 for existing install.')
+        mutated = True
+
+    return mutated
 
 
 def build_original_path(root: str, rel: str) -> str:

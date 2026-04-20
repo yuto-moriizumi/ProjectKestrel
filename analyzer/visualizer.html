@@ -12,10 +12,14 @@
 
 <body>
   <div id="legalNotice" class="legal-notice-banner hidden">
-    <span>By using Project Kestrel you agree to our <a href="https://projectkestrel.org/terms-of-use"
-        target="_blank">Terms of Use</a> and <a href="https://projectkestrel.org/privacy-policy" target="_blank">Privacy
-        Policy</a>.</span>
-    <button id="legalAgreeBtn" class="legal-notice-btn">Agree & Dismiss</button>
+    <span id="legalNoticeMsg" class="legal-notice-msg"></span>
+    <div class="legal-notice-actions">
+      <a id="legalViewTerms" href="https://projectkestrel.org/terms-of-use" target="_blank"
+        rel="noopener" class="legal-notice-link">View Terms of Use</a>
+      <a id="legalViewPrivacy" href="https://projectkestrel.org/privacy-policy" target="_blank"
+        rel="noopener" class="legal-notice-link">View Privacy Policy</a>
+      <button id="legalAgreeBtn" class="legal-notice-btn">Agree &amp; Dismiss</button>
+    </div>
   </div>
   <div class="app-body">
   <header>
@@ -450,6 +454,30 @@
       </div>
       <div class="muted" style="font-size:12px;margin-top:-6px;margin-bottom:8px">Cache full-resolution RAW previews
         in .kestrel/culling_TMP for faster subsequent loads. Disable to save disk space (previews will be generated fresh each time).</div>
+
+      <div class="row">
+        <label for="thumbnailMaxWidth">Thumbnail resolution</label>
+        <select id="thumbnailMaxWidth" style="width:auto">
+          <option value="800">800&nbsp;px &mdash; smallest (~0.2&nbsp;MB/img)</option>
+          <option value="1200" selected>1200&nbsp;px &mdash; recommended (~0.4&nbsp;MB/img)</option>
+          <option value="1600">1600&nbsp;px &mdash; sharper (~0.7&nbsp;MB/img)</option>
+          <option value="2000">2000&nbsp;px &mdash; large (~1.0&nbsp;MB/img)</option>
+          <option value="2400">2400&nbsp;px &mdash; maximum (~1.5&nbsp;MB/img)</option>
+        </select>
+      </div>
+      <div class="muted" style="font-size:12px;margin-top:-6px;margin-bottom:8px">Long-edge pixel width of the cached
+        grid/scene thumbnails written during analysis. Higher values look sharper when zoomed in but each
+        folder's <code>.kestrel</code> directory grows proportionally. Applies to future analyses;
+        existing cached thumbnails are not regenerated.</div>
+
+      <div class="row">
+        <label for="thumbnailJpegQuality">Thumbnail JPEG quality</label>
+        <input id="thumbnailJpegQuality" type="number" min="50" max="100" step="1" value="95" style="width:80px"
+          title="JPEG quality used when writing cached thumbnails (50–100)" />
+      </div>
+      <div class="muted" style="font-size:12px;margin-top:-6px;margin-bottom:8px">JPEG quality (50&ndash;100) used when
+        writing cached thumbnails. 95 is visually lossless; 80 cuts file size roughly in half with minor quality loss;
+        below 70 is only useful for very tight storage budgets.</div>
 
       <div class="row">
         <label for="rawExposureCorrectionDisabled" style="flex:1">Disable RAW Exposure Correction</label>

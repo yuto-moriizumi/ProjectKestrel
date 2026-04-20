@@ -378,6 +378,12 @@ def _sanitize_settings_payload(data: dict, emit_log: bool = False) -> dict:
     _set_bool('auto_save_enabled', default=True)
     _set_bool('raw_exposure_correction_disabled', default=False)
 
+    # Analysis-time thumbnail generation (cached export JPEGs + crops). Exposed
+    # as user settings so photographers can trade storage for fidelity.
+    # Width in pixels along the long edge; JPEG quality is cv2's 0–100 param.
+    _set_int('thumbnail_max_width', default=1200, min_value=400, max_value=2400)
+    _set_int('thumbnail_jpeg_quality', default=95, min_value=50, max_value=100)
+
     _set_bool('includeSecondarySpecies', default=False)
     _set_bool('groupByFolder', default=True)
     _set_bool('groupByTime', default=True)
@@ -410,6 +416,8 @@ def _sanitize_settings_payload(data: dict, emit_log: bool = False) -> dict:
     _set_str('machine_id', max_len=128)
     _set_str('version', max_len=64)
     _set_str('legal_agreed_version', max_len=64)
+    _set_str('legal_agreed_date', max_len=32)
+    _set_str('last_open_ping_utc', max_len=32)
     _set_bool('installed_telemetry_sent', default=False)
     _set_bool('legal_upgrade_self_heal_2026_03', default=False)
 

@@ -382,32 +382,135 @@ class Api:
             return ''
         return name
 
+    def _fetch_remote_legal_payload(self) -> dict:
+        """Internal helper: fetch https://projectkestrel.org/legal.json.
+
+        Returns a dict with keys ``effective_date``, ``terms_url``,
+        ``privacy_url`` on success, or an empty dict if the fetch fails.
+        Never raises.
+        """
+        try:
+            import urllib.request
+            import ssl
+            import certifi
+
+            url = "https://projectkestrel.org/legal.json"
+            ctx = ssl.create_default_context(cafile=certifi.where())
+            req = urllib.request.Request(
+                url,
+                headers={'User-Agent': 'ProjectKestrel/1.0'},
+                method='GET',
+            )
+            with urllib.request.urlopen(req, context=ctx, timeout=10) as resp:
+                data = json.loads(resp.read().decode('utf-8'))
+                if not isinstance(data, dict):
+                    return {}
+                return {
+                    'effective_date': str(data.get('effective_date', '') or '').strip(),
+                    'terms_url': str(data.get('terms_url', '') or '').strip(),
+                    'privacy_url': str(data.get('privacy_url', '') or '').strip(),
+                }
+        except Exception as e:
+            log(f'[legal] fetch_remote_legal failed: {e}')
+            return {}
+
+    def fetch_remote_legal(self):
+        """Fetch legal.json from projectkestrel.org to bypass CORS in JS."""
+        data = self._fetch_remote_legal_payload()
+        if not data:
+            return {'success': False, 'error': 'Failed to fetch legal.json'}
+        return {'success': True, 'data': data}
+
     def get_legal_status(self) -> dict:
-        """Check if the user has agreed to the terms and if install telemetry was sent."""
+        """Report legal-agreement state to the UI.
+
+        Fetches ``legal.json`` and compares ``effective_date`` to the stored
+        ``legal_agreed_date``. Returns a dict with:
+
+        - ``agreed``: True if the user has accepted terms at least as recent
+          as the remote effective date.
+        - ``reason``: None, ``'new_user'``, or ``'terms_updated'`` when
+          ``agreed`` is False.
+        - ``effective_date``, ``terms_url``, ``privacy_url``: remote legal
+          metadata (empty strings if the fetch failed).
+        - ``install_sent``: whether install telemetry was sent once.
+
+        If the network fetch fails, falls back to the legacy behaviour of
+        treating any non-empty ``legal_agreed_version`` as agreement, so
+        offline users are never blocked.
+        """
         settings = load_persisted_settings()
-        agreed = settings.get('legal_agreed_version', '') != ''
+        stored_date = str(settings.get('legal_agreed_date', '') or '').strip()
+        legacy_agreed = str(settings.get('legal_agreed_version', '') or '').strip() != ''
         install_sent = settings.get('installed_telemetry_sent', False)
-        log(f'[legal] get_legal_status: agreed={agreed}, install_sent={install_sent}')
+
+        remote = self._fetch_remote_legal_payload()
+        effective_date = remote.get('effective_date', '')
+        terms_url = remote.get('terms_url', '') or 'https://projectkestrel.org/terms-of-use'
+        privacy_url = remote.get('privacy_url', '') or 'https://projectkestrel.org/privacy-policy'
+
+        if not effective_date:
+            agreed = legacy_agreed
+            reason = None if agreed else 'new_user'
+            log(f'[legal] get_legal_status (offline fallback): agreed={agreed}')
+            return {
+                'agreed': agreed,
+                'reason': reason,
+                'effective_date': '',
+                'terms_url': terms_url,
+                'privacy_url': privacy_url,
+                'install_sent': install_sent,
+            }
+
+        if stored_date and stored_date >= effective_date:
+            agreed = True
+            reason = None
+        elif legacy_agreed or stored_date:
+            agreed = False
+            reason = 'terms_updated'
+        else:
+            agreed = False
+            reason = 'new_user'
+
+        log(
+            f'[legal] get_legal_status: agreed={agreed}, reason={reason}, '
+            f'stored_date={stored_date!r}, effective_date={effective_date!r}'
+        )
         return {
             'agreed': agreed,
-            'install_sent': install_sent
+            'reason': reason,
+            'effective_date': effective_date,
+            'terms_url': terms_url,
+            'privacy_url': privacy_url,
+            'install_sent': install_sent,
         }
 
-    def agree_to_legal(self):
-        """Mark legal agreement as accepted and trigger installation telemetry if needed."""
+    def agree_to_legal(self, effective_date: str = ''):
+        """Mark legal agreement as accepted and trigger installation telemetry if needed.
+
+        Parameters
+        ----------
+        effective_date : str
+            The ``effective_date`` from ``legal.json`` that the UI showed to
+            the user. Stored in ``legal_agreed_date`` and used for future
+            re-acceptance comparisons. If empty, only the legacy
+            ``legal_agreed_version`` marker is written.
+        """
         settings = load_persisted_settings()
         version = _telemetry._read_version() if _telemetry else 'unknown'
         settings['legal_agreed_version'] = version
-        log(f'[legal] User agreed to terms (version {version})')
-        
-        # Trigger installation telemetry on first agreement
+        date_str = str(effective_date or '').strip()
+        if date_str:
+            settings['legal_agreed_date'] = date_str
+        log(f'[legal] User agreed to terms (version {version}, effective_date={date_str!r})')
+
         if not settings.get('installed_telemetry_sent', False):
             if _telemetry:
                 mid = _telemetry.get_machine_id(settings)
                 _telemetry.send_installation_telemetry(mid, version=version)
                 settings['installed_telemetry_sent'] = True
                 log('[legal] Initial installation telemetry triggered.')
-        
+
         save_persisted_settings(settings)
         return {'success': True}
     
