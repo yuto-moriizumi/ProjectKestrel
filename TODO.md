@@ -29,8 +29,9 @@ TODO:
 * Improve timeline: more granular detail than just grouping by capture hour. Also maybe add a "Adjust Capture Time" button that lets you add some hour offsets/change the capture time to sync it better. [DONE]
 * Upgrade terms of service version retrieval to prompt updated terms warnings + Clarify file and folder names may be sent with crash reports that are automatic and non-opt-out. [DONE]
 * Upgrade Kestrel Telemetry/Required Usage Data Collection to fetch the data from the website if appropriate. [DONE]
-* Upgrade tutorial workflow: Simple and advanced version. Potentially also inform the user how they can integrate Kestrel into their workflows.
+* Upgrade tutorial workflow: Simple and advanced version. Potentially also inform the user how they can integrate Kestrel into their workflows. [DONE]
 * Add thumbnail quality settings for storage control. [DONE]
+* Update ONNXRuntime-DirectML for windows in CI workflow.
 
 PRE-LAUNCH:
 - Update website, version.json, and internal "What's New" to reflect latest release notes.
@@ -249,13 +250,17 @@ Most significant update to date: Kestrel is up to 500% faster while achieving be
     - Migration of all of these models, along with existing quality classifier to ONNXRuntime allows GPU utilization, leading to substantial performance improvements on all systems.
     - New exposure compensation algorithm achieves significantly better performance on poorly-lit bird images while performing 10x faster than v(Kentucky Warbler).
     - New analysis setting allows parallel processing of multiple files simultaneously, leading to up to 3x performance improvement in RAW decode speed.
-    - Together, this new pipeline is FASTER *and* MORE ACCURATE! THANK YOU to the wonderful teams behind SpeciesNet, MegaDetector, and SAM-HQ for open-sourcing their models!
+    - Together, this new pipeline is FASTER *and* MORE ACCURATE! THANK YOU to the wonderful teams behind SpeciesNet, MegaDetector, and SAM-HQ for their amazing open-source work!
 * Large number of user interface tweaks makes Kestrel more intuitive:
     - All analysis-specific settings are moved to the Analyze Folders Dialog box for clarity and proximity.
     - Improved timeline visualization no longer strictly groups photos by the hour. Additionally, new "Adjust Capture Time" dialog box allows you to correct your camera's capture time (ex. Daylight Savings Time, etc.)
     - Exposure compensation is now applied to the image thumbnails (toggle-able in settings), enabling better viewing of image details across lighting conditions.
     - New ability to see the bird thumbnail while browsing your photos.
     - Improvements to Scene view UI: "Mark as Reviewed" button, "Open in [photo editor]" button, and buttons to switch subjects in multi-subject mode.
+    - Revamped/Improved in-app tutorials provide better guidance with "Basic" and "Advanced" mode.
+
+## Minor Changes
+* Updated Privacy Policy and Terms of Use to clarify that some file names may be sent when reporting bugs or crashes. 
 * Several bug fixes
     - Fixed bugs where the tutorial would keep popping up for some users who upgraded their version of Kestrel
     - Fixed bugs where Kestrel would erroneously believe that it crashed, prompting the user to ask whether to send a crash report.

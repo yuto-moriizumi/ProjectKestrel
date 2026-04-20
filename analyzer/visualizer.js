@@ -8624,16 +8624,18 @@
     const _tutWorkflowStep = {
       title: 'Fit Kestrel into your workflow',
       body: '',
-      target: null,
+      target: '.write-metadata-btn',
+      position: 'bottom',
       customBody: 'workflowCard',
-      highlightAlso: ['.write-metadata-btn', '.culling-assistant-btn'],
+      highlightAlso: ['.culling-assistant-btn'],
     };
 
     const _tutTryYourOwnStepBase = {
       title: 'Now try it with your own photos',
       body: 'You\u2019re ready!<br><br>\u2022 Click <b>Analyze Folders\u2026</b> to process a new folder of photos.<br>\u2022 Click <b>Open Folder\u2026</b> (or drop into the Folder Tree) to browse photos Kestrel has already analyzed.<br><br><b>Tip:</b> open a parent folder once to load your whole library \u2014 then search across every outing, every year.',
-      target: null,
-      highlightAlso: ['#analyzeQueueBtn', '#pickFolder'],
+      target: '#analyzeQueueBtn',
+      position: 'right',
+      highlightAlso: ['#pickFolder'],
     };
 
     const TUTORIAL_BASICS = [
@@ -8918,48 +8920,46 @@
 
     function _renderTutWorkflowCard(bodyEl) {
       bodyEl.innerHTML =
-        '<div class="tut-workflow-intro">Choose the workflow that fits how you already edit \u2014 Kestrel plugs into any of them.</div>' +
+        '<div class="tut-workflow-intro">Pick the workflow that fits how you already edit \u2014 Kestrel plugs into any of them.</div>' +
         '<div class="tut-workflow-tabs" role="tablist">' +
           '<button type="button" class="tut-wf-tab active" data-tab="none">No workflow changes</button>' +
           '<button type="button" class="tut-wf-tab" data-tab="cull">Cut the blurry bulk</button>' +
-          '<button type="button" class="tut-wf-tab" data-tab="favs">Just import my favorites</button>' +
+          '<button type="button" class="tut-wf-tab" data-tab="favs">Just my favorites</button>' +
         '</div>' +
         '<div class="tut-workflow-panels">' +
           '<div class="tut-wf-panel active" data-panel="none">' +
             '<div class="tut-wf-flow">' +
-              '<div class="tut-wf-node">\uD83D\uDCF7<br><span>Shoot</span></div>' +
+              '<div class="tut-wf-node">Your Photos</div>' +
               '<div class="tut-wf-arrow">\u2192</div>' +
-              '<div class="tut-wf-node accent">\uD83E\uDD85<br><span>Kestrel analyzes</span><small>scenes \u00b7 birds \u00b7 quality \u00b7 species</small></div>' +
+              '<div class="tut-wf-node accent">Kestrel Analyzes</div>' +
               '<div class="tut-wf-arrow">\u2192</div>' +
-              '<div class="tut-wf-node">\uD83D\uDCE4<br><span>Write Photo Metadata</span><small>stars &amp; picks as XMP</small></div>' +
-              '<div class="tut-wf-arrow">\u2192</div>' +
-              '<div class="tut-wf-node">\uD83D\uDDBC\uFE0F<br><span>Lightroom / Darktable / Capture One</span></div>' +
+              '<div class="tut-wf-node highlight">Write Metadata</div>' +
             '</div>' +
+            '<div class="tut-wf-caption">Just export Kestrel\u2019s analysis as XMP sidecars, then browse them in the photo editor you already use.</div>' +
           '</div>' +
           '<div class="tut-wf-panel" data-panel="cull">' +
             '<div class="tut-wf-flow">' +
-              '<div class="tut-wf-node">\uD83D\uDCF7<br><span>Shoot</span></div>' +
+              '<div class="tut-wf-node">Your Photos</div>' +
               '<div class="tut-wf-arrow">\u2192</div>' +
-              '<div class="tut-wf-node accent">\uD83E\uDD85<br><span>Kestrel analyzes</span></div>' +
+              '<div class="tut-wf-node accent">Kestrel Analyzes</div>' +
               '<div class="tut-wf-arrow">\u2192</div>' +
-              '<div class="tut-wf-node highlight">\uD83D\uDDD1\uFE0F<br><span>Culling Assistant</span><small>sorts by your rules</small></div>' +
+              '<div class="tut-wf-node highlight">Culling Assistant</div>' +
               '<div class="tut-wf-arrow">\u2192</div>' +
-              '<div class="tut-wf-branch">' +
-                '<div class="tut-wf-node ok">\u2713 Accepts<small>\u2192 your editor</small></div>' +
-                '<div class="tut-wf-node bad">\u2717 Rejects<small>\u2192 archive folder</small></div>' +
-              '</div>' +
+              '<div class="tut-wf-node">Accepts / Rejects</div>' +
             '</div>' +
+            '<div class="tut-wf-caption">Use the <b>Culling Assistant</b> to cut the blurry bulk \u2014 keep the sharp photos and archive the rest in one pass.</div>' +
           '</div>' +
           '<div class="tut-wf-panel" data-panel="favs">' +
             '<div class="tut-wf-flow">' +
-              '<div class="tut-wf-node">\uD83D\uDCF7<br><span>Shoot</span></div>' +
+              '<div class="tut-wf-node">Your Photos</div>' +
               '<div class="tut-wf-arrow">\u2192</div>' +
-              '<div class="tut-wf-node accent">\uD83E\uDD85<br><span>Kestrel analyzes</span></div>' +
+              '<div class="tut-wf-node accent">Kestrel Analyzes</div>' +
               '<div class="tut-wf-arrow">\u2192</div>' +
-              '<div class="tut-wf-node">\uD83D\uDD0D<br><span>Browse &amp; pick favorites</span><small>Space = open in editor</small></div>' +
+              '<div class="tut-wf-node">Pick Favorites</div>' +
               '<div class="tut-wf-arrow">\u2192</div>' +
-              '<div class="tut-wf-node highlight">\uD83D\uDCE4<br><span>Write Photo Metadata</span><small>just your selections</small></div>' +
+              '<div class="tut-wf-node highlight">Open in Editor</div>' +
             '</div>' +
+            '<div class="tut-wf-caption">Browse your scenes in Kestrel and press <kbd>Space</kbd> on the ones you love \u2014 they open straight in your photo editor.</div>' +
           '</div>' +
         '</div>' +
         '<div class="tut-workflow-hint">We\u2019ve highlighted the two buttons you\u2019ll use most: <b>Write Photo Metadata</b> and <b>Open Culling Assistant</b>.</div>';
@@ -8985,19 +8985,19 @@
       var grid = document.createElement('div');
       grid.className = 'tut-editor-grid';
       var choices = [
-        { key: 'lightroom',   label: 'Adobe Lightroom Classic', icon: '\uD83C\uDFA8' },
-        { key: 'darktable',   label: 'Darktable',               icon: '\u25C9' },
-        { key: 'capture_one', label: 'Capture One',             icon: '\u25CE' },
-        { key: 'photoshop',   label: 'Adobe Photoshop',         icon: '\uD83D\uDD8C\uFE0F' },
-        { key: 'system',      label: 'System Default',          icon: '\uD83D\uDDA5\uFE0F' },
-        { key: '__other',     label: 'Other\u2026 (open Settings)', icon: '\u2699\uFE0F' },
+        { key: 'lightroom',   label: 'Adobe Lightroom Classic' },
+        { key: 'darktable',   label: 'Darktable' },
+        { key: 'capture_one', label: 'Capture One' },
+        { key: 'photoshop',   label: 'Adobe Photoshop' },
+        { key: 'system',      label: 'System Default' },
+        { key: '__other',     label: 'Other\u2026 (open Settings)' },
       ];
       choices.forEach(function(c) {
         var b = document.createElement('button');
         b.type = 'button';
         b.className = 'tut-editor-btn';
         b.setAttribute('data-key', c.key);
-        b.innerHTML = '<span class="tut-editor-icon">' + c.icon + '</span><span class="tut-editor-label">' + c.label + '</span>';
+        b.innerHTML = '<span class="tut-editor-label">' + c.label + '</span>';
         b.addEventListener('click', function() { onChosen(c.key, b); });
         grid.appendChild(b);
       });
@@ -9328,13 +9328,13 @@
     // Bump this whenever you author a new changelog. Clients with a matching
     // `last_seen_whats_new_version` will not see the banner again.
     const WHATS_NEW = {
-      version: '2026.04-tutorial-revamp',
-      headline: 'New in this update',
+      version: 'gambels-quail',
+      headline: "New in v(Gambel's Quail) \u2014 our biggest update yet",
       items: [
-        'Rebuilt in-app tutorial with <b>Basics</b> and <b>Advanced</b> branches \u2014 pick either from the <b>\uD83D\uDCD6 Tutorial</b> button.',
-        'Bird thumbnails now appear <b>side-by-side</b> with the scene preview instead of being overlaid.',
-        'New rotating <b>tips carousel</b> below \u2014 hover to pause, or use the arrows to browse.',
-        '<b>Wildlife mode</b> (experimental): enable it in Settings \u2192 Analysis to detect squirrels, bears, and other non-bird wildlife.',
+        'New <b>pipeline v2.0</b> is up to <b>500% faster</b> with better bird detection and exposure compensation \u2014 all powered by ONNX Runtime with GPU acceleration.',
+        'Detects <b>1,200+ wildlife species</b> (squirrels, bears, and more) using <b>MegaDetector</b>, <b>SpeciesNet</b>, and <b>SAM-HQ</b>. Enable in Settings \u2192 Analysis.',
+        'New <b>bird thumbnail</b> view shows the crop side-by-side with the full scene, plus new Scene view buttons: <b>Mark as Reviewed</b>, <b>Open in [editor]</b>, and subject-switcher arrows for multi-bird scenes.',
+        'Rebuilt in-app tutorial with <b>Basics</b> and <b>Advanced</b> branches, a rotating tips carousel, and a new <b>Adjust Capture Time</b> dialog for timeline fixes.',
       ],
     };
 
