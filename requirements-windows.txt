@@ -1,0 +1,44 @@
+# Windows CI build requirements
+#
+# Identical to requirements.txt except we use onnxruntime-directml instead of
+# the CPU-only onnxruntime package. onnxruntime-directml ships the DirectML
+# execution provider, which gives GPU acceleration on any DX12-compatible GPU
+# (NVIDIA, AMD, Intel). The two packages are mutually exclusive — they share
+# the `onnxruntime` module name — so only one may be installed at a time.
+#
+# Local dev installs still use requirements.txt (CPU-only) to avoid dragging
+# GPU drivers into the dev loop. This file is referenced by the Windows build
+# in .github/workflows/main.yml.
+
+# Core ML/AI Dependencies
+# onnxruntime-directml has no 1.23.2 release; 1.23.0 is the nearest match to
+# the 1.23.2 pin used for macOS / local dev (same minor series).
+onnxruntime-directml==1.24.4
+
+numpy==2.1.3
+
+# Computer Vision
+opencv-python==4.11.0.86
+rawpy==0.26.1
+
+# Data Processing
+pandas==2.2.2
+
+# GUI Framework
+PyQt6==6.10.2
+
+# Utilities
+PyExifTool==0.5.6
+requests==2.33.0
+pywebview==6.1
+
+# installer
+pyinstaller==6.18.0
+msvc-runtime==14.44.35112
+
+# EXIF reading
+exifread
+pillow==12.1.1
+
+# Camera-trap detection + classification (ensemble logic only; no PyTorch inference)
+speciesnet==5.0.3

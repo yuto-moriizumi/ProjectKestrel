@@ -114,7 +114,9 @@ jobs:
           python -m venv .venv2
           .\.venv2\Scripts\Activate.ps1
           python -m pip install --upgrade pip
-          pip install -r requirements.txt
+          # Windows build uses onnxruntime-directml (DirectML GPU acceleration).
+          # See requirements-windows.txt.
+          pip install -r requirements-windows.txt
           pip install pyinstaller
 
       - name: Build ProjectKestrel with PyInstaller
