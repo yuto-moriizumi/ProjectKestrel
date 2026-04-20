@@ -1057,16 +1057,23 @@
       height: 100%;
     }
 
-    /* Modal */
+    /* Modal.
+       Default: size to content in both dimensions. Dialogs that genuinely
+       need the full viewport (scene viewer, settings) opt in explicitly
+       below. This keeps small dialogs (merge, info, adjust-time, etc.)
+       from stretching to window width/height when they only have a few
+       rows of content. */
     dialog {
       border: 1px solid #2a3040;
       background: var(--panel);
       color: var(--text);
       border-radius: 14px;
-      width: min(1200px, 96vw);
+      width: auto;
+      max-width: min(1200px, 96vw);
+      height: auto;
       max-height: 92vh;
-      height: 92vh;
-      overflow: hidden;
+      overflow-x: hidden;
+      overflow-y: auto;
     }
 
     dialog::backdrop {
@@ -1603,6 +1610,83 @@
       font-size: 12px;
       margin-left: auto;
       flex-shrink: 0;
+      display: flex;
+      align-items: center;
+      gap: 10px;
+      min-width: 0;
+    }
+    .scene-info-meta-text {
+      overflow: hidden;
+      text-overflow: ellipsis;
+      white-space: nowrap;
+      min-width: 0;
+    }
+    .scene-info-crop-nav {
+      display: inline-flex;
+      align-items: center;
+      gap: 2px;
+      background: #1a1e26;
+      border: 1px solid #2a3040;
+      border-radius: 6px;
+      padding: 2px;
+      flex-shrink: 0;
+    }
+    .scene-info-crop-nav.hidden { display: none; }
+    .scene-info-crop-btn {
+      background: transparent;
+      border: none;
+      color: #9fb0cc;
+      font-size: 13px;
+      line-height: 1;
+      padding: 3px 7px;
+      border-radius: 4px;
+      cursor: pointer;
+      transition: background .12s ease, color .12s ease;
+    }
+    .scene-info-crop-btn:hover {
+      background: #252d40;
+      color: var(--brand);
+    }
+    .scene-info-crop-btn:disabled {
+      opacity: 0.35;
+      cursor: not-allowed;
+    }
+    .scene-info-crop-label {
+      font-size: 11px;
+      color: #cbd2dc;
+      font-weight: 600;
+      padding: 0 4px;
+      min-width: 54px;
+      text-align: center;
+      white-space: nowrap;
+    }
+    .scene-info-editor-btn {
+      display: inline-flex;
+      align-items: center;
+      gap: 5px;
+      background: #1a2235;
+      border: 1px solid #2a3d5c;
+      color: #a9c9ee;
+      font-size: 11px;
+      font-weight: 600;
+      padding: 4px 10px;
+      border-radius: 6px;
+      cursor: pointer;
+      transition: background .12s ease, border-color .12s ease, color .12s ease, opacity .12s ease;
+      flex-shrink: 0;
+    }
+    .scene-info-editor-btn:hover {
+      background: #1b2a42;
+      border-color: var(--brand);
+      color: #fff;
+    }
+    .scene-info-editor-btn:disabled {
+      opacity: 0.45;
+      cursor: not-allowed;
+    }
+    .scene-info-editor-icon {
+      font-size: 13px;
+      line-height: 1;
     }
 
     /* ── BOTTOM: Filmstrip ── */
@@ -3543,6 +3627,9 @@
       padding-top: 0;
     }
 
+    /* Dot size is set inline by JS to reflect image count in the cluster,
+       so bursts of activity are visible at a glance while scrolling down
+       the rail. Bigger dot = more images in that cluster. */
     .timeline-dot {
       width: 11px;
       height: 11px;
@@ -3551,8 +3638,12 @@
       border: 2px solid var(--bg);
       box-shadow: 0 0 0 3px rgba(58, 100, 200, 0.18);
       flex-shrink: 0;
-      margin-top: 15px;
+      margin-top: 13px;
       z-index: 1;
+      transition: transform .15s ease, box-shadow .15s ease;
+    }
+    .timeline-node:hover .timeline-dot {
+      box-shadow: 0 0 0 3px rgba(106, 160, 255, 0.32);
     }
 
     .timeline-line {
@@ -3590,6 +3681,11 @@
 
     .timeline-node-count {
       font-size: 11px;
+    }
+
+    .timeline-node-untimed .timeline-dot {
+      background: #4a5266;
+      box-shadow: 0 0 0 3px rgba(74,82,102,0.18);
     }
 
     /* Inside a timeline node, cards are a bit denser */

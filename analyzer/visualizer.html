@@ -314,7 +314,18 @@
             <button class="cull-btn unrated" data-cull="none" title="Reset (X)">Undecided</button>
             <button class="cull-btn reject" data-cull="reject" title="Reject (C)">✗ Reject</button>
           </div>
-          <div class="scene-info-meta" id="sceneInfoMeta"></div>
+          <div class="scene-info-meta" id="sceneInfoMeta">
+            <span class="scene-info-meta-text" id="sceneInfoMetaText">—</span>
+            <span class="scene-info-crop-nav hidden" id="sceneInfoCropNav" role="group" aria-label="Switch bird crop">
+              <button class="scene-info-crop-btn" id="sceneInfoCropPrev" type="button" title="Previous crop (↑)" aria-label="Previous crop">◂</button>
+              <span class="scene-info-crop-label" id="sceneInfoCropLabel">Crop 1/1</span>
+              <button class="scene-info-crop-btn" id="sceneInfoCropNext" type="button" title="Next crop (↓)" aria-label="Next crop">▸</button>
+            </span>
+            <button class="scene-info-editor-btn" id="sceneInfoEditorBtn" type="button" title="Open original in external editor (Space)">
+              <span class="scene-info-editor-icon">↗</span>
+              <span class="scene-info-editor-label" id="sceneInfoEditorLabel">Open</span>
+            </button>
+          </div>
         </div>
       </div>
 

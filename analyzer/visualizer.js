@@ -1076,25 +1076,40 @@
       return sd.scenes[sceneCount];
     }
 
+    // Labels that the pipeline emits as placeholders for "no usable
+    // classification" — these should never become user-visible scene tags.
+    // 'Unknown' is what SpeciesNet returns for "no cv result" routed wildlife
+    // detections; 'N/A' is used for non-bird placeholder rows; 'No Bird'
+    // is the explicit absence label.
+    const _PLACEHOLDER_SPECIES_LABELS = new Set(['No Bird', 'Unknown', 'N/A']);
+    const _PLACEHOLDER_FAMILY_LABELS = new Set(['Unknown', 'N/A']);
+
+    function _isMeaningfulSpeciesLabel(name) {
+      return !!name && !_PLACEHOLDER_SPECIES_LABELS.has(name);
+    }
+    function _isMeaningfulFamilyLabel(name) {
+      return !!name && !_PLACEHOLDER_FAMILY_LABELS.has(name);
+    }
+
     function _computeSceneTagsFromRows(sceneRows, confThreshold, includeSecondary, includeFamilies = true) {
       const speciesSet = new Set();
       const familySet = new Set();
       for (const r of sceneRows) {
         const conf = parseNumber(r.species_confidence);
-        if (conf >= confThreshold && r.species && r.species !== 'No Bird') speciesSet.add(r.species);
+        if (conf >= confThreshold && _isMeaningfulSpeciesLabel(r.species)) speciesSet.add(r.species);
         if (includeFamilies) {
           const fconf = parseNumber(r.family_confidence);
-          if (fconf >= confThreshold && r.family && r.family !== 'Unknown' && r.family !== 'N/A') familySet.add(r.family);
+          if (fconf >= confThreshold && _isMeaningfulFamilyLabel(r.family)) familySet.add(r.family);
         }
         if (includeSecondary) {
           const secondary = parseSecondarySpecies(r);
           for (const { name, score } of secondary) {
-            if (score >= confThreshold && name && name !== 'No Bird') speciesSet.add(name);
+            if (score >= confThreshold && _isMeaningfulSpeciesLabel(name)) speciesSet.add(name);
           }
           if (includeFamilies) {
             const secFams = parseSecondaryFamilies(r);
             for (const { name, score } of secFams) {
-              if (score >= confThreshold && name && name !== 'Unknown' && name !== 'N/A') familySet.add(name);
+              if (score >= confThreshold && _isMeaningfulFamilyLabel(name)) familySet.add(name);
             }
           }
         }
@@ -1381,46 +1396,108 @@
       // Flat index for shift-click range selection
       _visibleSceneOrder = visibleScenes.map(s => String(s.id));
 
-      // ---- Two-level grouping: folder → time-buckets ----
-      function getTimeBucket(s) {
-        const ct = s.representative?.capture_time;
-        if (!ct) return '';
+      // ---- Two-level grouping: folder → adaptive time clusters ----
+      //
+      // The timeline previously used a fixed 1-hour grid (YYYY-MM-DDTHH) which
+      // both over-segmented long sessions (e.g. 55 minutes → 2 nodes straddling
+      // the hour boundary) and under-segmented bursty ones (50 shots in 3
+      // minutes became a single node identical to 1 shot in 30 minutes).
+      // We now cluster by actual gaps between successive scenes so a "session"
+      // of continuous shooting is one node, and a quiet pause cuts a new node
+      // regardless of clock alignment.
+      //
+      // The gap threshold is derived from the folder itself: we take the
+      // median inter-scene gap and multiply by a constant so anything notably
+      // quieter than the folder's typical rhythm starts a new cluster. This
+      // keeps dense burst folders (gap of ~1s → ~10s threshold) and casual
+      // days (gap of ~30s → ~5min threshold) from needing different settings.
+      // Hard floor/ceiling keep pathological data (single-scene folders,
+      // multi-week bundles) from producing absurd thresholds.
+      const CLUSTER_GAP_MIN_MS = 45 * 1000;       // 45 s — never split bursts
+      const CLUSTER_GAP_MAX_MS = 10 * 60 * 1000;  // 10 min — never merge sessions
+      const CLUSTER_GAP_FALLBACK_MS = 3 * 60 * 1000; // fallback if we can't infer
+      const CLUSTER_GAP_MULTIPLIER = 10;
+
+      function computeDynamicClusterGapMs(scenes) {
+        const times = [];
+        for (const s of scenes) {
+          if (Number.isFinite(s.captureTimeMs)) times.push(s.captureTimeMs);
+        }
+        if (times.length < 3) return CLUSTER_GAP_FALLBACK_MS;
+        times.sort((a, b) => a - b);
+        const gaps = [];
+        for (let i = 1; i < times.length; i++) {
+          const g = times[i] - times[i - 1];
+          if (g > 0) gaps.push(g);
+        }
+        if (!gaps.length) return CLUSTER_GAP_FALLBACK_MS;
+        gaps.sort((a, b) => a - b);
+        const median = gaps[Math.floor(gaps.length / 2)];
+        const threshold = median * CLUSTER_GAP_MULTIPLIER;
+        return Math.max(CLUSTER_GAP_MIN_MS, Math.min(CLUSTER_GAP_MAX_MS, threshold));
+      }
+
+      function _pad2(n) { return String(n).padStart(2, '0'); }
+      function _dayKeyFromMs(ms) {
+        if (!Number.isFinite(ms)) return '';
+        const d = new Date(ms);
+        if (isNaN(d)) return '';
+        return `${d.getFullYear()}-${_pad2(d.getMonth()+1)}-${_pad2(d.getDate())}`;
+      }
+      function formatClusterTime(ms) {
+        if (!Number.isFinite(ms)) return '';
         try {
-          const d = new Date(ct);
-          if (isNaN(d)) return '';
-          const pad = n => String(n).padStart(2, '0');
-          return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}`;
+          return new Date(ms).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
         } catch (_) { return ''; }
       }
-      function getBucketDay(bucket) { return bucket ? bucket.split('T')[0] : ''; }
-      function formatNodeTime(bucket) {
-        if (!bucket) return 'Unknown time';
+      function formatClusterDay(ms) {
+        if (!Number.isFinite(ms)) return '';
         try {
-          const d = new Date(bucket + ':00');
-          if (isNaN(d)) return bucket;
-          return d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
-        } catch (_) { return bucket; }
-      }
-      function formatNodeDay(bucket) {
-        if (!bucket) return '';
-        try {
-          const d = new Date(bucket + ':00');
-          if (isNaN(d)) return '';
-          return d.toLocaleDateString(undefined, { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+          return new Date(ms).toLocaleDateString(undefined, { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
         } catch (_) { return ''; }
       }
 
-      // Build folderMap: folderKey → { folderPath, buckets: Map<tb, scene[]>, bucketOrder: [] }
+      // Walk scenes in ascending time order, cutting a new cluster each time
+      // the gap between the last scene's time and the next exceeds the
+      // threshold. Scenes lacking capture time are dropped into a final
+      // "untimed" cluster so they remain visible but don't distort ranges.
+      function buildTimeClusters(scenes, gapMs) {
+        const timed = [];
+        const untimed = [];
+        for (const s of scenes) {
+          if (Number.isFinite(s.captureTimeMs)) timed.push(s);
+          else untimed.push(s);
+        }
+        timed.sort((a, b) => a.captureTimeMs - b.captureTimeMs);
+        const clusters = [];
+        for (const s of timed) {
+          const last = clusters[clusters.length - 1];
+          if (!last || s.captureTimeMs - last.endMs > gapMs) {
+            clusters.push({
+              scenes: [s],
+              startMs: s.captureTimeMs,
+              endMs: s.captureTimeMs,
+              untimed: false,
+            });
+          } else {
+            last.scenes.push(s);
+            if (s.captureTimeMs > last.endMs) last.endMs = s.captureTimeMs;
+          }
+        }
+        if (untimed.length) {
+          clusters.push({ scenes: untimed, startMs: null, endMs: null, untimed: true });
+        }
+        return clusters;
+      }
+
+      // Build folderMap: folderKey → { folderPath, scenes: [ordered scene list] }
       const folderOrder = [];
       const folderMap = new Map();
       for (const s of visibleScenes) {
         const rp = groupByFolder ? (s.representative?.__rootPath || '') : '';
         const fk = rp || '__single__';
-        if (!folderMap.has(fk)) { folderMap.set(fk, { folderPath: rp, buckets: new Map(), bucketOrder: [] }); folderOrder.push(fk); }
-        const fd = folderMap.get(fk);
-        const tb = groupByTime ? (getTimeBucket(s) || '__notime__') : '__all__';
-        if (!fd.buckets.has(tb)) { fd.buckets.set(tb, []); fd.bucketOrder.push(tb); }
-        fd.buckets.get(tb).push(s);
+        if (!folderMap.has(fk)) { folderMap.set(fk, { folderPath: rp, scenes: [] }); folderOrder.push(fk); }
+        folderMap.get(fk).scenes.push(s);
       }
       const showFolderHeaders = groupByFolder;
 
@@ -1530,57 +1607,109 @@
       const batch = 24;
 
       // ---- Timeline builder (used when groupByTime is on) ----
+      //
+      // Each cluster renders as a timeline node with:
+      //   • rail dot (sized by image count) + connecting line
+      //   • a header showing the time range, scene count, and image count
+      //   • a grid of scene cards
+      //
+      // The rail dot scales with the cluster's image count so a quick scroll
+      // down the left edge makes shooting bursts immediately visible — bigger
+      // dot = denser cluster. Sizing uses sqrt so a 200-shot burst isn't 10×
+      // the size of a 20-shot one.
+      const _DOT_MIN_PX = 8;
+      const _DOT_MAX_PX = 26;
+
+      function _clusterImageCount(cluster) {
+        let n = 0;
+        for (const s of cluster.scenes) n += s.imageCount || 0;
+        return n;
+      }
+
+      function _dotSizePx(imageCount, maxInFolder) {
+        if (!Number.isFinite(imageCount) || imageCount <= 0) return _DOT_MIN_PX;
+        if (!Number.isFinite(maxInFolder) || maxInFolder <= 1) return _DOT_MIN_PX + 3;
+        const frac = Math.sqrt(imageCount) / Math.sqrt(maxInFolder);
+        return Math.round(_DOT_MIN_PX + frac * (_DOT_MAX_PX - _DOT_MIN_PX));
+      }
+
       function buildTimeline(fd, containerEl) {
         const timelineEl = document.createElement('div');
         timelineEl.className = 'timeline-body';
+        const gapMs = computeDynamicClusterGapMs(fd.scenes);
+        const clusters = buildTimeClusters(fd.scenes, gapMs);
         let prevDay = null;
-        const allBuckets = fd.bucketOrder;
 
-        for (let ni = 0; ni < allBuckets.length; ni++) {
-          const tb = allBuckets[ni];
-          const tbScenes = fd.buckets.get(tb);
-          const isLast = ni === allBuckets.length - 1;
-          const thisDay = getBucketDay(tb);
+        // Pre-compute the max image count across all clusters so dot sizes
+        // are proportional within this folder (different folders can have
+        // wildly different scales and shouldn't compete on the same axis).
+        let maxImgCountInFolder = 1;
+        for (const c of clusters) {
+          const n = _clusterImageCount(c);
+          if (n > maxImgCountInFolder) maxImgCountInFolder = n;
+        }
 
-          // Day banner when the calendar date changes between buckets
-          if (thisDay && thisDay !== '__notime__' && thisDay !== prevDay) {
+        for (let ni = 0; ni < clusters.length; ni++) {
+          const cluster = clusters[ni];
+          const isLast = ni === clusters.length - 1;
+          const thisDay = cluster.untimed ? '' : _dayKeyFromMs(cluster.startMs);
+
+          // Day banner when the calendar date changes between clusters
+          if (thisDay && thisDay !== prevDay) {
             const banner = document.createElement('div');
             banner.className = 'timeline-day-banner';
-            banner.textContent = formatNodeDay(tb);
+            banner.textContent = formatClusterDay(cluster.startMs);
             timelineEl.appendChild(banner);
             prevDay = thisDay;
           }
 
           const nodeEl = document.createElement('div');
-          nodeEl.className = 'timeline-node';
+          nodeEl.className = 'timeline-node' + (cluster.untimed ? ' timeline-node-untimed' : '');
 
-          // Rail column: dot + connecting line
+          // Rail column: dot (sized by image count) + connecting line
           const railCol = document.createElement('div');
           railCol.className = 'timeline-rail-col';
           const dot = document.createElement('div');
           dot.className = 'timeline-dot';
+          const imgCount = _clusterImageCount(cluster);
+          const dotSize = _dotSizePx(imgCount, maxImgCountInFolder);
+          dot.style.width = dotSize + 'px';
+          dot.style.height = dotSize + 'px';
+          // Title gives a fallback tooltip for folks who want the raw number.
+          dot.title = `${cluster.scenes.length} scene${cluster.scenes.length === 1 ? '' : 's'} · ${imgCount} image${imgCount === 1 ? '' : 's'}`;
           const line = document.createElement('div');
           line.className = 'timeline-line' + (isLast ? ' last' : '');
           railCol.appendChild(dot);
           railCol.appendChild(line);
 
-          // Content column: time label + scene cards
+          // Content column: header + grid
           const contentCol = document.createElement('div');
           contentCol.className = 'timeline-content-col';
 
-          if (tb !== '__all__') {
-            const hdr = document.createElement('div');
-            hdr.className = 'timeline-node-header';
-            const timeSpan = document.createElement('span');
-            timeSpan.className = 'timeline-node-time';
-            timeSpan.textContent = tb === '__notime__' ? 'Unknown time' : formatNodeTime(tb);
-            const countSpan = document.createElement('span');
-            countSpan.className = 'timeline-node-count muted';
-            countSpan.textContent = `${tbScenes.length} scene${tbScenes.length === 1 ? '' : 's'}`;
-            hdr.appendChild(timeSpan);
-            hdr.appendChild(countSpan);
-            contentCol.appendChild(hdr);
+          const hdr = document.createElement('div');
+          hdr.className = 'timeline-node-header';
+
+          const timeSpan = document.createElement('span');
+          timeSpan.className = 'timeline-node-time';
+          if (cluster.untimed) {
+            timeSpan.textContent = 'Unknown time';
+          } else {
+            const spanMs = cluster.endMs - cluster.startMs;
+            // Collapse clusters that span less than two minutes to a single
+            // time (otherwise the header reads "10:42 AM – 10:42 AM").
+            timeSpan.textContent = spanMs < 2 * 60 * 1000
+              ? formatClusterTime(cluster.startMs)
+              : `${formatClusterTime(cluster.startMs)} – ${formatClusterTime(cluster.endMs)}`;
           }
+          hdr.appendChild(timeSpan);
+
+          const countSpan = document.createElement('span');
+          countSpan.className = 'timeline-node-count muted';
+          countSpan.textContent =
+            `${cluster.scenes.length} scene${cluster.scenes.length === 1 ? '' : 's'} · ${imgCount} image${imgCount === 1 ? '' : 's'}`;
+          hdr.appendChild(countSpan);
+
+          contentCol.appendChild(hdr);
 
           const gridEl = document.createElement('div');
           gridEl.className = 'grid timeline-grid';
@@ -1590,9 +1719,9 @@
           nodeEl.appendChild(contentCol);
           timelineEl.appendChild(nodeEl);
 
-          for (let i = 0; i < tbScenes.length; i += batch) {
+          for (let i = 0; i < cluster.scenes.length; i += batch) {
             if (myVer !== _renderScenesVersion) { sceneGrid.style.minHeight = ''; return; }
-            const slice = tbScenes.slice(i, i + batch);
+            const slice = cluster.scenes.slice(i, i + batch);
             const frag = document.createDocumentFragment();
             for (const s of slice) frag.appendChild(buildCard(s));
             gridEl.appendChild(frag);
@@ -1604,7 +1733,7 @@
       // ---- Main folder rendering loop ----
       for (const fk of folderOrder) {
         const fd = folderMap.get(fk);
-        const allScenesInFolder = [...fd.buckets.values()].flat();
+        const allScenesInFolder = fd.scenes;
         let bodyEl; // receives the timeline or flat grid
 
         if (showFolderHeaders && fd.folderPath) {
@@ -1635,6 +1764,19 @@
           folderOptionsBtn.title = 'Reset Accept/Reject culling decisions for this folder';
           folderOptionsBtn.addEventListener('click', (ev) => { ev.stopPropagation(); showFolderOptionsDialog(fd.folderPath); });
           leftActions.appendChild(folderOptionsBtn);
+
+          // Adjust Capture Time — shifts every row's capture_time by a
+          // user-supplied offset (hours). Useful when the camera clock was
+          // set to the wrong time zone or drifted relative to another body.
+          const adjustTimeBtn = document.createElement('button');
+          adjustTimeBtn.className = 'action-btn';
+          adjustTimeBtn.innerHTML = '<i>⏱</i> Adjust Capture Time';
+          adjustTimeBtn.title = 'Shift capture timestamps for every image in this folder by a fixed offset (useful for syncing between camera bodies)';
+          adjustTimeBtn.addEventListener('click', (ev) => {
+            ev.stopPropagation();
+            showAdjustCaptureTimeDialog(fd.folderPath);
+          });
+          leftActions.appendChild(adjustTimeBtn);
 
           hdr.appendChild(leftActions);
 
@@ -2662,16 +2804,55 @@
         });
       }
 
-      const metaEl = el('#sceneInfoMeta');
-      if (metaEl) {
+      const metaTextEl = el('#sceneInfoMetaText');
+      if (metaTextEl) {
         const sp = decodeEntities(activeSpecies);
         const spConf = fmt3(activeSpeciesConf);
         const fam = decodeEntities(activeFamily);
         const famConf = fmt3(activeFamilyConf);
-        const cropLabel = cropState.crops.length > 0
-          ? ` · Crop ${cropState.activeIndex + 1}/${cropState.crops.length}`
-          : '';
-        metaEl.textContent = `${sp} (${spConf}) | ${fam} (${famConf}) · Image ${idx + 1} of ${scene.images.length}${cropLabel}`;
+        metaTextEl.textContent = `${sp} (${spConf}) | ${fam} (${famConf}) · Image ${idx + 1} of ${scene.images.length}`;
+      }
+
+      // Crop nav (shown only when a row exposes multiple bird crops).
+      const cropNavEl = el('#sceneInfoCropNav');
+      const cropLabelEl = el('#sceneInfoCropLabel');
+      const cropPrevBtn = el('#sceneInfoCropPrev');
+      const cropNextBtn = el('#sceneInfoCropNext');
+      if (cropNavEl && cropLabelEl && cropPrevBtn && cropNextBtn) {
+        const total = cropState.crops.length;
+        if (total > 1) {
+          cropNavEl.classList.remove('hidden');
+          cropLabelEl.textContent = `Crop ${cropState.activeIndex + 1}/${total}`;
+          cropPrevBtn.disabled = false;
+          cropNextBtn.disabled = false;
+          const cycleCrop = (step) => {
+            const stateNow = getRowActiveCropState(r);
+            if (stateNow.crops.length <= 1) return;
+            const next = (stateNow.activeIndex + step + stateNow.crops.length) % stateNow.crops.length;
+            setRowActiveCropIndex(r, next, stateNow.crops);
+            selectFilmstripImage(currentImageIndex, _currentScene, true, true);
+          };
+          cropPrevBtn.onclick = (ev) => { ev.stopPropagation(); cycleCrop(-1); };
+          cropNextBtn.onclick = (ev) => { ev.stopPropagation(); cycleCrop(1); };
+        } else {
+          cropNavEl.classList.add('hidden');
+          cropLabelEl.textContent = '';
+          cropPrevBtn.onclick = null;
+          cropNextBtn.onclick = null;
+        }
+      }
+
+      // "Open in editor" button — label reflects the currently configured editor.
+      const editorBtn = el('#sceneInfoEditorBtn');
+      const editorLabelEl = el('#sceneInfoEditorLabel');
+      if (editorBtn && editorLabelEl) {
+        const editorKey = getSetting('editor', 'darktable');
+        editorLabelEl.textContent = `Open in ${_editorDisplayName(editorKey)}`;
+        editorBtn.title = `Open original in ${_editorDisplayName(editorKey)} (Space)`;
+        editorBtn.onclick = (ev) => {
+          ev.stopPropagation();
+          openInEditor(r);
+        };
       }
 
       // Render star bar in info bar
@@ -4568,6 +4749,33 @@
       const i = s.toLowerCase().lastIndexOf('/.kestrel/');
       if (i > 0) return s.substring(0, i);
       return null;
+    }
+
+    // Display names for each editor key used by the preferred-editor setting.
+    // Mirrors the <option> list in visualizer.html so the button label reads
+    // naturally (e.g. "Open in Lightroom") instead of raw keys like "lightroom".
+    const _EDITOR_DISPLAY_NAMES = {
+      system: 'Default App',
+      darktable: 'Darktable',
+      lightroom: 'Lightroom',
+      photoshop: 'Photoshop',
+      capture_one: 'Capture One',
+      affinity: 'Affinity',
+      gimp: 'GIMP',
+      rawtherapee: 'RawTherapee',
+      luminar: 'Luminar',
+      dxo: 'DxO PhotoLab',
+      on1: 'ON1',
+      acdsee: 'ACDSee',
+      paintshop: 'PaintShop',
+      faststone: 'FastStone',
+      xnview: 'XnView',
+      irfanview: 'IrfanView',
+      custom: 'Editor',
+    };
+    function _editorDisplayName(key) {
+      if (!key) return 'Editor';
+      return _EDITOR_DISPLAY_NAMES[key] || 'Editor';
     }
 
     async function openInEditor(row) {
@@ -7819,6 +8027,243 @@
       dlg.showModal();
     }
 
+    // ---- Adjust Capture Time dialog ----
+    //
+    // Shifts every row's `capture_time` in the given folder by a user-supplied
+    // number of hours (can be fractional and/or negative). Values are parsed
+    // as ISO strings, offset in milliseconds, and re-serialised as ISO without
+    // timezone suffixes so the shift stays consistent on reload. Rows that
+    // lack a parseable capture time are left untouched.
+    function _shiftIsoTime(iso, offsetMs) {
+      if (!iso) return '';
+      const trimmed = String(iso).trim();
+      if (!trimmed) return '';
+      let d = new Date(trimmed);
+      if (isNaN(d)) d = new Date(trimmed.replace(' ', 'T'));
+      if (isNaN(d)) return trimmed;
+      const shifted = new Date(d.getTime() + offsetMs);
+      if (isNaN(shifted)) return trimmed;
+      const p = (n) => String(n).padStart(2, '0');
+      // Mirror the pipeline format: local-ish ISO without timezone suffix,
+      // matching `datetime.isoformat()` output on capture_time writes.
+      return `${shifted.getFullYear()}-${p(shifted.getMonth()+1)}-${p(shifted.getDate())}T${p(shifted.getHours())}:${p(shifted.getMinutes())}:${p(shifted.getSeconds())}`;
+    }
+
+    // Format a ms timestamp as a friendly local string like
+    //   "Tue, Oct 14, 2025, 14:32:47"
+    function _formatPrettyLocalTime(ms) {
+      if (!Number.isFinite(ms)) return '—';
+      const d = new Date(ms);
+      try {
+        return d.toLocaleString(undefined, {
+          weekday: 'short', year: 'numeric', month: 'short', day: 'numeric',
+          hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+        });
+      } catch (_) {
+        return d.toISOString();
+      }
+    }
+
+    // Convert a ms timestamp to a "YYYY-MM-DDTHH:MM:SS" string in local time,
+    // suitable for a <input type="datetime-local" step="1"> value.
+    function _msToDatetimeLocalValue(ms) {
+      if (!Number.isFinite(ms)) return '';
+      const d = new Date(ms);
+      const p = (n) => String(n).padStart(2, '0');
+      return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+    }
+
+    // Parse a <input type="datetime-local"> value back into a ms timestamp
+    // (interpreted in local time, same convention the pipeline uses).
+    function _datetimeLocalValueToMs(val) {
+      if (!val) return Number.NaN;
+      const m = String(val).match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/);
+      if (!m) return Number.NaN;
+      const d = new Date(
+        Number(m[1]), Number(m[2]) - 1, Number(m[3]),
+        Number(m[4]), Number(m[5]), Number(m[6] || 0),
+      );
+      const ms = d.getTime();
+      return Number.isFinite(ms) ? ms : Number.NaN;
+    }
+
+    // Pretty-print a signed ms offset as "+2h 30m" / "-45m 12s" / "0".
+    function _formatOffsetMs(offsetMs) {
+      if (!Number.isFinite(offsetMs) || offsetMs === 0) return '0';
+      const sign = offsetMs > 0 ? '+' : '−';
+      const totalSec = Math.round(Math.abs(offsetMs) / 1000);
+      const h = Math.floor(totalSec / 3600);
+      const m = Math.floor((totalSec % 3600) / 60);
+      const s = totalSec % 60;
+      const parts = [];
+      if (h) parts.push(`${h}h`);
+      if (m) parts.push(`${m}m`);
+      if (s || !parts.length) parts.push(`${s}s`);
+      return `${sign}${parts.join(' ')}`;
+    }
+
+    function showAdjustCaptureTimeDialog(folderPath) {
+      if (!folderPath) { showToast('No folder selected', 2500); return; }
+      const folderName = folderBaseName(folderPath) || folderPath;
+      const targetRows = rows.filter(r => r.__rootPath === folderPath);
+      if (!targetRows.length) { showToast('No images loaded for this folder', 2500); return; }
+
+      // Sort all rows that have a parseable capture time chronologically so
+      // "the first photo" the user sees is the actual earliest capture — not
+      // whatever happens to be first in the CSV.
+      const timedRows = targetRows
+        .filter(r => Number.isFinite(parseCaptureTimeMs(r.capture_time)))
+        .slice()
+        .sort((a, b) => parseCaptureTimeMs(a.capture_time) - parseCaptureTimeMs(b.capture_time));
+      const anchorRow = timedRows[0] || null;
+      const anchorOriginalIso = anchorRow ? String(anchorRow.capture_time || '') : '';
+      const anchorOriginalMs = anchorRow ? parseCaptureTimeMs(anchorOriginalIso) : Number.NaN;
+      const withTime = timedRows.length;
+
+      const dlg = document.createElement('dialog');
+      dlg.style.cssText = [
+        'border:1px solid #303a52', 'border-radius:12px', 'background:#141a24',
+        'color:#e8f0f8', 'padding:0', 'width:min(540px,96vw)',
+        'box-shadow:0 8px 40px rgba(0,0,0,0.6)',
+      ].join(';');
+
+      const initialValue = _msToDatetimeLocalValue(anchorOriginalMs);
+
+      dlg.innerHTML = `
+        <div style="padding:18px 22px 12px;border-bottom:1px solid #222e45;">
+          <div style="font-size:16px;font-weight:700;margin-bottom:3px;">Adjust Capture Time</div>
+          <div style="color:#7a90b8;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${escapeHtml(folderPath)}">${escapeHtml(folderName)} · ${targetRows.length} image${targetRows.length === 1 ? '' : 's'} · ${withTime} with capture time</div>
+        </div>
+        <div style="padding:16px 22px;">
+          <div style="font-size:12px;color:#9fb0cc;line-height:1.55;margin-bottom:14px;">
+            Use this when your camera clock was set to the wrong time zone — for example, travelling abroad with a body still on home time, or a daylight-savings change that didn't get picked up. Correcting the time on the photo below will apply the same offset to every photo in this folder.
+          </div>
+          ${anchorRow ? `
+            <div style="display:flex;gap:14px;align-items:flex-start;background:#0f1422;border:1px solid #1e2638;border-radius:8px;padding:12px;margin-bottom:14px;">
+              <div style="flex:0 0 auto;width:104px;height:104px;background:#0a0d15;border:1px solid #1c2438;border-radius:6px;overflow:hidden;display:flex;align-items:center;justify-content:center;">
+                <img id="actThumb" alt="" style="max-width:100%;max-height:100%;object-fit:contain;display:none;" />
+                <div id="actThumbFallback" style="color:#475670;font-size:10px;">loading…</div>
+              </div>
+              <div style="flex:1 1 auto;min-width:0;">
+                <div style="font-size:11px;color:#7a90b8;margin-bottom:2px;">Earliest photo in this folder</div>
+                <div style="font-size:12px;color:#cbd2dc;word-break:break-all;margin-bottom:10px;" title="${escapeHtml(anchorRow.filename || '')}">${escapeHtml(anchorRow.filename || '(unknown file)')}</div>
+                <label style="display:flex;flex-direction:column;gap:4px;">
+                  <span style="font-size:11px;color:#a9c9ee;font-weight:600;">This photo was taken at:</span>
+                  <input id="actDateInput" type="datetime-local" step="1" value="${escapeHtml(initialValue)}"
+                    style="padding:7px 10px;border:1px solid #2a3040;background:#0e1320;color:#e8f0f8;border-radius:6px;font-size:13px;font-family:inherit;" />
+                </label>
+              </div>
+            </div>
+            <div id="actSummary" style="background:#15192a;border:1px solid #243043;border-radius:6px;padding:10px 12px;margin-bottom:16px;font-size:12px;color:#a9c9ee;line-height:1.6;"></div>
+          ` : `
+            <div style="background:#2a1a1a;border:1px solid #52323a;border-radius:6px;padding:12px;margin-bottom:16px;font-size:12px;color:#d0a0a0;line-height:1.5;">
+              No images in this folder have a readable capture time, so there's nothing to shift.
+            </div>
+          `}
+          <div style="display:flex;gap:8px;justify-content:flex-end;">
+            <button id="actCancel" style="padding:8px 16px;border:1px solid #3a465f;background:#1c2433;color:#e8f0f8;border-radius:6px;cursor:pointer;font-size:13px;">Cancel</button>
+            <button id="actApply" ${anchorRow ? '' : 'disabled'} style="padding:8px 16px;border:1px solid #2a5fa8;background:#1a3a6a;color:#7eb8e0;border-radius:6px;cursor:${anchorRow ? 'pointer' : 'not-allowed'};font-size:13px;font-weight:600;opacity:${anchorRow ? '1' : '.55'};">Save</button>
+          </div>
+        </div>
+      `;
+      document.body.appendChild(dlg);
+      const closeAndRemove = () => { try { dlg.close(); } catch (_) {} if (dlg.parentNode) dlg.parentNode.removeChild(dlg); };
+
+      // Load the anchor photo thumbnail asynchronously (desktop only). If it
+      // fails we just leave the placeholder in place — not critical.
+      if (anchorRow && anchorRow.filename) {
+        (async () => {
+          try {
+            const url = await getBlobUrlForPath(anchorRow.filename, folderPath);
+            const imgEl = dlg.querySelector('#actThumb');
+            const fbEl = dlg.querySelector('#actThumbFallback');
+            if (url && imgEl) {
+              imgEl.addEventListener('load', () => {
+                imgEl.style.display = 'block';
+                if (fbEl) fbEl.style.display = 'none';
+              });
+              imgEl.src = url;
+            } else if (fbEl) {
+              fbEl.textContent = '—';
+            }
+          } catch (_) {
+            const fbEl = dlg.querySelector('#actThumbFallback');
+            if (fbEl) fbEl.textContent = '—';
+          }
+        })();
+      }
+
+      const dateInput = dlg.querySelector('#actDateInput');
+      const summaryEl = dlg.querySelector('#actSummary');
+      const applyBtn = dlg.querySelector('#actApply');
+
+      const setApplyEnabled = (enabled) => {
+        if (!applyBtn) return;
+        applyBtn.disabled = !enabled;
+        applyBtn.style.opacity = enabled ? '1' : '.55';
+        applyBtn.style.cursor = enabled ? 'pointer' : 'not-allowed';
+      };
+
+      const renderSummary = () => {
+        if (!dateInput || !summaryEl) return;
+        const newMs = _datetimeLocalValueToMs(dateInput.value);
+        if (!Number.isFinite(newMs) || !Number.isFinite(anchorOriginalMs)) {
+          summaryEl.innerHTML = '<span style="color:#d08080;">Enter a valid date &amp; time.</span>';
+          setApplyEnabled(false);
+          return;
+        }
+        const offsetMs = newMs - anchorOriginalMs;
+        const prettyOriginal = _formatPrettyLocalTime(anchorOriginalMs);
+        if (offsetMs === 0) {
+          summaryEl.innerHTML = `
+            <div style="color:#7a90b8;">No change — the new time matches what was originally reported.</div>
+            <div style="margin-top:4px;"><span style="color:#7a90b8;">Original reported time:</span> <code style="background:#1c2438;padding:1px 5px;border-radius:3px;">${escapeHtml(prettyOriginal)}</code></div>
+          `;
+          setApplyEnabled(false);
+          return;
+        }
+        setApplyEnabled(true);
+        summaryEl.innerHTML = `
+          <div><span style="color:#7a90b8;">Original reported time:</span> <code style="background:#1c2438;padding:1px 5px;border-radius:3px;">${escapeHtml(prettyOriginal)}</code></div>
+          <div style="margin-top:4px;"><span style="color:#7a90b8;">This will shift all ${withTime} timed photo${withTime === 1 ? '' : 's'} by:</span> <b style="color:#8fc4ff;">${escapeHtml(_formatOffsetMs(offsetMs))}</b></div>
+        `;
+      };
+
+      if (dateInput) {
+        dateInput.addEventListener('input', renderSummary);
+        dateInput.addEventListener('change', renderSummary);
+        renderSummary();
+      }
+
+      dlg.querySelector('#actCancel').addEventListener('click', closeAndRemove);
+      if (anchorRow && applyBtn) {
+        applyBtn.addEventListener('click', () => {
+          const newMs = _datetimeLocalValueToMs(dateInput.value);
+          if (!Number.isFinite(newMs) || !Number.isFinite(anchorOriginalMs)) { closeAndRemove(); return; }
+          const offsetMs = newMs - anchorOriginalMs;
+          if (offsetMs === 0) { closeAndRemove(); return; }
+          let changed = 0;
+          for (const r of targetRows) {
+            const next = _shiftIsoTime(r.capture_time, offsetMs);
+            if (next && next !== r.capture_time) {
+              r.capture_time = next;
+              changed++;
+            }
+          }
+          if (changed > 0) {
+            markDirty(folderPath);
+            try { renderScenes(); } catch (_) {}
+            showToast(`Shifted ${changed} capture time${changed === 1 ? '' : 's'} by ${_formatOffsetMs(offsetMs)}`, 3500);
+          } else {
+            showToast('No capture times changed', 2500);
+          }
+          closeAndRemove();
+        });
+      }
+      dlg.addEventListener('close', () => { if (dlg.parentNode) dlg.parentNode.removeChild(dlg); });
+      dlg.showModal();
+    }
+
     // ---- Write Metadata launcher ----
     async function writeMetadataForFolder(rootPath) {
       if (!window.pywebview?.api) {
@@ -7842,6 +8287,24 @@
         'box-shadow:0 8px 40px rgba(0,0,0,0.6)',
       ].join(';');
 
+      const xmpFieldDefaults = {
+        rating: true,
+        label: true,
+        species: true,
+        family: true,
+        quality: true,
+      };
+      const savedXmpFields = getSetting('xmp_fields', xmpFieldDefaults) || {};
+      const xmpFields = { ...xmpFieldDefaults, ...savedXmpFields };
+      const fieldRow = (key, title, desc) => `
+        <label style="display:flex;align-items:flex-start;gap:8px;padding:5px 8px;border-radius:5px;cursor:pointer;" class="wm-field-row">
+          <input type="checkbox" data-xmp-field="${key}" ${xmpFields[key] ? 'checked' : ''} style="margin-top:2px;flex-shrink:0;" />
+          <span style="display:flex;flex-direction:column;gap:1px;min-width:0;">
+            <span style="font-size:12px;font-weight:600;color:#e8f0f8;">${title}</span>
+            <span style="font-size:11px;color:#7a90b8;line-height:1.35;">${desc}</span>
+          </span>
+        </label>`;
+
       dlg.innerHTML = `
         <div style="padding:20px 22px 14px;border-bottom:1px solid #222e45;">
           <div style="font-size:17px;font-weight:700;margin-bottom:4px;">Write Photo Metadata</div>
@@ -7854,6 +8317,18 @@
             <div style="flex:1;min-width:0;">
               <div style="font-size:13px;font-weight:600;margin-bottom:4px;">XMP Sidecar Files</div>
               <div style="font-size:12px;color:#7a90b8;line-height:1.5;">Writes a <code style="background:#1c2438;padding:1px 4px;border-radius:3px;">.xmp</code> sidecar file next to each original. Embeds star ratings, Accept/Reject decisions, and species tags in a format readable by Lightroom, Capture One, darktable, and other editors.</div>
+            </div>
+          </div>
+          <div style="background:#15192a;border:1px solid #243043;border-radius:8px;padding:10px 14px;margin-bottom:12px;">
+            <div style="font-size:12px;font-weight:600;color:#a9c9ee;margin-bottom:6px;display:flex;align-items:center;gap:6px;">
+              <span style="font-size:13px;">⚙️</span> Fields to write
+            </div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:2px;">
+              ${fieldRow('rating', 'Star Rating', 'xmp:Rating (0–5 stars).')}
+              ${fieldRow('label', 'Color Label', 'xmp:Label — Green/Red for Accept/Reject.')}
+              ${fieldRow('species', 'Species Tag', 'kestrel:Species + species keyword.')}
+              ${fieldRow('family', 'Family Tag', 'kestrel:Family + family keyword.')}
+              ${fieldRow('quality', 'Quality Score', 'kestrel:QualityScore (0–1).')}
             </div>
           </div>
           <div style="background:#1a1f10;border:1px solid #3a4020;border-radius:6px;padding:10px 14px;margin-bottom:16px;font-size:12px;color:#b0c070;line-height:1.5;">
@@ -7929,11 +8404,33 @@
 
       dlg.querySelector('#wmCancel').addEventListener('click', closeAndRemove);
 
+      // Read the current field selection out of the dialog and persist it so
+      // the next write defaults to whatever the user picked last.
+      const collectFieldSelection = () => {
+        const sel = { ...xmpFieldDefaults };
+        dlg.querySelectorAll('input[data-xmp-field]').forEach(cb => {
+          sel[cb.dataset.xmpField] = !!cb.checked;
+        });
+        return sel;
+      };
+      const persistFieldSelection = (sel) => {
+        try {
+          const cur = loadSettings();
+          cur.xmp_fields = sel;
+          saveSettings(cur);
+          if (window.pywebview?.api?.save_settings_data) {
+            window.pywebview.api.save_settings_data({ xmp_fields: sel }).catch(() => {});
+          }
+        } catch (_) {}
+      };
+
       dlg.querySelector('#wmOk').addEventListener('click', async () => {
+        const fieldSelection = collectFieldSelection();
+        persistFieldSelection(fieldSelection);
         showView('wmProgressView');
         addStep('write', 'Writing XMP sidecar files', 'running');
         try {
-          const res = await window.pywebview.api.write_xmp_metadata(rootPath, payload, false, false);
+          const res = await window.pywebview.api.write_xmp_metadata(rootPath, payload, false, false, fieldSelection);
           if (!res.success) {
             setStep('write', 'failed', res.error || 'Unknown error');
             dlg.querySelector('#wmProgressActions').style.display = 'flex';
@@ -7967,7 +8464,7 @@
               showView('wmProgressView');
               addStep('overwrite', 'Overwriting conflicting XMP files', 'running');
               try {
-                const res2 = await window.pywebview.api.write_xmp_metadata(rootPath, payload, true, false);
+                const res2 = await window.pywebview.api.write_xmp_metadata(rootPath, payload, true, false, fieldSelection);
                 if (!res2.success) {
                   setStep('overwrite', 'failed', res2.error || 'Unknown error');
                 } else {

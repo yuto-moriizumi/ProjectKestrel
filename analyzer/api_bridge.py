@@ -1721,14 +1721,32 @@ class Api:
             log(f'move_rejects_to_folder error: {e}')
             return {'success': False, 'error': str(e)}
 
-    def write_xmp_metadata(self, root_path: str, image_data, overwrite_external: bool = False, use_auto_labels: bool = False):
-        """Write XMP sidecar files for each image, embedding star rating and culling label."""
+    def write_xmp_metadata(
+        self,
+        root_path: str,
+        image_data,
+        overwrite_external: bool = False,
+        use_auto_labels: bool = False,
+        fields=None,
+    ):
+        """Write XMP sidecar files for each image, embedding star rating and culling label.
+
+        ``fields`` is an optional dict selecting which sections to write
+        (``rating``, ``label``, ``species``, ``family``, ``quality``).
+        Omitting it writes everything, preserving legacy behaviour.
+        """
         if _write_xmp_metadata is None:
             return {'success': False, 'error': 'metadata_writer module not available'}
         root_real, err = self._validate_root_dir(root_path, context='write_xmp_metadata', require_exists=True)
         if err:
             return {'success': False, 'error': err}
-        return _write_xmp_metadata(root_real, image_data, overwrite_external, use_auto_labels)
+        return _write_xmp_metadata(
+            root_real,
+            image_data,
+            overwrite_external,
+            use_auto_labels,
+            fields=fields if isinstance(fields, dict) else None,
+        )
 
     def _restore_file_with_sidecars(self, reject_dir: str, root_path: str, filename: str):
         """Restore a file and its configured companion files from reject directory.

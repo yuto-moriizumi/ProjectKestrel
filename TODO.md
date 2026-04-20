@@ -19,17 +19,19 @@ TODO:
 * Scrutinize database overwrites that are potentially leading to inconsistent behavior while analysis is still in progress getting rid of manually inputted data [DONE]
 * Upgrade to enable experimental wildlife detection by default + Test [DEFERRED]
 * Remove additional model weights from Git repo + verify LFS assets [DONE]
-* Add ability to change which XML fields are written (ex. exclude ratings, labels).
-* Upgrade terms of service version retrieval to prompt updated terms warnings + Clarify file and folder names may be sent with crash reports that are automatic and non-opt-out.
-* Upgrade Kestrel Telemetry/Required Usage Data Collection to fetch the data from the website if appropriate.
+* Add ability to change which XML fields are written (ex. exclude ratings, labels). [DONE]
 * Improve exposure compensation algorithm to fix dark birds against bright backlit sky edge case. [DONE]
-* Upgrade tutorial workflow: Simple and advanced version. Potentially also inform the user how they can integrate Kestrel into their workflows.
-* Remove "Unknown" from becoming a dedicated species label.
+* Remove "Unknown" from becoming a dedicated species label. [DONE]
 * Website: Add sign-up list for cloud analysis or beta testing.
 * Improve 'show bird thumbnail' behavior. [DONE]
 * Fix bug where the image is like half-split for some reason. [DONE]
-* Improve UI: Add "Open in [photo editor]" button; along with buttons to switch between the multiple bird crops. Near the right side.
-* Improve timeline: more granular detail than just grouping by capture hour. Also maybe add a "Adjust Capture Time" button that lets you add some hour offsets/change the capture time to sync it better.
+* Improve UI: Add "Open in [photo editor]" button; along with buttons to switch between the multiple bird crops. Near the right side. [DONE]
+* Improve timeline: more granular detail than just grouping by capture hour. Also maybe add a "Adjust Capture Time" button that lets you add some hour offsets/change the capture time to sync it better. [DONE]
+* Upgrade terms of service version retrieval to prompt updated terms warnings + Clarify file and folder names may be sent with crash reports that are automatic and non-opt-out.
+* Upgrade Kestrel Telemetry/Required Usage Data Collection to fetch the data from the website if appropriate.
+* Upgrade tutorial workflow: Simple and advanced version. Potentially also inform the user how they can integrate Kestrel into their workflows.
+
+
 
 
 TESTING:
@@ -230,3 +232,29 @@ Test before release:
 * Improvement to crash handling and error logging. [DONE]
 * Test rawpy decode issue. [DONE, FIXED]
 * Test Queue restore fixes [DONE]
+
+
+# Version Gambel's Quail Changelog
+Most significant update to date: Kestrel is up to 500% faster while achieving better analysis quality! Kestrel also supports more than 1200 wildlife species!
+
+## Key Changes
+* New pipeline version 2.0 enables up to 500% performance improvement over v(Kentucky Warbler) while *improving* bird detection sensitivity and exposure compensation performance.
+    - New wildlife detection model powered by MegaDetector (github:Microsoft/CameraTraps) leads to significant improvements in performance and animal detection sensitivity.
+    - New wildlife species classification model powered by SpeciesNet (github:Google/SpeciesNet) enables identification of up to 1200 wildlife species!
+    - New image segmentation model (github:SysCV/SAM-HQ) leads to substantial improvements in identifying specific bird pixels. 
+    - Migration of all of these models, along with existing quality classifier to ONNXRuntime allows GPU utilization, leading to substantial performance improvements on all systems.
+    - New exposure compensation algorithm achieves significantly better performance on poorly-lit bird images while performing 10x faster than v(Kentucky Warbler).
+    - New analysis setting allows parallel processing of multiple files simultaneously, leading to up to 3x performance improvement in RAW decode speed.
+    - Together, this new pipeline is FASTER *and* MORE ACCURATE! THANK YOU to the wonderful teams behind SpeciesNet, MegaDetector, and SAM-HQ for open-sourcing their models!
+* Large number of user interface tweaks makes Kestrel more intuitive:
+    - All analysis-specific settings are moved to the Analyze Folders Dialog box for clarity and proximity.
+    - Improved timeline visualization no longer strictly groups photos by the hour. Additionally, new "Adjust Capture Time" dialog box allows you to correct your camera's capture time (ex. Daylight Savings Time, etc.)
+    - Exposure compensation is now applied to the image thumbnails (toggle-able in settings), enabling better viewing of image details across lighting conditions.
+    - New ability to see the bird thumbnail while browsing your photos.
+    - Improvements to Scene view UI: "Mark as Reviewed" button, "Open in [photo editor]" button, and buttons to switch subjects in multi-subject mode.
+* Several bug fixes
+    - Fixed bugs where the tutorial would keep popping up for some users who upgraded their version of Kestrel
+    - Fixed bugs where Kestrel would erroneously believe that it crashed, prompting the user to ask whether to send a crash report.
+    - Fixed bugs where images would appear 'split in half' when viewed rapidly.
+    - Fixed a bug causing user-specified culling decisions and similar edits to be overwritten if Kestrel was analyzing the folder while the user was reviewing their photos.
+    - Fixed bugs causing the image to appear hazy and tinted for certain scenes and camera models.
