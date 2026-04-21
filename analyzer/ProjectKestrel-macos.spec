@@ -20,6 +20,8 @@ hiddenimports = ['pywebview', 'certifi','PIL','exifread','settings_utils','edito
 binaries += collect_dynamic_libs('onnxruntime')
 tmp_ret = collect_all('msvc-runtime')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+tmp_ret = collect_all('optree')
+datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
 # After your datas definition, add:
 print("=== Verifying source files exist ===")
