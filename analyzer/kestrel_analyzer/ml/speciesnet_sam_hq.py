@@ -22,6 +22,7 @@ from .speciesnet_taxonomy import (
     bird_vs_wildlife_classifier_scores,
     is_ambiguous_generic_taxonomy,
     is_ignored_prediction,
+    is_no_cv_result,
     route_with_classifier_tiebreak,
     should_skip_confident_no_cv_classifier,
     split_taxonomy,
@@ -1123,6 +1124,16 @@ class SpeciesNetSAMHQWrapper:
                     parts = [p.lower() for p in split_taxonomy(pred_raw) if p]
                     last = parts[-1] if parts else pred_raw
                     reason = f"ignored class: {last}"
+                elif is_no_cv_result(pred_raw):
+                    # Classifier returned "no cv result" / UNKNOWN and the
+                    # top-k tiebreak did not find a stronger bird hypothesis.
+                    # Treat as a MegaDetector false positive rather than
+                    # emitting an "Unknown wildlife" crop.
+                    bb, bo = bird_vs_wildlife_classifier_scores(cls_info)
+                    reason = (
+                        f"classifier returned Unknown / no cv result with no"
+                        f" bird tiebreak (bird_max={bb:.3f} other={bo:.3f})"
+                    )
                 elif not wildlife_enabled:
                     reason = "non-bird wildlife disabled"
                 print(

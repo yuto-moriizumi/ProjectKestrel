@@ -54,9 +54,13 @@ def wildlife_display_name(raw: str) -> str:
 def is_ignored_prediction(raw: str) -> bool:
     """blank, vehicle, human — skip for downstream processing.
 
-    "no cv result" is intentionally NOT ignored: SpeciesNet could not classify
-    the detection, but MegaDetector still found an animal. These are routed as
-    wildlife with an "Unknown" label so the user sees the crop.
+    ``no cv result`` is handled separately in :func:`route_prediction` so that
+    the classifier-tiebreak in :func:`route_with_classifier_tiebreak` still has
+    a chance to rescue it as a bird using the top-k classifier scores. When
+    neither the ensemble nor the top-k commit to a species, the detection is
+    routed to ignore rather than emitted as a wildlife "Unknown" crop, on the
+    reasoning that a MegaDetector box SpeciesNet cannot classify is usually a
+    false positive (branch, shadow, rock, sky artifact, etc.).
     """
     if not raw or not str(raw).strip():
         return True
@@ -153,10 +157,16 @@ def route_prediction(
         return "ignore", None
     if is_bird_taxon(raw_prediction):
         return "bird", "bird"
-    # "no cv result" — MegaDetector found an animal but SpeciesNet could not
-    # classify it.  Route as wildlife so the crop is still saved.
+    # "no cv result" / Classification.UNKNOWN — SpeciesNet's ensemble could
+    # not commit to a species. Route to ignore by default; the caller
+    # (``route_with_classifier_tiebreak``) will still rescue this as a bird
+    # when the top-k classifier scores show a stronger aves hypothesis than
+    # any other animal. A MegaDetector box with no classifier commitment is
+    # overwhelmingly a false positive (branch, shadow, rock, sky artifact),
+    # so treating it as "Unknown wildlife" adds noise and disk churn for
+    # essentially no signal.
     if is_no_cv_result(raw_prediction):
-        return "wildlife", "Unknown"
+        return "ignore", None
     if not wildlife_enabled:
         return "ignore", None
     return "wildlife", wildlife_display_name(raw_prediction)
