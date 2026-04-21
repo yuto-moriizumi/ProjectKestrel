@@ -25,6 +25,13 @@ class TestSpeciesNetTaxonomy(unittest.TestCase):
     def test_examples_ignore(self):
         self.assertTrue(is_ignored_prediction("f1856211-cfb7-4a5b-9158-c0f72fd09ee6;;;;;;blank"))
         self.assertTrue(is_ignored_prediction("e2895ed5-780b-48f6-8a11-9e27cb594511;;;;;;vehicle"))
+        self.assertTrue(is_ignored_prediction(
+            "990ae9dd-7a59-4344-afcb-1b7b21368000;mammalia;primates;hominidae;homo;sapiens;human"
+        ))
+        # Genus-only human (no species / common name) — must still be ignored
+        self.assertTrue(is_ignored_prediction(
+            "d126f0ec-82dd-46f0-b76a-5985ff6bbc9b;mammalia;primates;hominidae;homo;;"
+        ))
 
     def test_examples_wildlife_display(self):
         raw = (

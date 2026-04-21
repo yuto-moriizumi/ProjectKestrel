@@ -5691,18 +5691,8 @@
         await scanFolderTree(fp);
         if (!folderTreeRootNode) return;
       }
-      // GPU checkbox: hide on Windows frozen builds (DirectML requires separate
-      // onnxruntime-directml package not bundled); show on macOS frozen builds
-      // where CoreML is included in the standard onnxruntime package.
-      const gpuLabel = document.getElementById('analyzeGpuLabel');
-      const hideGpu = _isFrozenApp && _appPlatform !== 'macos';
-      if (gpuLabel) {
-        gpuLabel.style.display = hideGpu ? 'none' : '';
-        if (hideGpu) {
-          const gpuCb = document.getElementById('analyzeUseGpu');
-          if (gpuCb) gpuCb.checked = false;
-        }
-      }
+      // GPU is always available: DirectML (Windows) and CoreML (macOS) are bundled
+      // with the frozen build, so no platform-specific hiding is needed.
       // Seed the dialog's selected set from any previously-queued paths
       _dlgSelected = new Set(queuedFolderPaths);
       

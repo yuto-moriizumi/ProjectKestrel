@@ -1103,6 +1103,12 @@
       overflow-y: auto;
     }
 
+    dialog#analyzeQueueDlg,
+    dialog#liveAnalysisDlg {
+      width: 98vw;
+      max-width: 98vw;
+    }
+
     /* Settings dialog: larger, flex column with sticky footer */
     dialog.dlg-settings {
       width: min(660px, 96vw);
@@ -2566,8 +2572,67 @@
     .analyze-dlg-advanced-body {
       display: flex;
       flex-direction: column;
+      gap: 12px;
+      padding: 4px 12px 12px;
+    }
+
+    .adlg-group {
+      display: flex;
+      flex-direction: column;
       gap: 4px;
-      padding: 0 12px 10px;
+      padding: 10px 12px;
+      border: 1px solid #161a24;
+      border-radius: 6px;
+      background: #0a0d13;
+    }
+
+    .adlg-group-title {
+      font-size: 11px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.6px;
+      color: #7a8598;
+      margin-bottom: 4px;
+    }
+
+    .adlg-toggle-row {
+      display: flex;
+      align-items: flex-start;
+      gap: 10px;
+      padding: 6px 0;
+      cursor: pointer;
+    }
+    .adlg-toggle-row input[type="checkbox"] {
+      margin-top: 2px;
+      flex-shrink: 0;
+    }
+    .adlg-toggle-text {
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      flex: 1;
+    }
+    .adlg-toggle-label {
+      font-size: 13px;
+      color: #d4d8e0;
+    }
+    .adlg-toggle-hint {
+      font-size: 11px;
+      line-height: 1.35;
+    }
+    .adlg-tag {
+      display: inline-block;
+      margin-left: 6px;
+      padding: 1px 6px;
+      font-size: 10px;
+      font-weight: 600;
+      text-transform: uppercase;
+      letter-spacing: 0.4px;
+      color: #d0b8ff;
+      background: #3a2a5a;
+      border: 1px solid #5a4a7a;
+      border-radius: 4px;
+      vertical-align: middle;
     }
 
     .adlg-setting-row {
@@ -2583,6 +2648,11 @@
     .adlg-setting-row input[type="number"],
     .adlg-setting-row select {
       flex-shrink: 0;
+    }
+    .adlg-hint {
+      font-size: 11px;
+      margin-top: -2px;
+      line-height: 1.35;
     }
 
     .analyze-dlg-footer {

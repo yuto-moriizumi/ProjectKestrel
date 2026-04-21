@@ -71,6 +71,10 @@ def is_ignored_prediction(raw: str) -> bool:
     last = parts_lower[-1] if parts_lower else ""
     if last in ("blank", "vehicle", "human"):
         return True
+    # Genus- or family-only human labels (e.g. "mammalia;primates;hominidae;homo;;")
+    # omit the common-name segment, so the last-segment check above misses them.
+    if "hominidae" in parts_lower or "homo" in parts_lower:
+        return True
     return False
 
 

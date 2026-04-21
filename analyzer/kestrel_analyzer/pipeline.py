@@ -37,6 +37,7 @@ from .exposure_compensation import (
     build_metered_detection_image,
     compose_total_stops as ec_compose_total_stops,
     compute_stops_numpy_solver,
+    linear_to_srgb_u8,
 )
 from .image_utils import read_image, read_image_for_pipeline
 from .ratings import quality_to_rating, get_profile_thresholds
@@ -54,6 +55,16 @@ except ImportError:
 from .ml.speciesnet_sam_hq import SpeciesNetSAMHQWrapper
 from .ml.bird_species import BirdSpeciesClassifier
 from .ml.quality import QualityClassifier
+
+
+def _write_jpeg(path: str, bgr: np.ndarray, params) -> bool:
+    # Some cv2 builds (headless/full conflict) reject imwrite's params arg.
+    # imencode + tofile works on every wheel and handles unicode Windows paths.
+    ok, buf = cv2.imencode('.jpg', bgr, params)
+    if not ok:
+        return False
+    buf.tofile(path)
+    return True
 
 
 class AnalysisPipeline:
@@ -589,10 +600,19 @@ class AnalysisPipeline:
 
                     stage_ctx["stage"] = "export_image"
                     export_path = os.path.join(export_dir, f"{os.path.splitext(raw_file)[0]}_export.jpg")
-                    _tgt_w = min(thumbnail_max_width, int(img.shape[1]))
-                    _tgt_h = max(1, int(_tgt_w * img.shape[0] / img.shape[1]))
-                    img_small = cv2.resize(img, (_tgt_w, _tgt_h))
-                    cv2.imwrite(
+                    # Thumbnail must be free of baked-in exposure correction so the
+                    # browser's live correction (driven by entry.exposure_correction)
+                    # does not double-apply the meter_scale component. For RAW,
+                    # render directly from noauto_linear (no meter scale). For
+                    # non-RAW, img already has no correction applied.
+                    if noauto_linear is not None:
+                        thumbnail_source = linear_to_srgb_u8(noauto_linear)
+                    else:
+                        thumbnail_source = img
+                    _tgt_w = min(thumbnail_max_width, int(thumbnail_source.shape[1]))
+                    _tgt_h = max(1, int(_tgt_w * thumbnail_source.shape[0] / thumbnail_source.shape[1]))
+                    img_small = cv2.resize(thumbnail_source, (_tgt_w, _tgt_h))
+                    _write_jpeg(
                         export_path,
                         cv2.cvtColor(img_small, cv2.COLOR_RGB2BGR),
                         jpeg_params,
@@ -634,7 +654,7 @@ class AnalysisPipeline:
                             status_cb(f"No detections in {raw_file}")
                         stage_ctx["stage"] = "write_crop"
                         crop_path = os.path.join(crop_dir, f"{os.path.splitext(raw_file)[0]}_crop_0.jpg")
-                        cv2.imwrite(
+                        _write_jpeg(
                             crop_path,
                             cv2.cvtColor(img_small, cv2.COLOR_RGB2BGR),
                             jpeg_params,
@@ -932,7 +952,7 @@ class AnalysisPipeline:
                         if crop_img is None:
                             continue
                         crop_path = os.path.join(crop_dir, f"{base_name}_crop_{crop_idx}.jpg")
-                        cv2.imwrite(
+                        _write_jpeg(
                             crop_path,
                             cv2.cvtColor(crop_img, cv2.COLOR_RGB2BGR),
                             jpeg_params,
