@@ -941,7 +941,7 @@ class SpeciesNetSAMHQWrapper:
             mask_threshold: Unused (legacy Mask R-CNN pixel threshold); retained for API compatibility.
 
         Returns:
-            (masks, pred_boxes, pred_class, pred_score) — same contract as ``MaskRCNNWrapper``.
+            (masks, pred_boxes, pred_class, pred_score) — detection/mask contract used by the pipeline.
         """
         _ = mask_threshold  # SAM-HQ path does not use Mask R-CNN mask pixel threshold; UI keeps knob for compatibility.
 
@@ -1139,7 +1139,7 @@ class SpeciesNetSAMHQWrapper:
             )
         return result
 
-    # --- Geometry (aligned with MaskRCNNWrapper) for square crops and species bbox ---
+    # --- Geometry helpers for square crops and species bbox ---
 
     @staticmethod
     def _fsolve(func, xmin, xmax):

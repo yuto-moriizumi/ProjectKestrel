@@ -17,9 +17,7 @@ sample_sets_tree = Tree('sample_sets', prefix='sample_sets')
 datas += [(item[0], item[1]) for item in sample_sets_tree]  # Only use first 2 elements of each tuple
 binaries = []
 hiddenimports = ['pywebview', 'certifi','PIL','exifread','settings_utils','editor_launch','queue_manager','api_bridge']
-binaries += collect_dynamic_libs('torch')
 binaries += collect_dynamic_libs('onnxruntime')
-binaries += collect_dynamic_libs('tensorflow')
 tmp_ret = collect_all('msvc-runtime')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 
