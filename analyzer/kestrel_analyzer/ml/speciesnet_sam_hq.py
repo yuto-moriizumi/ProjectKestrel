@@ -961,9 +961,10 @@ class SpeciesNetSAMHQWrapper:
         detector_threshold = float(threshold)
 
         # Every MegaDetector "animal" above *detector_threshold* goes to SpeciesNet ensemble + SAM-HQ.
-        # We do not apply a second (higher) confidence gate here — low-confidence boxes can still
-        # produce useful crops; classifier "blank" / vehicle / human routes are dropped per-detection
-        # below via ``is_ignored_prediction`` / ``route == "ignore"``.
+        # A second gate on the ensemble/classifier ``pred_score`` is applied below so that
+        # MegaDetector false positives that SpeciesNet also can't commit to are dropped.
+        # ``is_ignored_prediction`` / ``route == "ignore"`` still prunes blank/vehicle/human
+        # before the score gate runs.
         animal_dets: list[dict[str, Any]] = []
         for det in detections:
             label = str(det.get("label", ""))
@@ -1057,6 +1058,17 @@ class SpeciesNetSAMHQWrapper:
                 print(
                     f"[SpeciesNet] det {det_idx}  SKIPPED — {reason}"
                     f"  (conf={conf:.2f}, pred={pred_raw!r})"
+                )
+                continue
+
+            # Classifier-confidence gate: MegaDetector is tuned to over-propose so
+            # SpeciesNet can prune false positives. Require the ensemble/classifier
+            # score to clear the same user-facing threshold as the detector.
+            if pred_score < detector_threshold:
+                print(
+                    f"[SpeciesNet] det {det_idx}  SKIPPED — classifier pred_score"
+                    f" {pred_score:.3f} < threshold {detector_threshold:.2f}"
+                    f"  (detector conf={conf:.2f}, pred={pred_raw!r})"
                 )
                 continue
 
