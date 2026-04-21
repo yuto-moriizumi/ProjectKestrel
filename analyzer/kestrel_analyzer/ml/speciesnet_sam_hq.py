@@ -32,6 +32,16 @@ _MIN_MAX_BIRD_CROPS = 1
 _MAX_MAX_BIRD_CROPS = 20
 _HEAVY_OVERLAP_IOU = 0.75
 _HEAVY_OVERLAP_CONTAINMENT = 0.90
+
+# Pre-classifier dedupe thresholds (boxes only, before SpeciesNet + SAM run).
+# Deliberately TIGHTER than the mask-based final filter above: we only drop a
+# MegaDetector proposal here when it almost perfectly coincides with a
+# higher-confidence proposal, so there is no realistic chance the classifier
+# would have disagreed with the winner. Anything ambiguous falls through and
+# is handled by ``filter_overlapping_detections`` at the end, which uses true
+# mask IoU and is the authoritative pass.
+_PRE_CLASSIFIER_IOU = 0.85
+_PRE_CLASSIFIER_CONTAINMENT = 0.95
 _SUPPORTED_DETECTOR_NAMES = tuple(DETECTOR_ONNX_PATHS.keys())
 _YOLOV9_DETECTOR_NAMES = {"mdv6-mit-yolov9-c", "mdv6-mit-yolov9-e"}
 
@@ -161,6 +171,51 @@ def filter_overlapping_detections(
         [pred_class[i] for i in indices],
         [pred_score[i] for i in indices],
     )
+
+
+def _md_bbox_corners(md_bbox: list) -> tuple[tuple[float, float], tuple[float, float]]:
+    """MegaDetector normalized xywh -> ``((x1, y1), (x2, y2))`` in the same
+    normalized units. IoU/containment ratios are scale-invariant, so the
+    pre-classifier dedupe does not need image dimensions.
+    """
+    x, y, bw, bh = [float(v) for v in md_bbox]
+    return (x, y), (x + bw, y + bh)
+
+
+def prefilter_overlapping_md_boxes(
+    animal_dets: list,
+    iou_thresh: float = _PRE_CLASSIFIER_IOU,
+    containment_thresh: float = _PRE_CLASSIFIER_CONTAINMENT,
+) -> list:
+    """Drop MegaDetector proposals that heavily overlap a higher-confidence
+    proposal, *before* SpeciesNet + SAM run on each of them.
+
+    Assumes ``animal_dets`` is already sorted by ``conf`` descending (which is
+    how ``get_prediction`` produces it). Greedy O(n²) — n is the number of
+    ``animal`` detections on one image, typically small.
+
+    Uses tighter thresholds than the final mask-based overlap filter, so we
+    only drop what is clearly a duplicate at the box level. Anything
+    borderline is deferred to the mask-based pass at the end of
+    ``get_prediction``, which sees the true subject shapes.
+    """
+    n = len(animal_dets)
+    if n <= 1:
+        return list(animal_dets)
+
+    corners = [_md_bbox_corners(d.get("bbox", [0.0, 0.0, 0.0, 0.0])) for d in animal_dets]
+    keep = [True] * n
+    for i in range(n):
+        if not keep[i]:
+            continue
+        for j in range(i + 1, n):
+            if not keep[j]:
+                continue
+            iou = _box_iou(corners[i], corners[j])
+            containment = _box_intersection_over_min_area(corners[i], corners[j])
+            if iou >= iou_thresh or containment >= containment_thresh:
+                keep[j] = False
+    return [animal_dets[i] for i in range(n) if keep[i]]
 
 
 def _md_bbox_to_pixel_box(md_bbox: list, img_w: int, img_h: int) -> tuple[float, float, float, float]:
@@ -976,9 +1031,24 @@ class SpeciesNetSAMHQWrapper:
             animal_dets.append(det)
 
         animal_dets.sort(key=lambda d: float(d.get("conf", 0.0)), reverse=True)
+
+        # Pre-classifier dedupe: drop near-duplicate MegaDetector boxes before
+        # spending a SpeciesNet forward pass + SAM mask decode on each of them.
+        # The authoritative mask-based overlap filter still runs at the end.
+        pre_nms_count = len(animal_dets)
+        animal_dets = prefilter_overlapping_md_boxes(animal_dets)
+        pre_nms_dropped = pre_nms_count - len(animal_dets)
+        if pre_nms_dropped > 0:
+            print(
+                f"[SpeciesNet] pre-classifier NMS: dropped {pre_nms_dropped} of"
+                f" {pre_nms_count} MegaDetector proposals (IoU>={_PRE_CLASSIFIER_IOU}"
+                f" or containment>={_PRE_CLASSIFIER_CONTAINMENT})"
+            )
+
         print(
             f"[SpeciesNet] {os.path.basename(fp)}  animals -> classifier/SAM: {len(animal_dets)}"
-            f"  (detector_threshold={detector_threshold:.2f}, total proposals={len(detections)})"
+            f"  (detector_threshold={detector_threshold:.2f}, total proposals={len(detections)}"
+            f"{f', pre-NMS dropped {pre_nms_dropped}' if pre_nms_dropped else ''})"
         )
 
         bird_rows: list[dict[str, Any]] = []

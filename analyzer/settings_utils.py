@@ -2,13 +2,30 @@
 
 from __future__ import annotations
 
+import glob
 import json
 import math
 import os
 import shutil
 import sys
+import tempfile
+import threading
 import time
 from typing import Any
+
+# Serializes ``save_persisted_settings`` so the read-existing / monotonic-guard
+# / refresh-.bak / os.replace sequence is atomic with respect to other saves
+# in this process. Concurrent callers include the JS bridge (UI setting
+# changes), the queue worker (impact-counter bumps), and the visualizer
+# startup path — they all hit the same file and previously raced on the
+# shared ``settings.json.tmp`` name (symptom: WinError 2 "cannot find the
+# file specified" on os.replace when the other thread deleted our tmp).
+_SAVE_LOCK = threading.RLock()
+
+# Prefix/suffix for ``tempfile.mkstemp`` tmp files we emit. The glob
+# ``settings.json.*.tmp`` uniquely identifies orphans left by a crashed save.
+_TMP_FILE_PREFIX = 'settings.json.'
+_TMP_FILE_SUFFIX = '.tmp'
 
 # Forward-compatible / unknown keys (e.g. tutorial flags from newer builds) — size limits only.
 _PASSTHROUGH_MAX_STR = 16384
@@ -583,10 +600,32 @@ def load_persisted_settings() -> dict:
     return {}
 
 
+def _reap_orphan_tmp_files(directory: str) -> None:
+    """Best-effort cleanup of ``settings.json.*.tmp`` orphans from crashed
+    or racing saves. Silent on any error — these files are harmless; they
+    just waste a few bytes until next startup.
+    """
+    try:
+        pattern = os.path.join(directory, _TMP_FILE_PREFIX + '*' + _TMP_FILE_SUFFIX)
+        for orphan in glob.glob(pattern):
+            try:
+                os.remove(orphan)
+            except OSError:
+                pass
+    except Exception:
+        pass
+
+
 def save_persisted_settings(data: dict) -> None:
     """Atomically persist settings with corruption-aware integrity guards.
 
     Behaviour:
+      * Serialized in-process by ``_SAVE_LOCK`` so concurrent callers (JS
+        bridge, queue worker, startup) cannot race on the temp file.
+      * Each save writes to a **unique** temp file via ``tempfile.mkstemp``
+        so two racing saves never overwrite or delete each other's tmp —
+        this is the fix for the ``WinError 2`` we hit when the old code
+        hardcoded ``settings.json.tmp``.
       * If the on-disk file is corrupt and a valid ``.bak`` exists, the corrupt
         file is quarantined to ``<path>.corrupt-<ts>`` and the save proceeds,
         using ``.bak`` for the monotonic-counter guard so impact totals etc.
@@ -603,83 +642,107 @@ def save_persisted_settings(data: dict) -> None:
     if not isinstance(data, dict):
         raise ValueError('Settings payload must be an object')
 
-    path = _get_settings_path()
-    existing_raw, status = _load_settings_raw()
+    with _SAVE_LOCK:
+        path = _get_settings_path()
+        directory = os.path.dirname(path)
+        existing_raw, status = _load_settings_raw()
 
-    if status == 'corrupt':
-        bak_data = _load_backup_if_valid()
-        if bak_data is None:
+        if status == 'corrupt':
+            bak_data = _load_backup_if_valid()
+            if bak_data is None:
+                log(
+                    f'[settings] REFUSING to save over unreadable {path}; '
+                    f'no valid .bak to recover from. '
+                    f'Remove or repair the file manually, then retry.'
+                )
+                return
+            # Move the corrupt file aside so the atomic write below has a clean slate.
+            _quarantine_corrupt_settings(path)
+            try:
+                os.remove(path)
+            except OSError:
+                # Not fatal — os.replace below will try to overwrite regardless.
+                pass
+            existing_raw = bak_data
+            status = 'missing'
+
+        data = _apply_monotonic_guard(data, existing_raw)
+
+        # Re-sanitize while preserving forward-compatible keys so merges from the UI
+        # cannot strip unknown keys that were loaded from disk.
+        data = _sanitize_settings_payload(data, emit_log=True)
+
+        # --- Flush pending analytics on consent ---
+        if data.get('analytics_consent_shown', False) and 'pending_analytics' in data:
+            pending = data.pop('pending_analytics')
+            if data.get('analytics_opted_in', False) and _telemetry is not None:
+                try:
+                    _telemetry.send_folder_analytics(**pending)
+                    log('[analytics] Flushed pending detailed analytics after opt-in.')
+                except Exception as e:
+                    log(f'[analytics] Failed to flush pending analytics: {e}')
+        # ------------------------------------------
+
+        os.makedirs(directory, exist_ok=True)
+
+        # Unique temp file per save. ``mkstemp`` atomically creates and opens
+        # the file with O_EXCL so no two calls can ever produce the same path.
+        try:
+            tmp_fd, tmp = tempfile.mkstemp(
+                prefix=_TMP_FILE_PREFIX,
+                suffix=_TMP_FILE_SUFFIX,
+                dir=directory,
+            )
+        except OSError as exc:
             log(
-                f'[settings] REFUSING to save over unreadable {path}; '
-                f'no valid .bak to recover from. '
-                f'Remove or repair the file manually, then retry.'
+                f'[settings] FAILED to create temp file for atomic save ({exc}); '
+                f'existing file left unchanged. Check disk space and permissions '
+                f'on {directory}.'
             )
             return
-        # Move the corrupt file aside so the atomic write below has a clean slate.
-        _quarantine_corrupt_settings(path)
+
         try:
-            os.remove(path)
-        except OSError:
-            # Not fatal — os.replace below will try to overwrite regardless.
-            pass
-        existing_raw = bak_data
-        status = 'missing'
-
-    data = _apply_monotonic_guard(data, existing_raw)
-
-    # Re-sanitize while preserving forward-compatible keys so merges from the UI
-    # cannot strip unknown keys that were loaded from disk.
-    data = _sanitize_settings_payload(data, emit_log=True)
-
-    # --- Flush pending analytics on consent ---
-    if data.get('analytics_consent_shown', False) and 'pending_analytics' in data:
-        pending = data.pop('pending_analytics')
-        if data.get('analytics_opted_in', False) and _telemetry is not None:
             try:
-                _telemetry.send_folder_analytics(**pending)
-                log('[analytics] Flushed pending detailed analytics after opt-in.')
-            except Exception as e:
-                log(f'[analytics] Failed to flush pending analytics: {e}')
-    # ------------------------------------------
+                with os.fdopen(tmp_fd, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, indent=2, sort_keys=True)
+                    try:
+                        f.flush()
+                        os.fsync(f.fileno())
+                    except OSError:
+                        # fsync can legitimately fail on some network filesystems;
+                        # proceed with the atomic replace anyway.
+                        pass
+            except Exception:
+                # fdopen took ownership of the fd; if the with-block raised,
+                # the fd is already closed. Just make sure we clean up the
+                # orphan temp file in the outer except.
+                raise
 
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + '.tmp'
-    try:
-        # Remove any stale .tmp from a previous crash (Windows can't replace a locked file)
-        try:
-            os.remove(tmp)
-        except FileNotFoundError:
-            pass
-        with open(tmp, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2, sort_keys=True)
+            # Promote the previous good file to .bak before replacement so that
+            # a future corrupt-main scenario can auto-recover.
+            if status == 'ok':
+                try:
+                    shutil.copy2(path, path + '.bak')
+                except OSError as exc:
+                    log(f'[settings] WARN: could not refresh .bak: {exc}')
+
+            os.replace(tmp, path)
+        except OSError as exc:
+            # Do NOT fall back to a non-atomic direct write — that path is how
+            # partial writes corrupt settings.json in the first place. Leave the
+            # existing (possibly older) file in place and log loudly.
+            log(
+                f'[settings] FAILED to atomically save settings ({exc}); '
+                f'existing file left unchanged. Check disk space, permissions, '
+                f'and antivirus locks on {path}.'
+            )
             try:
-                f.flush()
-                os.fsync(f.fileno())
+                os.remove(tmp)
             except OSError:
-                # fsync can legitimately fail on some network filesystems;
-                # proceed with the atomic replace anyway.
                 pass
-        # Promote the previous good file to .bak before replacement so that
-        # a future corrupt-main scenario can auto-recover.
-        if status == 'ok':
-            try:
-                shutil.copy2(path, path + '.bak')
-            except OSError as exc:
-                log(f'[settings] WARN: could not refresh .bak: {exc}')
-        os.replace(tmp, path)
-    except OSError as exc:
-        # Do NOT fall back to a non-atomic direct write — that path is how
-        # partial writes corrupt settings.json in the first place. Leave the
-        # existing (possibly older) file in place and log loudly.
-        log(
-            f'[settings] FAILED to atomically save settings ({exc}); '
-            f'existing file left unchanged. Check disk space, permissions, '
-            f'and antivirus locks on {path}.'
-        )
-        try:
-            os.remove(tmp)
-        except OSError:
-            pass
+        else:
+            # Successful save — reap any orphans left by prior crashed saves.
+            _reap_orphan_tmp_files(directory)
 
 
 def log(*args):

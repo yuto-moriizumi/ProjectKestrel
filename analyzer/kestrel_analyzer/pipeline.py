@@ -202,40 +202,142 @@ class AnalysisPipeline:
         A semaphore limits total submitted-but-not-yet-consumed results to
         ``max_workers + 1`` so peak memory stays bounded regardless of how
         slowly the consumer processes each image.
+
+        Observability
+        -------------
+        Emits periodic ``[decode-queue]`` stderr lines (roughly every 10% of
+        the run, plus the first few images) and a final structured
+        ``decode_queue_summary`` log event so the operator can tell whether
+        the queue is actually hiding decode latency behind pipeline work.
+
+        Interpreting the numbers:
+          * ``wait_ms=0`` consistently     → pipeline is the bottleneck, the
+            queue is fully hiding decode cost (good).
+          * ``wait_ms`` grows vs ``decode_ms``  → decoder is the bottleneck,
+            raising ``parallel_prefetch`` may help (if disk/CPU headroom).
+          * ``inflight`` never exceeds 1   → decodes are effectively serial;
+            check ``parallel_prefetch`` setting or whether the file list
+            fell into the degenerate inline path.
         """
-        if max_workers <= 1 or len(file_list) == 0:
-            # Degenerate cases: decode inline (no threading overhead).
+        total = len(file_list)
+        if max_workers <= 1 or total == 0:
             for raw_file in file_list:
                 yield self._decode_image(os.path.join(folder, raw_file), raw_file)
             return
+
+        metrics_lock = threading.Lock()
+        submitted = 0        # decodes handed to the pool
+        completed = 0        # decodes that have finished (set by workers)
+        total_decode_ms = 0.0
+        total_wait_ms = 0.0
+        peak_inflight = 0
 
         max_buffered = max_workers + 1
         semaphore = threading.Semaphore(max_buffered)
         futures_q: queue.Queue = queue.Queue()
 
+        # Fixed cadence (every 10 images) rather than a percentage of total so
+        # long runs remain observable in real time. First 3 images always
+        # print for warm-up visibility, and the last image always prints.
+        log_every_n = 10
+
+        def _decode_and_time(image_path: str, raw_file: str) -> dict:
+            t0 = time.monotonic()
+            decoded = self._decode_image(image_path, raw_file)
+            decode_ms = (time.monotonic() - t0) * 1000.0
+            decoded["_decode_ms"] = decode_ms
+            with metrics_lock:
+                nonlocal completed, total_decode_ms
+                completed += 1
+                total_decode_ms += decode_ms
+            return decoded
+
         def _submit_all() -> None:
+            nonlocal submitted, peak_inflight
             with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
                 for raw_file in file_list:
-                    semaphore.acquire()  # block if max_buffered images are already in-flight
+                    semaphore.acquire()
                     future = executor.submit(
-                        self._decode_image,
+                        _decode_and_time,
                         os.path.join(folder, raw_file),
                         raw_file,
                     )
+                    with metrics_lock:
+                        submitted += 1
+                        inflight = submitted - completed
+                        if inflight > peak_inflight:
+                            peak_inflight = inflight
                     futures_q.put(future)
-            futures_q.put(None)  # sentinel: all jobs submitted and executor shut down
+            futures_q.put(None)
 
         submit_thread = threading.Thread(target=_submit_all, daemon=True)
         submit_thread.start()
+
+        idx = 0
+        print(
+            f"[decode-queue] starting: files={total} workers={max_workers} "
+            f"buffer={max_buffered}",
+            flush=True,
+        )
 
         while True:
             future = futures_q.get()
             if future is None:
                 break
-            yield future.result()     # blocks until this specific image is decoded
-            semaphore.release()       # allow one more image to be submitted + decoded
+            t_wait = time.monotonic()
+            decoded = future.result()
+            wait_ms = (time.monotonic() - t_wait) * 1000.0
+            with metrics_lock:
+                total_wait_ms += wait_ms
+                snap_submitted = submitted
+                snap_completed = completed
+            idx += 1
+
+            # Print for the first 3 images (warm-up visibility), then every
+            # ~10% of the run, and always on the last image.
+            if idx <= 3 or idx % log_every_n == 0 or idx == total:
+                decode_ms = decoded.get("_decode_ms")
+                decode_ms_str = f"{decode_ms:.0f}" if decode_ms is not None else "?"
+                inflight_now = max(0, snap_submitted - snap_completed)
+                ahead = max(0, snap_submitted - idx)
+                print(
+                    f"[decode-queue] idx={idx}/{total} "
+                    f"inflight={inflight_now} ahead={ahead} "
+                    f"decode_ms={decode_ms_str} wait_ms={wait_ms:.0f}",
+                    flush=True,
+                )
+
+            yield decoded
+            semaphore.release()
 
         submit_thread.join()
+
+        # Final summary — this is the number you actually want to watch
+        # when deciding whether to raise parallel_prefetch.
+        avg_decode = total_decode_ms / max(1, total)
+        avg_wait = total_wait_ms / max(1, total)
+        try:
+            log_event(
+                self._log_path,
+                {
+                    "level": "info",
+                    "event": "decode_queue_summary",
+                    "max_workers": int(max_workers),
+                    "file_count": int(total),
+                    "peak_inflight": int(peak_inflight),
+                    "sum_decode_ms": round(total_decode_ms, 1),
+                    "sum_wait_ms": round(total_wait_ms, 1),
+                    "avg_decode_ms": round(avg_decode, 1),
+                    "avg_wait_ms": round(avg_wait, 1),
+                },
+            )
+        except Exception:
+            pass
+        print(
+            f"[decode-queue] done: files={total} peak_inflight={peak_inflight} "
+            f"avg_decode_ms={avg_decode:.0f} avg_wait_ms={avg_wait:.0f}",
+            flush=True,
+        )
 
     def load_models(
         self,
