@@ -696,7 +696,15 @@ class AnalysisPipeline:
                                 "similar": similarity["similar"],
                             }
                         )
-                    previous_image = img.copy()
+                    # Hold the previous image by reference, not by copy. The next
+                    # iteration rebinds ``img`` to a fresh decoded array, so the
+                    # old array stays alive for AKAZE via this reference. The
+                    # per-detection patch-and-restore in ``process_subject_items``
+                    # keeps ``img`` pristine across the rest of this iteration.
+                    # Skipping a 45 MP uint8 copy (~135 MB memcpy) here closes
+                    # a significant slice of the gap between "bird crop shown"
+                    # and "next image thumbnail shown".
+                    previous_image = img
                     previous_image_path = image_path
                     previous_orientation = current_orientation
 
@@ -707,13 +715,31 @@ class AnalysisPipeline:
                     # does not double-apply the meter_scale component. For RAW,
                     # render directly from noauto_linear (no meter scale). For
                     # non-RAW, img already has no correction applied.
+                    #
+                    # Downsize FIRST in linear float space, THEN apply the sRGB
+                    # curve. This was the biggest single cost in the gap between
+                    # "bird thumbnails shown for image N" and "thumbnail shown
+                    # for image N+1" — the old code ran the full gamma LUT on
+                    # the entire 45 MP linear frame before shrinking to ~1 MP,
+                    # which is ~40x more work than necessary. Downsizing in
+                    # linear space with INTER_AREA is also more physically
+                    # correct for photographs (standard practice in any serious
+                    # image pipeline — avoids edge/highlight artifacts that
+                    # come from box-filtering gamma-compressed values).
                     if noauto_linear is not None:
-                        thumbnail_source = linear_to_srgb_u8(noauto_linear)
+                        src_h, src_w = noauto_linear.shape[:2]
+                        _tgt_w = min(thumbnail_max_width, int(src_w))
+                        _tgt_h = max(1, int(_tgt_w * src_h / src_w))
+                        linear_small = cv2.resize(
+                            noauto_linear, (_tgt_w, _tgt_h),
+                            interpolation=cv2.INTER_AREA,
+                        )
+                        img_small = linear_to_srgb_u8(linear_small)
                     else:
-                        thumbnail_source = img
-                    _tgt_w = min(thumbnail_max_width, int(thumbnail_source.shape[1]))
-                    _tgt_h = max(1, int(_tgt_w * thumbnail_source.shape[0] / thumbnail_source.shape[1]))
-                    img_small = cv2.resize(thumbnail_source, (_tgt_w, _tgt_h))
+                        src_h, src_w = img.shape[:2]
+                        _tgt_w = min(thumbnail_max_width, int(src_w))
+                        _tgt_h = max(1, int(_tgt_w * src_h / src_w))
+                        img_small = cv2.resize(img, (_tgt_w, _tgt_h), interpolation=cv2.INTER_AREA)
                     _write_jpeg(
                         export_path,
                         cv2.cvtColor(img_small, cv2.COLOR_RGB2BGR),
@@ -832,7 +858,7 @@ class AnalysisPipeline:
                         for i in indices:
                             crop_bbox = self.sn_sam.get_square_crop_box(masks[i])
                             if noauto_linear is not None:
-                                # RAW numpy path — no additional rawpy calls
+                                # RAW numpy path — no additional rawpy calls.
                                 stops = self._compute_stops_numpy(
                                     noauto_linear, masks[i], raw_meter_scale, exposure_quality
                                 )
@@ -842,26 +868,35 @@ class AnalysisPipeline:
                                     crop_bbox["y_max"], crop_bbox["x_max"],
                                 )
                                 corrected_crop = self._apply_crop_numpy(noauto_linear, bbox_tuple, total_scale)
-                                # Patch corrected crop into a copy of the metered image so
-                                # subsequent slicing (species_crop, quality_crop) uses
-                                # full-image coordinates as expected.
-                                img_src = img.copy()
-                                img_src[
-                                    crop_bbox["y_min"]:crop_bbox["y_max"],
-                                    crop_bbox["x_min"]:crop_bbox["x_max"],
-                                ] = corrected_crop
+                                # Patch the exposure-corrected crop in place on ``img``,
+                                # run the two downstream crop extractions that need
+                                # full-image coordinates, then restore the original
+                                # pixels before the next detection runs. This replaces
+                                # a full-frame ``img.copy()`` per detection (which was
+                                # ~140 MB on 45 MP RAW and was the visible lag between
+                                # per-bird thumbnails in the UI) with two tiny
+                                # crop-sized copies that are effectively free.
+                                y0, y1 = crop_bbox["y_min"], crop_bbox["y_max"]
+                                x0, x1 = crop_bbox["x_min"], crop_bbox["x_max"]
+                                original_patch = img[y0:y1, x0:x1].copy()
+                                img[y0:y1, x0:x1] = corrected_crop
+                                try:
+                                    species_crop = self.sn_sam.get_species_crop(pred_boxes[i], img)
+                                    quality_crop, quality_mask = self.sn_sam.get_square_crop(masks[i], img, resize=True)
+                                finally:
+                                    img[y0:y1, x0:x1] = original_patch
                                 total_stops = ec_compose_total_stops(stops, raw_meter_scale)
                                 meter_scale = float(raw_meter_scale)
                                 pipeline_mode = "numpy_linear_v2"
                             else:
-                                # Non-RAW / JPEG path — simple numpy multiply on uint8
+                                # Non-RAW / JPEG path — no exposure correction, so no
+                                # patching needed. Use the metered image directly.
                                 stops = 0.0
-                                img_src = img
                                 total_stops = 0.0
                                 meter_scale = 1.0
                                 pipeline_mode = "legacy_auto_bright_v1"
-                            species_crop = self.sn_sam.get_species_crop(pred_boxes[i], img_src)
-                            quality_crop, quality_mask = self.sn_sam.get_square_crop(masks[i], img_src, resize=True)
+                                species_crop = self.sn_sam.get_species_crop(pred_boxes[i], img)
+                                quality_crop, quality_mask = self.sn_sam.get_square_crop(masks[i], img, resize=True)
                             items.append(
                                 {
                                     "index": i,
