@@ -90,8 +90,53 @@ _DEFAULT_EDITOR_EXTENSIONS = [
     '.cr3', '.cr2', '.nef', '.arw', '.dng', '.raf', '.orf', '.rw2', '.sr2',
     '.jpg', '.jpeg', '.png', '.tif', '.tiff'
 ]
+_EXTERNAL_URL_SCHEME_ALLOWLIST = frozenset({'http', 'https', 'mailto'})
+
+
+def _is_safe_external_url(url) -> bool:
+    """Return True iff ``url`` is safe to hand to ``webbrowser.open``.
+
+    Only plain ``http://``, ``https://``, and ``mailto:`` URLs are allowed.
+    Everything else — ``file://``, ``javascript:``, ``data:``, Windows-specific
+    custom schemes like ``ms-appdata:`` / ``search-ms:``, UNC paths (``\\\\host``
+    or forward-slash ``//host``), and any URL containing control characters —
+    is rejected.
+
+    Rationale (FINDING-01): ``webbrowser.open`` ultimately calls
+    ``ShellExecute`` on Windows, which happily launches local executables when
+    given a ``file://`` URL or a custom URI scheme bound to an installed
+    handler. Combined with the stored DOM-XSS formerly present in the scene
+    renderer, that was a clean stored-XSS-to-RCE chain. The allowlist closes
+    the browser side of that chain.
+    """
+    if not isinstance(url, str):
+        return False
+    u = url.strip()
+    if not u:
+        return False
+    # Reject any ASCII control character (incl. newline, CR, NUL, DEL).
+    for ch in u:
+        o = ord(ch)
+        if o < 0x20 or o == 0x7F:
+            return False
+    # Reject UNC paths and backslash injection (Windows ShellExecute
+    # interprets these as local file references).
+    if '\\' in u or u.startswith('//'):
+        return False
+    scheme, sep, _rest = u.partition(':')
+    if not sep:
+        return False
+    return scheme.strip().lower() in _EXTERNAL_URL_SCHEME_ALLOWLIST
+
+
 _ALLOWED_EDITOR_EXTENSIONS: set[str] = set()
-_ALLOW_ANY_EDITOR_EXTENSION = os.environ.get('KESTREL_ALLOW_ANY_EXTENSION') == '1'
+# ``KESTREL_ALLOW_ANY_EXTENSION`` was previously an env-var escape hatch that
+# let users bypass the extension allowlist on the ``open_in_editor`` surface.
+# That's a FINDING-07 escape hatch and is now hard-off: the set of allowed
+# extensions is fixed to ``_DEFAULT_EDITOR_EXTENSIONS`` plus the user's
+# ``KESTREL_ALLOWED_EXTENSIONS`` override (still validated), and the check is
+# never bypassed.
+_ALLOW_ANY_EDITOR_EXTENSION = False
 
 
 def _normalize_extensions(exts):
@@ -382,32 +427,135 @@ class Api:
             return ''
         return name
 
+    def _fetch_remote_legal_payload(self) -> dict:
+        """Internal helper: fetch https://projectkestrel.org/legal.json.
+
+        Returns a dict with keys ``effective_date``, ``terms_url``,
+        ``privacy_url`` on success, or an empty dict if the fetch fails.
+        Never raises.
+        """
+        try:
+            import urllib.request
+            import ssl
+            import certifi
+
+            url = "https://projectkestrel.org/legal.json"
+            ctx = ssl.create_default_context(cafile=certifi.where())
+            req = urllib.request.Request(
+                url,
+                headers={'User-Agent': 'ProjectKestrel/1.0'},
+                method='GET',
+            )
+            with urllib.request.urlopen(req, context=ctx, timeout=10) as resp:
+                data = json.loads(resp.read().decode('utf-8'))
+                if not isinstance(data, dict):
+                    return {}
+                return {
+                    'effective_date': str(data.get('effective_date', '') or '').strip(),
+                    'terms_url': str(data.get('terms_url', '') or '').strip(),
+                    'privacy_url': str(data.get('privacy_url', '') or '').strip(),
+                }
+        except Exception as e:
+            log(f'[legal] fetch_remote_legal failed: {e}')
+            return {}
+
+    def fetch_remote_legal(self):
+        """Fetch legal.json from projectkestrel.org to bypass CORS in JS."""
+        data = self._fetch_remote_legal_payload()
+        if not data:
+            return {'success': False, 'error': 'Failed to fetch legal.json'}
+        return {'success': True, 'data': data}
+
     def get_legal_status(self) -> dict:
-        """Check if the user has agreed to the terms and if install telemetry was sent."""
+        """Report legal-agreement state to the UI.
+
+        Fetches ``legal.json`` and compares ``effective_date`` to the stored
+        ``legal_agreed_date``. Returns a dict with:
+
+        - ``agreed``: True if the user has accepted terms at least as recent
+          as the remote effective date.
+        - ``reason``: None, ``'new_user'``, or ``'terms_updated'`` when
+          ``agreed`` is False.
+        - ``effective_date``, ``terms_url``, ``privacy_url``: remote legal
+          metadata (empty strings if the fetch failed).
+        - ``install_sent``: whether install telemetry was sent once.
+
+        If the network fetch fails, falls back to the legacy behaviour of
+        treating any non-empty ``legal_agreed_version`` as agreement, so
+        offline users are never blocked.
+        """
         settings = load_persisted_settings()
-        agreed = settings.get('legal_agreed_version', '') != ''
+        stored_date = str(settings.get('legal_agreed_date', '') or '').strip()
+        legacy_agreed = str(settings.get('legal_agreed_version', '') or '').strip() != ''
         install_sent = settings.get('installed_telemetry_sent', False)
-        log(f'[legal] get_legal_status: agreed={agreed}, install_sent={install_sent}')
+
+        remote = self._fetch_remote_legal_payload()
+        effective_date = remote.get('effective_date', '')
+        terms_url = remote.get('terms_url', '') or 'https://projectkestrel.org/terms-of-use'
+        privacy_url = remote.get('privacy_url', '') or 'https://projectkestrel.org/privacy-policy'
+
+        if not effective_date:
+            agreed = legacy_agreed
+            reason = None if agreed else 'new_user'
+            log(f'[legal] get_legal_status (offline fallback): agreed={agreed}')
+            return {
+                'agreed': agreed,
+                'reason': reason,
+                'effective_date': '',
+                'terms_url': terms_url,
+                'privacy_url': privacy_url,
+                'install_sent': install_sent,
+            }
+
+        if stored_date and stored_date >= effective_date:
+            agreed = True
+            reason = None
+        elif legacy_agreed or stored_date:
+            agreed = False
+            reason = 'terms_updated'
+        else:
+            agreed = False
+            reason = 'new_user'
+
+        log(
+            f'[legal] get_legal_status: agreed={agreed}, reason={reason}, '
+            f'stored_date={stored_date!r}, effective_date={effective_date!r}'
+        )
         return {
             'agreed': agreed,
-            'install_sent': install_sent
+            'reason': reason,
+            'effective_date': effective_date,
+            'terms_url': terms_url,
+            'privacy_url': privacy_url,
+            'install_sent': install_sent,
         }
 
-    def agree_to_legal(self):
-        """Mark legal agreement as accepted and trigger installation telemetry if needed."""
+    def agree_to_legal(self, effective_date: str = ''):
+        """Mark legal agreement as accepted and trigger installation telemetry if needed.
+
+        Parameters
+        ----------
+        effective_date : str
+            The ``effective_date`` from ``legal.json`` that the UI showed to
+            the user. Stored in ``legal_agreed_date`` and used for future
+            re-acceptance comparisons. If empty, only the legacy
+            ``legal_agreed_version`` marker is written.
+        """
         settings = load_persisted_settings()
         version = _telemetry._read_version() if _telemetry else 'unknown'
         settings['legal_agreed_version'] = version
-        log(f'[legal] User agreed to terms (version {version})')
-        
-        # Trigger installation telemetry on first agreement
+        date_str = str(effective_date or '').strip()
+        if date_str:
+            settings['legal_agreed_date'] = date_str
+        log(f'[legal] User agreed to terms (version {version}, effective_date={date_str!r})')
+
         if not settings.get('installed_telemetry_sent', False):
             if _telemetry:
                 mid = _telemetry.get_machine_id(settings)
                 _telemetry.send_installation_telemetry(mid, version=version)
                 settings['installed_telemetry_sent'] = True
                 log('[legal] Initial installation telemetry triggered.')
-        
+
         save_persisted_settings(settings)
         return {'success': True}
     
@@ -1125,8 +1273,17 @@ class Api:
             return {'success': False, 'error': str(e)}
 
     def open_url(self, url: str):
-        """Open a URL in the system default browser (pywebview desktop mode)."""
+        """Open an external URL in the system default browser.
+
+        Gated by ``_is_safe_external_url``: only plain ``http``, ``https``,
+        and ``mailto`` schemes are passed through. Everything else (``file``,
+        ``javascript``, ``data``, custom URI handlers, UNC paths, control
+        characters) is rejected. See FINDING-01.
+        """
         try:
+            if not _is_safe_external_url(url):
+                log(f'[security] open_url refused unsafe URL: {url!r}')
+                return {'success': False, 'error': 'URL scheme not allowed'}
             webbrowser.open(url)
             return {'success': True}
         except Exception as e:
@@ -1427,23 +1584,29 @@ class Api:
                 return {'success': False, 'error': 'No valid paths provided'}
 
             sett = load_persisted_settings()
-            detection_threshold = float(sett.get('detection_threshold', 0.75))
+            detection_threshold = float(sett.get('detection_threshold', 0.25))
             detection_threshold = max(0.1, min(0.99, detection_threshold))
             scene_time_threshold = float(sett.get('scene_time_threshold', 1.0))
             scene_time_threshold = max(0.0, scene_time_threshold)
             mask_threshold = float(sett.get('mask_threshold', 0.5))
             mask_threshold = max(0.5, min(0.95, mask_threshold))
             try:
-                max_bird_crops = int(float(sett.get('max_bird_crops', 5)))
+                max_bird_crops = int(float(sett.get('max_bird_crops', 10)))
             except (TypeError, ValueError):
-                max_bird_crops = 5
+                max_bird_crops = 10
             max_bird_crops = max(1, min(20, max_bird_crops))
+            try:
+                parallel_prefetch = int(float(sett.get('parallel_prefetch', 3)))
+            except (TypeError, ValueError):
+                parallel_prefetch = 3
+            parallel_prefetch = max(1, min(5, parallel_prefetch))
             return _queue_manager.enqueue(validated_paths, use_gpu=bool(use_gpu),
                                           wildlife_enabled=bool(wildlife_enabled),
                                           detection_threshold=detection_threshold,
                                           scene_time_threshold=scene_time_threshold,
                                           mask_threshold=mask_threshold,
-                                          max_bird_crops=max_bird_crops)
+                                          max_bird_crops=max_bird_crops,
+                                          parallel_prefetch=parallel_prefetch)
         except Exception as e:
             print(f'[API] start_analysis_queue() -> Error: {e}', flush=True)
             return {'success': False, 'error': str(e)}
@@ -1715,14 +1878,32 @@ class Api:
             log(f'move_rejects_to_folder error: {e}')
             return {'success': False, 'error': str(e)}
 
-    def write_xmp_metadata(self, root_path: str, image_data, overwrite_external: bool = False, use_auto_labels: bool = False):
-        """Write XMP sidecar files for each image, embedding star rating and culling label."""
+    def write_xmp_metadata(
+        self,
+        root_path: str,
+        image_data,
+        overwrite_external: bool = False,
+        use_auto_labels: bool = False,
+        fields=None,
+    ):
+        """Write XMP sidecar files for each image, embedding star rating and culling label.
+
+        ``fields`` is an optional dict selecting which sections to write
+        (``rating``, ``label``, ``species``, ``family``, ``quality``).
+        Omitting it writes everything, preserving legacy behaviour.
+        """
         if _write_xmp_metadata is None:
             return {'success': False, 'error': 'metadata_writer module not available'}
         root_real, err = self._validate_root_dir(root_path, context='write_xmp_metadata', require_exists=True)
         if err:
             return {'success': False, 'error': err}
-        return _write_xmp_metadata(root_real, image_data, overwrite_external, use_auto_labels)
+        return _write_xmp_metadata(
+            root_real,
+            image_data,
+            overwrite_external,
+            use_auto_labels,
+            fields=fields if isinstance(fields, dict) else None,
+        )
 
     def _restore_file_with_sidecars(self, reject_dir: str, root_path: str, filename: str):
         """Restore a file and its configured companion files from reject directory.

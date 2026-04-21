@@ -17,7 +17,78 @@ _NS_DC = 'http://purl.org/dc/elements/1.1/'
 _NS_LR = 'http://ns.adobe.com/lightroom/1.0/'
 
 # Species/family values that indicate no meaningful detection
-_EMPTY_LABELS = {'', 'unknown', 'no bird'}
+_EMPTY_LABELS = {'', 'unknown', 'no bird', 'n/a'}
+
+
+def _safe_sidecar_path(root: str, filename: str) -> str | None:
+    """Resolve ``<root>/<filename>`` to an absolute path that is guaranteed to
+    live directly inside ``root`` and return it, or ``None`` if ``filename``
+    is unsafe.
+
+    Policy (FINDING-02): ``filename`` MUST already be a bare basename. Any
+    directory component (``../``, ``..\\``, absolute path, drive letter, UNC
+    prefix, leading separator, NUL byte, Windows ``altsep``) causes the
+    entry to be rejected outright — we deliberately do not silently reduce
+    ``../../etc/evil`` to ``evil`` and write it into the root, because
+    callers that pass non-bare names are either buggy or attacking, and in
+    either case the user's data is better served by an error than by a
+    surprise write.
+    """
+    if not isinstance(filename, str):
+        return None
+    name = filename.strip()
+    if not name:
+        return None
+    # Control chars / NUL byte — reject before any further interpretation.
+    if '\x00' in name:
+        return None
+    # Reject absolute paths, drive letters, and UNC prefixes up front.
+    if os.path.isabs(name):
+        return None
+    # ``ntpath.splitdrive`` catches Windows drive prefixes like ``C:foo``
+    # even on POSIX builds, because the attacker gets to choose the input.
+    import ntpath as _nt
+    drive, _rest = _nt.splitdrive(name)
+    if drive:
+        return None
+    # Reject any path separator (POSIX ``/``, Windows ``\\``) and the
+    # traversal pseudo-names. These are not legal characters in a sidecar
+    # basename and their presence indicates the caller is trying to
+    # redirect the write elsewhere.
+    if '/' in name or '\\' in name:
+        return None
+    if name in ('.', '..'):
+        return None
+    # os.sep / os.altsep are already covered above but keep the belt-and-
+    # suspenders check for future-proofing if someone ever adds new seps.
+    if os.sep in name or (os.altsep and os.altsep in name):
+        return None
+    try:
+        root_real = os.path.realpath(root)
+        candidate = os.path.realpath(os.path.join(root_real, name))
+    except (OSError, ValueError):
+        return None
+    try:
+        if os.path.commonpath([candidate, root_real]) != root_real:
+            return None
+    except ValueError:
+        # Different drives (Windows) — not under root.
+        return None
+    # Defence against ``realpath`` resolving a symlink back up out of root:
+    # require the final component to match the name we validated.
+    if os.path.basename(candidate) != name:
+        return None
+    return candidate
+
+# Default field selection for XMP writes — every field on. The frontend can
+# override individual flags via the `fields` parameter to write_xmp_metadata().
+_DEFAULT_FIELDS = {
+    'rating': True,    # xmp:Rating star rating (0–5)
+    'label': True,     # xmp:Label color label (Green/Red for accept/reject)
+    'species': True,   # kestrel:Species + dc:subject Species keyword
+    'family': True,    # kestrel:Family + dc:subject Family keyword
+    'quality': True,   # kestrel:QualityScore + Quality summary in description
+}
 
 
 def log(*args):
@@ -41,6 +112,21 @@ def _is_meaningful(value: str) -> bool:
     return bool(value) and value.lower() not in _EMPTY_LABELS
 
 
+def _normalize_fields(fields) -> dict:
+    """Coerce a user-supplied fields dict to a complete bool-valued dict.
+
+    Unknown keys are ignored; missing keys fall back to the default (True),
+    so omitting `fields` entirely preserves the legacy "write everything"
+    behaviour.
+    """
+    out = dict(_DEFAULT_FIELDS)
+    if isinstance(fields, dict):
+        for k, v in fields.items():
+            if k in out:
+                out[k] = bool(v)
+    return out
+
+
 def _build_xmp_packet(
     rating: int,
     label: str,
@@ -49,12 +135,25 @@ def _build_xmp_packet(
     species: str = '',
     family: str = '',
     quality_score: float = -1.0,
+    fields: dict | None = None,
 ) -> str:
-    """Build a complete XMP packet string with rating, label, and Kestrel metadata."""
+    """Build a complete XMP packet string with rating, label, and Kestrel metadata.
+
+    The `fields` dict (see `_DEFAULT_FIELDS`) controls which sections appear
+    in the packet. Disabled fields are omitted from xmp:* attributes,
+    kestrel:* attributes, dc:description, and dc:subject keywords.
+
+    Note: `kestrel:CullStatus` and `kestrel:SourceFile` are always written —
+    they are bookkeeping needed to detect Kestrel-authored sidecars on the
+    next write and are too small to bother gating.
+    """
+    f = _normalize_fields(fields)
     rating = max(0, min(5, rating))
-    has_species = _is_meaningful(species)
-    has_family = _is_meaningful(family)
-    has_quality = quality_score >= 0.0
+    write_rating = f['rating']
+    has_species = f['species'] and _is_meaningful(species)
+    has_family = f['family'] and _is_meaningful(family)
+    has_quality = f['quality'] and quality_score >= 0.0
+    write_label = f['label'] and bool(label)
 
     lines = [
         '<?xpacket begin="\xef\xbb\xbf" id="W5M0MpCehiHzreSzNTczkc9d"?>',
@@ -65,13 +164,14 @@ def _build_xmp_packet(
         f'      xmlns:dc="{_NS_DC}"',
         f'      xmlns:lr="{_NS_LR}"',
         f'      xmlns:kestrel="{_KESTREL_NS}"',
-        f'      xmp:Rating="{rating}"',
     ]
-
-    if label:
+    if write_rating:
+        lines.append(f'      xmp:Rating="{rating}"')
+    if write_label:
         lines.append(f'      xmp:Label="{label}"')
 
-    # Kestrel-specific attributes
+    # Kestrel-specific attributes — CullStatus + SourceFile are always written
+    # (used to identify Kestrel-authored sidecars on subsequent writes).
     lines.append(f'      kestrel:CullStatus="{_xml_escape(cull_status)}"')
     lines.append(f'      kestrel:SourceFile="{_xml_escape(filename)}"')
     if has_species:
@@ -91,30 +191,37 @@ def _build_xmp_packet(
         desc_parts.append(f'Family: {family}')
     if has_quality:
         desc_parts.append(f'Quality: {quality_score:.3f}')
-    desc_parts.append(f'Rating: {"*" * rating}')
+    if write_rating:
+        desc_parts.append(f'Rating: {"*" * rating}')
 
-    description = ' | '.join(desc_parts)
-    lines += [
-        '      <dc:description>',
-        '        <rdf:Alt>',
-        f'          <rdf:li xml:lang="x-default">{_xml_escape(description)}</rdf:li>',
-        '        </rdf:Alt>',
-        '      </dc:description>',
-    ]
+    if desc_parts:
+        description = ' | '.join(desc_parts)
+        lines += [
+            '      <dc:description>',
+            '        <rdf:Alt>',
+            f'          <rdf:li xml:lang="x-default">{_xml_escape(description)}</rdf:li>',
+            '        </rdf:Alt>',
+            '      </dc:description>',
+        ]
 
     # dc:subject — hierarchical keywords for Lightroom keyword panel
-    lines += [
-        '      <dc:subject>',
-        '        <rdf:Bag>',
-        f'          <rdf:li>Kestrel|Rating|{rating} Star</rdf:li>',
-    ]
+    subject_lines = []
+    if write_rating:
+        subject_lines.append(f'          <rdf:li>Kestrel|Rating|{rating} Star</rdf:li>')
     if has_species:
-        lines.append(f'          <rdf:li>Kestrel|Species|{_xml_escape(species)}</rdf:li>')
+        subject_lines.append(f'          <rdf:li>Kestrel|Species|{_xml_escape(species)}</rdf:li>')
     if has_family:
-        lines.append(f'          <rdf:li>Kestrel|Family|{_xml_escape(family)}</rdf:li>')
+        subject_lines.append(f'          <rdf:li>Kestrel|Family|{_xml_escape(family)}</rdf:li>')
+    if subject_lines:
+        lines += [
+            '      <dc:subject>',
+            '        <rdf:Bag>',
+            *subject_lines,
+            '        </rdf:Bag>',
+            '      </dc:subject>',
+        ]
+
     lines += [
-        '        </rdf:Bag>',
-        '      </dc:subject>',
         '    </rdf:Description>',
         '  </rdf:RDF>',
         '</x:xmpmeta>',
@@ -134,7 +241,13 @@ def _is_kestrel_xmp(path: str) -> bool:
         return False
 
 
-def write_xmp_metadata(root_path: str, image_data, overwrite_external: bool = False, use_auto_labels: bool = False):
+def write_xmp_metadata(
+    root_path: str,
+    image_data,
+    overwrite_external: bool = False,
+    use_auto_labels: bool = False,
+    fields: dict | None = None,
+):
     """Write XMP sidecar files for each image, embedding star rating, culling
     label, and analysis metadata (species, family, quality score).
 
@@ -168,10 +281,16 @@ def write_xmp_metadata(root_path: str, image_data, overwrite_external: bool = Fa
         overwrite_external: Whether to overwrite non-Kestrel XMPs.
         use_auto_labels: If True, write Red/Green color labels for AI-generated ('auto') culls.
                          Labels are always written for user culls ('manual' and 'verified').
+        fields: Optional dict selecting which fields to write. Recognised keys
+                are ``rating``, ``label``, ``species``, ``family``, ``quality``;
+                each value is coerced to bool. Missing keys default to True so
+                callers that omit the argument keep legacy "write everything"
+                behaviour.
 
     Returns:
         { success, written, skipped_conflicts: [filenames], errors }
     """
+    field_flags = _normalize_fields(fields)
     try:
         if not root_path or not os.path.isdir(root_path):
             return {'success': False, 'error': 'Invalid root path'}
@@ -209,9 +328,18 @@ def write_xmp_metadata(root_path: str, image_data, overwrite_external: bool = Fa
                 except (TypeError, ValueError):
                     quality_score = -1.0
 
-                base, _ext = os.path.splitext(filename)
-                xmp_filename = base + '.xmp'
-                xmp_path = os.path.join(root_path, xmp_filename)
+                # Jail sidecar writes to ``root_path``. A crafted filename
+                # with traversal segments (``../sensitive``) or an absolute
+                # path would otherwise let the caller write .xmp files
+                # anywhere on disk. See FINDING-02.
+                resolved_image = _safe_sidecar_path(root_path, filename)
+                if resolved_image is None:
+                    errors.append(f'{filename}: rejected (unsafe filename)')
+                    log(f'[security] write_xmp_metadata rejected unsafe filename: {filename!r}')
+                    continue
+                base, _ext = os.path.splitext(resolved_image)
+                xmp_path = base + '.xmp'
+                xmp_filename = os.path.basename(xmp_path)
 
                 # Safety check: if XMP already exists, verify origin
                 if os.path.exists(xmp_path):
@@ -231,6 +359,7 @@ def write_xmp_metadata(root_path: str, image_data, overwrite_external: bool = Fa
                     species=species,
                     family=family,
                     quality_score=quality_score,
+                    fields=field_flags,
                 )
 
                 with open(xmp_path, 'w', encoding='utf-8') as f:

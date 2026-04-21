@@ -16,17 +16,17 @@ jobs:
           echo "Downloading model files from GitHub release..."
           mkdir -p analyzer/models
 
-          curl -L -o analyzer/models/mask_rcnn_resnet50_fpn_v2.pth \
-            "https://github.com/SanjaySoniLV/ProjectKestrel/releases/download/test/mask_rcnn_resnet50_fpn_v2.pth"
+          curl -L -o analyzer/models/sam_hq_vit_tiny.pth \
+            "https://huggingface.co/lkeab/hq-sam/resolve/main/sam_hq_vit_tiny.pth"
 
           echo "Verifying download..."
-          if [ ! -f analyzer/models/mask_rcnn_resnet50_fpn_v2.pth ]; then
-            echo "ERROR: mask_rcnn_resnet50_fpn_v2.pth not found after download"
+          if [ ! -f analyzer/models/sam_hq_vit_tiny.pth ]; then
+            echo "ERROR: sam_hq_vit_tiny.pth not found after download"
             exit 1
           fi
-          FILE_SIZE=$(stat -f%z analyzer/models/mask_rcnn_resnet50_fpn_v2.pth 2>/dev/null || stat -c%s analyzer/models/mask_rcnn_resnet50_fpn_v2.pth)
+          FILE_SIZE=$(stat -f%z analyzer/models/sam_hq_vit_tiny.pth 2>/dev/null || stat -c%s analyzer/models/sam_hq_vit_tiny.pth)
           echo "Downloaded file size: ${FILE_SIZE} bytes"
-          if [ "${FILE_SIZE}" -lt 100000 ]; then
+          if [ "${FILE_SIZE}" -lt 20000000 ]; then
             echo "ERROR: Downloaded file too small (${FILE_SIZE} bytes)"
             exit 1
           fi

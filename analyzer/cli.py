@@ -8,14 +8,38 @@ from pathlib import Path
 sys.path.insert(0, str(Path(__file__).parent))
 from kestrel_analyzer.pipeline import AnalysisPipeline
 from kestrel_analyzer.logging_utils import get_log_path, log_event, log_exception
-from kestrel_analyzer.config import RAW_EXTENSIONS, JPEG_EXTENSIONS
+from kestrel_analyzer.config import (
+    DEFAULT_DETECTOR_NAME,
+    DETECTOR_ONNX_PATHS,
+    JPEG_EXTENSIONS,
+    RAW_EXTENSIONS,
+)
 
 
 def parse_args():
+    detector_choices = sorted(DETECTOR_ONNX_PATHS.keys())
     parser = argparse.ArgumentParser(description="Kestrel Analyzer CLI")
     parser.add_argument("folder", help="Folder with RAW/JPEG images")
-    parser.add_argument("--gpu", dest="use_gpu", action="store_true", help="Use GPU (DirectML) for ONNX")
+    parser.add_argument("--gpu", dest="use_gpu", action="store_true", help="Use GPU (DirectML on Windows, CoreML on macOS) for ONNX")
     parser.add_argument("--no-gpu", dest="use_gpu", action="store_false", help="Force CPU for ONNX")
+    parser.add_argument(
+        "--detector-name",
+        choices=detector_choices,
+        default=DEFAULT_DETECTOR_NAME,
+        help="Select detector model variant.",
+    )
+    parser.add_argument(
+        "--detection-threshold",
+        type=float,
+        default=0.25,
+        help="Minimum detection confidence threshold (0.10-0.99); matches desktop default.",
+    )
+    parser.add_argument(
+        "--parallel-prefetch",
+        type=int,
+        default=3,
+        help="Parallel RAW decode workers (1-5); matches desktop 'parallel prefetch' setting.",
+    )
     parser.add_argument(
         "--smoke",
         action="store_true",
@@ -49,6 +73,8 @@ def main():
     log_path = get_log_path(None)
     try:
         args = parse_args()
+        detection_threshold = max(0.10, min(0.99, float(args.detection_threshold)))
+        parallel_pf = max(1, min(5, int(float(args.parallel_prefetch))))
         log_path = get_log_path(args.folder)
         if args.smoke:
             log_event(
@@ -76,7 +102,10 @@ def main():
             else:
                 print("Smoke test FAILED: read_image returned None", flush=True)
             return
-        pipeline = AnalysisPipeline(use_gpu=args.use_gpu)
+        pipeline = AnalysisPipeline(
+            use_gpu=args.use_gpu,
+            detector_name=args.detector_name,
+        )
 
         def on_status(msg):
             print(msg)
@@ -91,6 +120,9 @@ def main():
                 "event": "cli_start",
                 "folder": args.folder,
                 "use_gpu": args.use_gpu,
+                "detector_name": args.detector_name,
+                "detection_threshold": detection_threshold,
+                "parallel_prefetch": parallel_pf,
             },
         )
 
@@ -101,6 +133,8 @@ def main():
                 "on_progress": on_progress,
             },
             analyzer_name="cli",
+            detection_threshold=detection_threshold,
+            parallel_prefetch=parallel_pf,
         )
         print()
     except Exception as e:

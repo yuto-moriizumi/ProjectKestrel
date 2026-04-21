@@ -1,21 +1,24 @@
+import concurrent.futures
 import json
 import os
+import queue
+import threading
 import time
 import warnings
-from typing import Callable, Dict, Optional
+from typing import Callable, Dict, Generator, Optional
 
 import cv2
 import numpy as np
 import pandas as pd
 
 from .config import (
+    DEFAULT_DETECTOR_NAME,
     JPEG_EXTENSIONS,
     RAW_EXTENSIONS,
     SPECIESCLASSIFIER_LABELS,
     SPECIESCLASSIFIER_PATH,
     QUALITYCLASSIFIER_PATH,
     QUALITY_NORMALIZATION_DATA_PATH,
-    WILDLIFE_CATEGORIES,
     MODELS_DIR,
     KESTREL_DIR_NAME,
     METADATA_FILENAME,
@@ -30,11 +33,11 @@ from .database import (
     update_scenedata_with_database,
 )
 from .exposure_compensation import (
-    apply_exposure_correction as ec_apply_exposure_correction,
+    apply_exposure_crop_numpy,
     build_metered_detection_image,
     compose_total_stops as ec_compose_total_stops,
-    compute_exposure_stops as ec_compute_exposure_stops,
-    refine_exposure_stops as ec_refine_exposure_stops,
+    compute_stops_numpy_solver,
+    linear_to_srgb_u8,
 )
 from .image_utils import read_image, read_image_for_pipeline
 from .ratings import quality_to_rating, get_profile_thresholds
@@ -49,15 +52,26 @@ except ImportError:
         from analyzer.settings_utils import load_persisted_settings
     except ImportError:
         load_persisted_settings = None
-from .ml.mask_rcnn import MaskRCNNWrapper
+from .ml.speciesnet_sam_hq import SpeciesNetSAMHQWrapper
 from .ml.bird_species import BirdSpeciesClassifier
 from .ml.quality import QualityClassifier
 
 
+def _write_jpeg(path: str, bgr: np.ndarray, params) -> bool:
+    # Some cv2 builds (headless/full conflict) reject imwrite's params arg.
+    # imencode + tofile works on every wheel and handles unicode Windows paths.
+    ok, buf = cv2.imencode('.jpg', bgr, params)
+    if not ok:
+        return False
+    buf.tofile(path)
+    return True
+
+
 class AnalysisPipeline:
-    def __init__(self, use_gpu: bool):
+    def __init__(self, use_gpu: bool, detector_name: str = DEFAULT_DETECTOR_NAME):
         self.use_gpu = use_gpu
-        self.mask_rcnn: Optional[MaskRCNNWrapper] = None
+        self.detector_name = str(detector_name)
+        self.sn_sam: Optional[SpeciesNetSAMHQWrapper] = None
         self.species_clf: Optional[BirdSpeciesClassifier] = None
         self.quality_clf: Optional[QualityClassifier] = None
         self._log_path: Optional[str] = None
@@ -88,50 +102,21 @@ class AnalysisPipeline:
         return overlay
 
     @staticmethod
-    def _compute_exposure_stops(img: np.ndarray, mask: np.ndarray, profile: str = "aggressive") -> float:
-        return ec_compute_exposure_stops(img, mask, profile)
-
-    @staticmethod
-    def _refine_exposure_stops(
-        img: np.ndarray,
+    def _compute_stops_numpy(
+        noauto_linear: np.ndarray,
         mask: np.ndarray,
-        initial_stops: float,
-        profile: str,
-        solver: str = "metered_refine_one_pass",
-        raw_obj=None,
-        *,
-        base_scale: float = 1.0,
-        no_auto_bright: bool = False,
+        meter_scale: float,
+        quality: str = "balanced",
     ) -> float:
-        return ec_refine_exposure_stops(
-            img,
-            mask,
-            initial_stops,
-            profile,
-            solver=solver,
-            raw_obj=raw_obj,
-            base_scale=base_scale,
-            no_auto_bright=no_auto_bright,
-        )
+        return compute_stops_numpy_solver(noauto_linear, mask, meter_scale, quality)
 
     @staticmethod
-    def _apply_exposure_correction(
-        img: np.ndarray,
-        stops: float,
-        raw_obj=None,
-        *,
-        base_scale: float = 1.0,
-        no_auto_bright: bool = False,
-        profile: str = "aggressive",
+    def _apply_crop_numpy(
+        noauto_linear: np.ndarray,
+        crop_bbox,
+        total_scale: float,
     ) -> np.ndarray:
-        return ec_apply_exposure_correction(
-            img,
-            stops,
-            raw_obj,
-            base_scale=base_scale,
-            no_auto_bright=no_auto_bright,
-            profile=profile,
-        )
+        return apply_exposure_crop_numpy(noauto_linear, crop_bbox, total_scale)
 
     @staticmethod
     def _get_image_orientation(img: np.ndarray) -> str:
@@ -143,6 +128,216 @@ class AnalysisPipeline:
         if w > h:
             return "landscape"
         return "square"
+
+    # Default parallel RAW decode workers when caller omits parallel_prefetch (matches settings default).
+    _DEFAULT_DECODE_WORKERS: int = 3
+
+    def _decode_image(self, image_path: str, raw_file: str) -> dict:
+        """Decode one image.  Safe to call from a worker thread.
+
+        Returns a dict with keys:
+            file_name, image_path, img, noauto_linear, raw_meter_scale,
+            exposure_pipeline, meter_warning, orientation, capture_time, error
+        """
+        result: dict = {
+            "file_name": raw_file,
+            "image_path": image_path,
+            "img": None,
+            "noauto_linear": None,
+            "raw_meter_scale": 1.0,
+            "exposure_pipeline": "legacy_auto_bright_v1",
+            "meter_warning": None,
+            "orientation": "unknown",
+            "capture_time": None,
+            "error": None,
+        }
+        try:
+            img, raw_obj = read_image_for_pipeline(image_path)
+            if img is None and raw_obj is None:
+                raise RuntimeError("Image read returned None for both img and raw_obj")
+
+            if raw_obj is not None:
+                result["exposure_pipeline"] = "numpy_linear_v2"
+                try:
+                    metered_img, raw_meter_scale, meter_debug, noauto_linear = (
+                        build_metered_detection_image(raw_obj)
+                    )
+                finally:
+                    raw_obj.close()
+                result["raw_meter_scale"] = float(raw_meter_scale)
+                result["noauto_linear"] = noauto_linear
+                if metered_img is not None:
+                    img = metered_img
+                elif meter_debug.get("error"):
+                    result["meter_warning"] = (
+                        f"RAW metering fallback to default decode: {meter_debug['error']}"
+                    )
+
+            if img is None:
+                raise RuntimeError("Image build returned None after decode")
+
+            result["img"] = img
+            result["orientation"] = self._get_image_orientation(img)
+
+            try:
+                ct = get_capture_time(image_path)
+                result["capture_time"] = ct
+            except Exception:
+                pass
+
+        except Exception as exc:
+            result["error"] = exc
+
+        return result
+
+    def _iter_decoded(
+        self,
+        file_list: list,
+        folder: str,
+        max_workers: int = 3,
+    ) -> Generator[dict, None, None]:
+        """Yield decoded image dicts in file_list order.
+
+        Up to *max_workers* files are decoded concurrently by background threads.
+        A semaphore limits total submitted-but-not-yet-consumed results to
+        ``max_workers + 1`` so peak memory stays bounded regardless of how
+        slowly the consumer processes each image.
+
+        Observability
+        -------------
+        Emits periodic ``[decode-queue]`` stderr lines (roughly every 10% of
+        the run, plus the first few images) and a final structured
+        ``decode_queue_summary`` log event so the operator can tell whether
+        the queue is actually hiding decode latency behind pipeline work.
+
+        Interpreting the numbers:
+          * ``wait_ms=0`` consistently     → pipeline is the bottleneck, the
+            queue is fully hiding decode cost (good).
+          * ``wait_ms`` grows vs ``decode_ms``  → decoder is the bottleneck,
+            raising ``parallel_prefetch`` may help (if disk/CPU headroom).
+          * ``inflight`` never exceeds 1   → decodes are effectively serial;
+            check ``parallel_prefetch`` setting or whether the file list
+            fell into the degenerate inline path.
+        """
+        total = len(file_list)
+        if max_workers <= 1 or total == 0:
+            for raw_file in file_list:
+                yield self._decode_image(os.path.join(folder, raw_file), raw_file)
+            return
+
+        metrics_lock = threading.Lock()
+        submitted = 0        # decodes handed to the pool
+        completed = 0        # decodes that have finished (set by workers)
+        total_decode_ms = 0.0
+        total_wait_ms = 0.0
+        peak_inflight = 0
+
+        max_buffered = max_workers + 1
+        semaphore = threading.Semaphore(max_buffered)
+        futures_q: queue.Queue = queue.Queue()
+
+        # Fixed cadence (every 10 images) rather than a percentage of total so
+        # long runs remain observable in real time. First 3 images always
+        # print for warm-up visibility, and the last image always prints.
+        log_every_n = 10
+
+        def _decode_and_time(image_path: str, raw_file: str) -> dict:
+            t0 = time.monotonic()
+            decoded = self._decode_image(image_path, raw_file)
+            decode_ms = (time.monotonic() - t0) * 1000.0
+            decoded["_decode_ms"] = decode_ms
+            with metrics_lock:
+                nonlocal completed, total_decode_ms
+                completed += 1
+                total_decode_ms += decode_ms
+            return decoded
+
+        def _submit_all() -> None:
+            nonlocal submitted, peak_inflight
+            with concurrent.futures.ThreadPoolExecutor(max_workers=max_workers) as executor:
+                for raw_file in file_list:
+                    semaphore.acquire()
+                    future = executor.submit(
+                        _decode_and_time,
+                        os.path.join(folder, raw_file),
+                        raw_file,
+                    )
+                    with metrics_lock:
+                        submitted += 1
+                        inflight = submitted - completed
+                        if inflight > peak_inflight:
+                            peak_inflight = inflight
+                    futures_q.put(future)
+            futures_q.put(None)
+
+        submit_thread = threading.Thread(target=_submit_all, daemon=True)
+        submit_thread.start()
+
+        idx = 0
+        print(
+            f"[decode-queue] starting: files={total} workers={max_workers} "
+            f"buffer={max_buffered}",
+            flush=True,
+        )
+
+        while True:
+            future = futures_q.get()
+            if future is None:
+                break
+            t_wait = time.monotonic()
+            decoded = future.result()
+            wait_ms = (time.monotonic() - t_wait) * 1000.0
+            with metrics_lock:
+                total_wait_ms += wait_ms
+                snap_submitted = submitted
+                snap_completed = completed
+            idx += 1
+
+            # Print for the first 3 images (warm-up visibility), then every
+            # ~10% of the run, and always on the last image.
+            if idx <= 3 or idx % log_every_n == 0 or idx == total:
+                decode_ms = decoded.get("_decode_ms")
+                decode_ms_str = f"{decode_ms:.0f}" if decode_ms is not None else "?"
+                inflight_now = max(0, snap_submitted - snap_completed)
+                ahead = max(0, snap_submitted - idx)
+                print(
+                    f"[decode-queue] idx={idx}/{total} "
+                    f"inflight={inflight_now} ahead={ahead} "
+                    f"decode_ms={decode_ms_str} wait_ms={wait_ms:.0f}",
+                    flush=True,
+                )
+
+            yield decoded
+            semaphore.release()
+
+        submit_thread.join()
+
+        # Final summary — this is the number you actually want to watch
+        # when deciding whether to raise parallel_prefetch.
+        avg_decode = total_decode_ms / max(1, total)
+        avg_wait = total_wait_ms / max(1, total)
+        try:
+            log_event(
+                self._log_path,
+                {
+                    "level": "info",
+                    "event": "decode_queue_summary",
+                    "max_workers": int(max_workers),
+                    "file_count": int(total),
+                    "peak_inflight": int(peak_inflight),
+                    "sum_decode_ms": round(total_decode_ms, 1),
+                    "sum_wait_ms": round(total_wait_ms, 1),
+                    "avg_decode_ms": round(avg_decode, 1),
+                    "avg_wait_ms": round(avg_wait, 1),
+                },
+            )
+        except Exception:
+            pass
+        print(
+            f"[decode-queue] done: files={total} peak_inflight={peak_inflight} "
+            f"avg_decode_ms={avg_decode:.0f} avg_wait_ms={avg_wait:.0f}",
+            flush=True,
+        )
 
     def load_models(
         self,
@@ -156,15 +351,23 @@ class AnalysisPipeline:
         max_bird_crops = max(1, min(20, max_bird_crops))
 
         mask_ready_for_cap = bool(
-            self.mask_rcnn
-            and int(getattr(self.mask_rcnn, "max_bird_crops", 5)) == max_bird_crops
+            self.sn_sam
+            and int(getattr(self.sn_sam, "max_bird_crops", 5)) == max_bird_crops
+            and getattr(self.sn_sam, "use_gpu", None) == self.use_gpu
+            and str(getattr(self.sn_sam, "detector_name", DEFAULT_DETECTOR_NAME)) == self.detector_name
         )
         if mask_ready_for_cap and self.species_clf and self.quality_clf:
             return
         if status_cb:
-            status_cb("Loading models... This may take a while on first run.")
+            status_cb(
+                f"Loading models (detector={self.detector_name})... This may take a while on first run."
+            )
         if not mask_ready_for_cap:
-            self.mask_rcnn = MaskRCNNWrapper(max_bird_crops=max_bird_crops)
+            self.sn_sam = SpeciesNetSAMHQWrapper(
+                max_bird_crops=max_bird_crops,
+                use_gpu=self.use_gpu,
+                detector_name=self.detector_name,
+            )
         if not self.species_clf:
             self.species_clf = BirdSpeciesClassifier(
                 str(SPECIESCLASSIFIER_PATH),
@@ -188,10 +391,11 @@ class AnalysisPipeline:
         callbacks: Optional[Dict[str, Callable]] = None,
         analyzer_name: str = "pipeline",
         wildlife_enabled: bool = True,
-        detection_threshold: float = 0.75,
+        detection_threshold: float = 0.25,
         scene_time_threshold: float = 1.0,
         mask_threshold: float = 0.5,
         max_bird_crops: int = 5,
+        parallel_prefetch: int = 3,
     ) -> None:
         callbacks = callbacks or {}
         status_cb = callbacks.get("on_status")
@@ -210,24 +414,38 @@ class AnalysisPipeline:
             max_bird_crops = 5
         max_bird_crops = max(1, min(20, max_bird_crops))
 
+        try:
+            decode_workers = int(parallel_prefetch)
+        except (TypeError, ValueError):
+            decode_workers = self._DEFAULT_DECODE_WORKERS
+        decode_workers = max(1, min(5, decode_workers))
+
         rating_thresholds = None
-        exposure_profile = "aggressive"
-        exposure_solver = "metered_refine_one_pass"
+        rating_profile = "balanced"
+        exposure_quality = "balanced"
+        thumbnail_max_width = 1200
+        thumbnail_jpeg_quality = 95
         if callable(load_persisted_settings):
             try:
                 sett = load_persisted_settings() or {}
-                profile = sett.get('rating_profile', 'balanced')
-                rating_thresholds = get_profile_thresholds(profile)
-                raw_exp_profile = str(sett.get('exposure_compensation_profile', 'aggressive') or 'aggressive').strip().lower()
-                if raw_exp_profile in {'lenient', 'normal', 'aggressive'}:
-                    exposure_profile = raw_exp_profile
-                raw_exp_solver = str(sett.get('exposure_compensation_solver', 'metered_refine_one_pass') or 'metered_refine_one_pass').strip().lower()
-                if raw_exp_solver in {'metered_refine_one_pass', 'convergent_two_pass', 'predictive_fast'}:
-                    exposure_solver = raw_exp_solver
+                rating_profile = str(sett.get('rating_profile', 'balanced') or 'balanced').strip().lower() or 'balanced'
+                rating_thresholds = get_profile_thresholds(rating_profile)
+                raw_eq = str(sett.get('exposure_quality', 'balanced') or 'balanced').strip().lower()
+                if raw_eq in {'lenient', 'balanced', 'aggressive'}:
+                    exposure_quality = raw_eq
+                try:
+                    thumbnail_max_width = int(sett.get('thumbnail_max_width', 1200))
+                except (TypeError, ValueError):
+                    thumbnail_max_width = 1200
+                try:
+                    thumbnail_jpeg_quality = int(sett.get('thumbnail_jpeg_quality', 95))
+                except (TypeError, ValueError):
+                    thumbnail_jpeg_quality = 95
             except Exception:
                 rating_thresholds = None
-
-        active_wildlife_categories = WILDLIFE_CATEGORIES if wildlife_enabled else []
+        thumbnail_max_width = max(400, min(2400, thumbnail_max_width))
+        thumbnail_jpeg_quality = max(50, min(100, thumbnail_jpeg_quality))
+        jpeg_params = [int(cv2.IMWRITE_JPEG_QUALITY), thumbnail_jpeg_quality]
 
         self._log_path = get_log_path(folder)
         stage_ctx = {"stage": "startup", "file": None}
@@ -287,6 +505,9 @@ class AnalysisPipeline:
                     "analyzer": analyzer_name,
                     "folder": folder,
                     "file_count": len(files),
+                    "detector_name": self.detector_name,
+                    "detection_threshold": float(detection_threshold),
+                    "parallel_prefetch": int(decode_workers),
                 },
             )
 
@@ -333,7 +554,12 @@ class AnalysisPipeline:
                         previous_orientation = self._get_image_orientation(img)
             scene_count = database["scene_count"].max() if not database.empty else 0
 
-            for idx, raw_file in enumerate(new_files, start=1):
+            for idx, decoded in enumerate(
+                self._iter_decoded(new_files, folder, max_workers=decode_workers),
+                start=1,
+            ):
+                raw_file = decoded["file_name"]
+
                 # Pause: wait until resume or until cancel_event is set.
                 if pause_event is not None:
                     while not pause_event.is_set():
@@ -378,42 +604,37 @@ class AnalysisPipeline:
                     "orientation": "unknown",
                 }
 
-                image_path = None
-                raw_obj = None
-                raw_meter_scale = 1.0
+                image_path = decoded["image_path"]
+                raw_meter_scale = decoded["raw_meter_scale"]
                 try:
                     stage_ctx["stage"] = "read_image"
                     stage_ctx["file"] = raw_file
-                    image_path = os.path.join(folder, raw_file)
-                    img, raw_obj = read_image_for_pipeline(image_path)
+
+                    # Re-raise any decode error inside the per-image error handler.
+                    if decoded["error"] is not None:
+                        raise decoded["error"]
+
+                    img = decoded["img"]
+                    noauto_linear = decoded["noauto_linear"]
+
                     if img is None:
-                        raise RuntimeError("Image read returned None")
+                        raise RuntimeError("Image build returned None")
 
-                    if raw_obj is not None:
-                        entry["exposure_pipeline"] = "no_auto_bright_metered_v1"
-                        metered_img, raw_meter_scale, meter_debug = build_metered_detection_image(
-                            raw_obj,
-                            profile=exposure_profile,
+                    entry["exposure_pipeline"] = decoded["exposure_pipeline"]
+                    entry["exposure_meter_scale"] = float(raw_meter_scale)
+                    if decoded.get("meter_warning"):
+                        log_warning(
+                            self._log_path,
+                            decoded["meter_warning"],
+                            stage=stage_ctx["stage"],
+                            context={"file": raw_file, "folder": folder},
                         )
-                        entry["exposure_meter_scale"] = float(raw_meter_scale)
-                        if metered_img is not None:
-                            img = metered_img
-                        elif meter_debug.get("error"):
-                            log_warning(
-                                self._log_path,
-                                f"RAW metering fallback to default decode: {meter_debug['error']}",
-                                stage=stage_ctx["stage"],
-                                context={"file": raw_file, "folder": folder},
-                            )
 
-                    current_orientation = self._get_image_orientation(img)
+                    current_orientation = decoded["orientation"]
                     entry["orientation"] = current_orientation
 
-                    try:
-                        ct = get_capture_time(image_path)
-                        entry["capture_time"] = ct.isoformat() if ct is not None else ""
-                    except Exception:
-                        pass
+                    ct = decoded["capture_time"]
+                    entry["capture_time"] = ct.isoformat() if ct is not None else ""
 
                     stage_ctx["stage"] = "compute_similarity"
                     timestamp_similar = None
@@ -475,17 +696,54 @@ class AnalysisPipeline:
                                 "similar": similarity["similar"],
                             }
                         )
-                    previous_image = img.copy()
+                    # Hold the previous image by reference, not by copy. The next
+                    # iteration rebinds ``img`` to a fresh decoded array, so the
+                    # old array stays alive for AKAZE via this reference. The
+                    # per-detection patch-and-restore in ``process_subject_items``
+                    # keeps ``img`` pristine across the rest of this iteration.
+                    # Skipping a 45 MP uint8 copy (~135 MB memcpy) here closes
+                    # a significant slice of the gap between "bird crop shown"
+                    # and "next image thumbnail shown".
+                    previous_image = img
                     previous_image_path = image_path
                     previous_orientation = current_orientation
 
                     stage_ctx["stage"] = "export_image"
                     export_path = os.path.join(export_dir, f"{os.path.splitext(raw_file)[0]}_export.jpg")
-                    img_small = cv2.resize(img, (1200, int(1200 * img.shape[0] / img.shape[1])))
-                    cv2.imwrite(
+                    # Thumbnail must be free of baked-in exposure correction so the
+                    # browser's live correction (driven by entry.exposure_correction)
+                    # does not double-apply the meter_scale component. For RAW,
+                    # render directly from noauto_linear (no meter scale). For
+                    # non-RAW, img already has no correction applied.
+                    #
+                    # Downsize FIRST in linear float space, THEN apply the sRGB
+                    # curve. This was the biggest single cost in the gap between
+                    # "bird thumbnails shown for image N" and "thumbnail shown
+                    # for image N+1" — the old code ran the full gamma LUT on
+                    # the entire 45 MP linear frame before shrinking to ~1 MP,
+                    # which is ~40x more work than necessary. Downsizing in
+                    # linear space with INTER_AREA is also more physically
+                    # correct for photographs (standard practice in any serious
+                    # image pipeline — avoids edge/highlight artifacts that
+                    # come from box-filtering gamma-compressed values).
+                    if noauto_linear is not None:
+                        src_h, src_w = noauto_linear.shape[:2]
+                        _tgt_w = min(thumbnail_max_width, int(src_w))
+                        _tgt_h = max(1, int(_tgt_w * src_h / src_w))
+                        linear_small = cv2.resize(
+                            noauto_linear, (_tgt_w, _tgt_h),
+                            interpolation=cv2.INTER_AREA,
+                        )
+                        img_small = linear_to_srgb_u8(linear_small)
+                    else:
+                        src_h, src_w = img.shape[:2]
+                        _tgt_w = min(thumbnail_max_width, int(src_w))
+                        _tgt_h = max(1, int(_tgt_w * src_h / src_w))
+                        img_small = cv2.resize(img, (_tgt_w, _tgt_h), interpolation=cv2.INTER_AREA)
+                    _write_jpeg(
                         export_path,
                         cv2.cvtColor(img_small, cv2.COLOR_RGB2BGR),
-                        [cv2.IMWRITE_JPEG_QUALITY, 70],
+                        jpeg_params,
                     )
                     # Store relative path for cross-platform compatibility
                     export_path_rel = os.path.relpath(export_path, folder)
@@ -493,11 +751,18 @@ class AnalysisPipeline:
                     if thumbnail_cb:
                         thumbnail_cb({"filename": raw_file, "thumbnail": img_small, "export_path": export_path_rel})
 
-                    stage_ctx["stage"] = "mask_rcnn_prediction"
-                    # MaskRCNN inference can take many seconds. Pause semantics are
+                    stage_ctx["stage"] = "detection_segmentation"
+                    # SpeciesNet + SAM-HQ inference can take many seconds. Pause semantics are
                     # handled at the start of each image loop so we do not check
                     # repeatedly inside the image processing path.
-                    masks, pred_boxes, pred_class, pred_score = self.mask_rcnn.get_prediction(img, threshold=detection_threshold, mask_threshold=mask_threshold)
+                    # mask_threshold is accepted for API compatibility; SAM-HQ ignores it (see settings tooltip).
+                    masks, pred_boxes, pred_class, pred_score = self.sn_sam.get_prediction(
+                        img,
+                        image_path,
+                        wildlife_enabled=wildlife_enabled,
+                        threshold=detection_threshold,
+                        mask_threshold=mask_threshold,
+                    )
                     if masks is None or len(masks) == 0:
                         if detection_cb:
                             detection_cb(
@@ -517,10 +782,10 @@ class AnalysisPipeline:
                             status_cb(f"No detections in {raw_file}")
                         stage_ctx["stage"] = "write_crop"
                         crop_path = os.path.join(crop_dir, f"{os.path.splitext(raw_file)[0]}_crop_0.jpg")
-                        cv2.imwrite(
+                        _write_jpeg(
                             crop_path,
                             cv2.cvtColor(img_small, cv2.COLOR_RGB2BGR),
-                            [cv2.IMWRITE_JPEG_QUALITY, 85],
+                            jpeg_params,
                         )
                         # Store relative path for cross-platform compatibility
                         crop_path_rel = os.path.relpath(crop_path, folder)
@@ -571,14 +836,13 @@ class AnalysisPipeline:
                             progress_cb(idx + processed_count, total)
                         continue
 
-                    # Store top-5 raw MaskRCNN detection confidence scores
+                    # Top-5 SpeciesNet ensemble scores (per retained detection)
                     entry["detection_scores"] = json.dumps([float(s) for s in sorted(pred_score, reverse=True)[:5]])
 
-                    wildlife_indices = [i for i, c in enumerate(pred_class) if c in active_wildlife_categories]
                     bird_indices = [i for i, c in enumerate(pred_class) if c == "bird"]
-                    bird_indices = sorted(bird_indices, key=lambda i: pred_score[i], reverse=True)[:max_bird_crops]
+                    subject_indices = list(range(len(pred_class)))
 
-                    overlay_indices = bird_indices if bird_indices else wildlife_indices[:1]
+                    overlay_indices = subject_indices
                     if detection_cb:
                         detection_cb(
                             {
@@ -588,99 +852,51 @@ class AnalysisPipeline:
                             }
                         )
 
-                    def process_nonbird(primary_mask_i):
-                        stage_ctx["stage"] = "process_nonbird"
-                        stops = self._compute_exposure_stops(img, masks[primary_mask_i], exposure_profile)
-                        stops = self._refine_exposure_stops(
-                            img,
-                            masks[primary_mask_i],
-                            stops,
-                            exposure_profile,
-                            solver=exposure_solver,
-                            raw_obj=raw_obj,
-                            base_scale=raw_meter_scale,
-                            no_auto_bright=raw_obj is not None,
-                        )
-                        img_src = self._apply_exposure_correction(
-                            img,
-                            stops,
-                            raw_obj,
-                            base_scale=raw_meter_scale,
-                            no_auto_bright=raw_obj is not None,
-                            profile=exposure_profile,
-                        )
-                        total_stops = (
-                            ec_compose_total_stops(stops, raw_meter_scale)
-                            if raw_obj is not None
-                            else float(stops)
-                        )
-                        meter_scale = float(raw_meter_scale if raw_obj is not None else 1.0)
-                        pipeline_mode = (
-                            "no_auto_bright_metered_v1"
-                            if raw_obj is not None
-                            else "legacy_auto_bright_v1"
-                        )
-                        crop_bbox = self.mask_rcnn.get_square_crop_box(masks[primary_mask_i])
-                        quality_crop, quality_mask = self.mask_rcnn.get_square_crop(
-                            masks[primary_mask_i], img_src, resize=True
-                        )
-                        quality_score = self.quality_clf.classify(quality_crop, quality_mask)
-                        return {
-                            "index": int(primary_mask_i),
-                            "confidence": float(pred_score[primary_mask_i]),
-                            "species": pred_class[primary_mask_i],
-                            "species_confidence": float(pred_score[primary_mask_i]),
-                            "family": "N/A",
-                            "family_confidence": 0.0,
-                            "quality": quality_score,
-                            "rating": quality_to_rating(quality_score, rating_thresholds),
-                            "quality_crop": quality_crop,
-                            "exposure_correction": round(total_stops, 4),
-                            "exposure_pipeline": pipeline_mode,
-                            "exposure_subject_stops": round(float(stops), 4),
-                            "exposure_meter_scale": round(meter_scale, 6),
-                            "crop_bbox": crop_bbox,
-                        }
-
-                    def process_bird_items(indices):
-                        stage_ctx["stage"] = "process_bird"
+                    def process_subject_items(indices):
+                        stage_ctx["stage"] = "process_subjects"
                         items = []
                         for i in indices:
-                            # Process per-crop results. Pause is checked at the
-                            # top of the image loop so we avoid pausing mid-image.
-                            stops = self._compute_exposure_stops(img, masks[i], exposure_profile)
-                            stops = self._refine_exposure_stops(
-                                img,
-                                masks[i],
-                                stops,
-                                exposure_profile,
-                                solver=exposure_solver,
-                                raw_obj=raw_obj,
-                                base_scale=raw_meter_scale,
-                                no_auto_bright=raw_obj is not None,
-                            )
-                            img_src = self._apply_exposure_correction(
-                                img,
-                                stops,
-                                raw_obj,
-                                base_scale=raw_meter_scale,
-                                no_auto_bright=raw_obj is not None,
-                                profile=exposure_profile,
-                            )
-                            total_stops = (
-                                ec_compose_total_stops(stops, raw_meter_scale)
-                                if raw_obj is not None
-                                else float(stops)
-                            )
-                            meter_scale = float(raw_meter_scale if raw_obj is not None else 1.0)
-                            pipeline_mode = (
-                                "no_auto_bright_metered_v1"
-                                if raw_obj is not None
-                                else "legacy_auto_bright_v1"
-                            )
-                            species_crop = self.mask_rcnn.get_species_crop(pred_boxes[i], img_src)
-                            crop_bbox = self.mask_rcnn.get_square_crop_box(masks[i])
-                            quality_crop, quality_mask = self.mask_rcnn.get_square_crop(masks[i], img_src, resize=True)
+                            crop_bbox = self.sn_sam.get_square_crop_box(masks[i])
+                            if noauto_linear is not None:
+                                # RAW numpy path — no additional rawpy calls.
+                                stops = self._compute_stops_numpy(
+                                    noauto_linear, masks[i], raw_meter_scale, exposure_quality
+                                )
+                                total_scale = float(raw_meter_scale) * (2.0 ** float(stops))
+                                bbox_tuple = (
+                                    crop_bbox["y_min"], crop_bbox["x_min"],
+                                    crop_bbox["y_max"], crop_bbox["x_max"],
+                                )
+                                corrected_crop = self._apply_crop_numpy(noauto_linear, bbox_tuple, total_scale)
+                                # Patch the exposure-corrected crop in place on ``img``,
+                                # run the two downstream crop extractions that need
+                                # full-image coordinates, then restore the original
+                                # pixels before the next detection runs. This replaces
+                                # a full-frame ``img.copy()`` per detection (which was
+                                # ~140 MB on 45 MP RAW and was the visible lag between
+                                # per-bird thumbnails in the UI) with two tiny
+                                # crop-sized copies that are effectively free.
+                                y0, y1 = crop_bbox["y_min"], crop_bbox["y_max"]
+                                x0, x1 = crop_bbox["x_min"], crop_bbox["x_max"]
+                                original_patch = img[y0:y1, x0:x1].copy()
+                                img[y0:y1, x0:x1] = corrected_crop
+                                try:
+                                    species_crop = self.sn_sam.get_species_crop(pred_boxes[i], img)
+                                    quality_crop, quality_mask = self.sn_sam.get_square_crop(masks[i], img, resize=True)
+                                finally:
+                                    img[y0:y1, x0:x1] = original_patch
+                                total_stops = ec_compose_total_stops(stops, raw_meter_scale)
+                                meter_scale = float(raw_meter_scale)
+                                pipeline_mode = "numpy_linear_v2"
+                            else:
+                                # Non-RAW / JPEG path — no exposure correction, so no
+                                # patching needed. Use the metered image directly.
+                                stops = 0.0
+                                total_stops = 0.0
+                                meter_scale = 1.0
+                                pipeline_mode = "legacy_auto_bright_v1"
+                                species_crop = self.sn_sam.get_species_crop(pred_boxes[i], img)
+                                quality_crop, quality_mask = self.sn_sam.get_square_crop(masks[i], img, resize=True)
                             items.append(
                                 {
                                     "index": i,
@@ -771,9 +987,9 @@ class AnalysisPipeline:
                     primary_crop_index = 0
                     img_h, img_w = img.shape[:2]
 
-                    if bird_indices:
-                        bird_items = process_bird_items(bird_indices)
-                        bird_data = [
+                    if subject_indices:
+                        subject_items = process_subject_items(subject_indices)
+                        crop_data = [
                             {
                                 "index": i["index"],
                                 "confidence": i["confidence"],
@@ -790,27 +1006,27 @@ class AnalysisPipeline:
                                 "exposure_meter_scale": i.get("exposure_meter_scale", 1.0),
                                 "crop_bbox": i.get("crop_bbox"),
                             }
-                            for i in bird_items
+                            for i in subject_items
                         ]
-                        primary_crop_index = int(np.argmax([b["quality"] for b in bird_data]))
-                        primary_bird = bird_data[primary_crop_index]
+                        primary_crop_index = int(np.argmax([b["quality"] for b in crop_data]))
+                        primary_row = crop_data[primary_crop_index]
                         entry.update(
                             {
-                                "species": primary_bird["species"],
-                                "species_confidence": primary_bird["species_confidence"],
-                                "family": primary_bird["family"],
-                                "family_confidence": primary_bird["family_confidence"],
-                                "quality": primary_bird["quality"],
-                                "exposure_correction": primary_bird["exposure_correction"],
-                                "exposure_pipeline": primary_bird["exposure_pipeline"],
-                                "exposure_subject_stops": primary_bird["exposure_subject_stops"],
-                                "exposure_meter_scale": primary_bird["exposure_meter_scale"],
+                                "species": primary_row["species"],
+                                "species_confidence": primary_row["species_confidence"],
+                                "family": primary_row["family"],
+                                "family_confidence": primary_row["family_confidence"],
+                                "quality": primary_row["quality"],
+                                "exposure_correction": primary_row["exposure_correction"],
+                                "exposure_pipeline": primary_row["exposure_pipeline"],
+                                "exposure_subject_stops": primary_row["exposure_subject_stops"],
+                                "exposure_meter_scale": primary_row["exposure_meter_scale"],
                             }
                         )
-                        all_species = [b["species"] for b in bird_data]
-                        all_species_conf = [float(b["species_confidence"]) for b in bird_data]
-                        all_families = [b["family"] for b in bird_data]
-                        all_family_conf = [float(b["family_confidence"]) for b in bird_data]
+                        all_species = [b["species"] for b in crop_data]
+                        all_species_conf = [float(b["species_confidence"]) for b in crop_data]
+                        all_families = [b["family"] for b in crop_data]
+                        all_family_conf = [float(b["family_confidence"]) for b in crop_data]
                         entry.update(
                             {
                                 "secondary_species_list": json.dumps(all_species),
@@ -819,94 +1035,51 @@ class AnalysisPipeline:
                                 "secondary_family_scores": json.dumps(all_family_conf),
                             }
                         )
-                        crop_items_for_write = bird_data
+                        crop_items_for_write = crop_data
+                        # Release full-res buffers now that all crops are extracted as
+                        # self-contained uint8 arrays.  img_h/img_w are already scalars;
+                        # img_small is a separate 1200px array and is unaffected.
+                        noauto_linear = None
+                        img = np.zeros((1, 1, 3), dtype=np.uint8)
                     else:
-                        if wildlife_indices:
-                            primary_index = wildlife_indices[np.argmax([pred_score[i] for i in wildlife_indices])]
-                            result = process_nonbird(primary_index)
-                            if crops_cb:
-                                crops_cb(
-                                    {
-                                        "filename": raw_file,
-                                        "crops": [result["quality_crop"]],
-                                        "confidences": [float(pred_score[primary_index])],
-                                    }
-                                )
-                            if quality_cb:
-                                quality_cb(
-                                    {
-                                        "filename": raw_file,
-                                        "results": [{"quality": result["quality"], "rating": result["rating"]}],
-                                    }
-                                )
-                            if species_cb:
-                                species_cb(
-                                    {
-                                        "filename": raw_file,
-                                        "results": [
-                                            {
-                                                "species": result["species"],
-                                                "species_confidence": result["species_confidence"],
-                                                "family": result["family"],
-                                                "family_confidence": result["family_confidence"],
-                                            }
-                                        ],
-                                    }
-                                )
-                            entry.update(
-                                {
-                                    "species": result["species"],
-                                    "species_confidence": result["species_confidence"],
-                                    "family": result["family"],
-                                    "family_confidence": result["family_confidence"],
-                                    "quality": result["quality"],
-                                    "exposure_correction": result["exposure_correction"],
-                                    "exposure_pipeline": result.get("exposure_pipeline", "legacy_auto_bright_v1"),
-                                    "exposure_subject_stops": result.get("exposure_subject_stops", 0.0),
-                                    "exposure_meter_scale": result.get("exposure_meter_scale", 1.0),
-                                }
-                            )
-                            crop_items_for_write = [result]
-                            primary_crop_index = 0
-                        else:
-                            if crops_cb:
-                                crops_cb({"filename": raw_file, "crops": [], "confidences": []})
-                            if quality_cb:
-                                quality_cb({"filename": raw_file, "results": []})
-                            if species_cb:
-                                species_cb({"filename": raw_file, "results": []})
-                            crop_items_for_write = [
-                                {
-                                    "index": -1,
-                                    "confidence": 0.0,
-                                    "species": entry.get("species", "Unknown"),
-                                    "species_confidence": entry.get("species_confidence", 0.0),
-                                    "family": entry.get("family", "Unknown"),
-                                    "family_confidence": entry.get("family_confidence", 0.0),
-                                    "quality": entry.get("quality", -1.0),
-                                    "rating": 0,
-                                    "quality_crop": img_small,
-                                    "exposure_correction": entry.get("exposure_correction", 0.0),
-                                    "exposure_pipeline": entry.get("exposure_pipeline", "legacy_auto_bright_v1"),
-                                    "exposure_subject_stops": entry.get("exposure_subject_stops", 0.0),
-                                    "exposure_meter_scale": entry.get("exposure_meter_scale", 1.0),
-                                    "crop_bbox": {
-                                        "x_min": 0,
-                                        "x_max": int(img_w),
-                                        "y_min": 0,
-                                        "y_max": int(img_h),
-                                        "width": int(img_w),
-                                        "height": int(img_h),
-                                        "x_min_norm": 0.0,
-                                        "x_max_norm": 1.0,
-                                        "y_min_norm": 0.0,
-                                        "y_max_norm": 1.0,
-                                        "x_center_norm": 0.5,
-                                        "y_center_norm": 0.5,
-                                    },
-                                }
-                            ]
-                            primary_crop_index = 0
+                        if crops_cb:
+                            crops_cb({"filename": raw_file, "crops": [], "confidences": []})
+                        if quality_cb:
+                            quality_cb({"filename": raw_file, "results": []})
+                        if species_cb:
+                            species_cb({"filename": raw_file, "results": []})
+                        crop_items_for_write = [
+                            {
+                                "index": -1,
+                                "confidence": 0.0,
+                                "species": entry.get("species", "Unknown"),
+                                "species_confidence": entry.get("species_confidence", 0.0),
+                                "family": entry.get("family", "Unknown"),
+                                "family_confidence": entry.get("family_confidence", 0.0),
+                                "quality": entry.get("quality", -1.0),
+                                "rating": 0,
+                                "quality_crop": img_small,
+                                "exposure_correction": entry.get("exposure_correction", 0.0),
+                                "exposure_pipeline": entry.get("exposure_pipeline", "legacy_auto_bright_v1"),
+                                "exposure_subject_stops": entry.get("exposure_subject_stops", 0.0),
+                                "exposure_meter_scale": entry.get("exposure_meter_scale", 1.0),
+                                "crop_bbox": {
+                                    "x_min": 0,
+                                    "x_max": int(img_w),
+                                    "y_min": 0,
+                                    "y_max": int(img_h),
+                                    "width": int(img_w),
+                                    "height": int(img_h),
+                                    "x_min_norm": 0.0,
+                                    "x_max_norm": 1.0,
+                                    "y_min_norm": 0.0,
+                                    "y_max_norm": 1.0,
+                                    "x_center_norm": 0.5,
+                                    "y_center_norm": 0.5,
+                                },
+                            }
+                        ]
+                        primary_crop_index = 0
 
                     stage_ctx["stage"] = "write_crop"
                     serialized_crops = []
@@ -916,10 +1089,10 @@ class AnalysisPipeline:
                         if crop_img is None:
                             continue
                         crop_path = os.path.join(crop_dir, f"{base_name}_crop_{crop_idx}.jpg")
-                        cv2.imwrite(
+                        _write_jpeg(
                             crop_path,
                             cv2.cvtColor(crop_img, cv2.COLOR_RGB2BGR),
-                            [cv2.IMWRITE_JPEG_QUALITY, 85],
+                            jpeg_params,
                         )
                         crop_path_rel = os.path.relpath(crop_path, folder)
                         bbox = crop_item.get("crop_bbox") or {
@@ -1033,13 +1206,8 @@ class AnalysisPipeline:
 
                 # Explicitly clear large temporary variables after each image
                 # so that pausing between images doesn't retain large buffers.
+                # raw_obj is owned by _decode_image (closed there); not present here.
                 try:
-                    # Close the rawpy object first to release the RAW file buffer.
-                    try:
-                        if raw_obj is not None:
-                            raw_obj.close()
-                        del raw_obj
-                    except Exception: pass
                     try: del masks
                     except Exception: pass
                     try: del pred_boxes
@@ -1054,7 +1222,7 @@ class AnalysisPipeline:
                     except Exception: pass
                     try: del items
                     except Exception: pass
-                    try: del bird_items
+                    try: del subject_items
                     except Exception: pass
                 except Exception:
                     pass
@@ -1074,6 +1242,7 @@ class AnalysisPipeline:
                     metadata_path = os.path.join(kestrel_dir, METADATA_FILENAME)
                     try:
                         import json as _json
+                        from datetime import datetime as _dt, timezone as _tz
                         if os.path.exists(metadata_path):
                             with open(metadata_path, "r", encoding="utf-8") as mf:
                                 _meta = _json.load(mf)
@@ -1086,8 +1255,8 @@ class AnalysisPipeline:
                                 _mode_txt = str(_mode or "").strip().lower()
                                 if _mode_txt:
                                     pipeline_modes.add(_mode_txt)
-                        if pipeline_modes == {"no_auto_bright_metered_v1"}:
-                            render_mode_meta = "no_auto_bright_metered_v1"
+                        if pipeline_modes == {"numpy_linear_v2"}:
+                            render_mode_meta = "numpy_linear_v2"
                         elif pipeline_modes == {"legacy_auto_bright_v1"}:
                             render_mode_meta = "legacy_auto_bright_v1"
                         elif pipeline_modes:
@@ -1097,9 +1266,33 @@ class AnalysisPipeline:
 
                         _meta["quality_distribution"] = distribution
                         _meta["quality_distribution_stored"] = True
-                        _meta["exposure_pipeline_version"] = 2
+                        _meta["exposure_pipeline_version"] = 3
                         _meta["exposure_render_mode"] = render_mode_meta
-                        _meta["exposure_compensation_profile"] = exposure_profile
+                        _meta["exposure_quality"] = exposure_quality
+
+                        # Record the full set of settings used for THIS analysis
+                        # run so users can later see which parameters produced
+                        # the cached results (detection thresholds, rating
+                        # profile, detector variant, etc.). This is a snapshot
+                        # — re-running analysis overwrites it.
+                        _meta["analyzed_utc"] = _dt.now(_tz.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ")
+                        _meta["kestrel_version"] = VERSION
+                        _meta["analysis_settings"] = {
+                            "detector_name": str(getattr(self, "detector_name", "") or ""),
+                            "use_gpu": bool(getattr(self, "use_gpu", False)),
+                            "wildlife_enabled": bool(wildlife_enabled),
+                            "detection_threshold": float(detection_threshold),
+                            "scene_time_threshold": float(scene_time_threshold),
+                            "mask_threshold": float(mask_threshold),
+                            "max_bird_crops": int(max_bird_crops),
+                            "parallel_prefetch": int(decode_workers),
+                            "rating_profile": rating_profile,
+                            "exposure_quality": exposure_quality,
+                            "exposure_render_mode": render_mode_meta,
+                            "exposure_pipeline_version": 3,
+                            "thumbnail_max_width": int(thumbnail_max_width),
+                            "thumbnail_jpeg_quality": int(thumbnail_jpeg_quality),
+                        }
                         with open(metadata_path, "w", encoding="utf-8") as mf:
                             _json.dump(_meta, mf, indent=2)
                     except Exception as _meta_e:

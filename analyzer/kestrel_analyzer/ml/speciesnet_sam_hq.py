@@ -1,0 +1,1331 @@
+"""SpeciesNet (MegaDetector + classifier + ensemble) + SAM-HQ segmentation for the analysis pipeline."""
+
+from __future__ import annotations
+
+import os
+from pathlib import Path
+from typing import Any, Optional
+
+import cv2
+import numpy as np
+from PIL import Image
+
+from ..config import (
+    DEFAULT_DETECTOR_NAME,
+    DETECTOR_ONNX_PATHS,
+    SAM_DEC_ONNX_PATH,
+    SAM_ENC_ONNX_PATH,
+    SPECIESNET_MODEL_DIR,
+)
+from . import gpu_providers, is_gpu_active
+from .speciesnet_taxonomy import (
+    bird_vs_wildlife_classifier_scores,
+    is_ambiguous_generic_taxonomy,
+    is_ignored_prediction,
+    is_no_cv_result,
+    route_with_classifier_tiebreak,
+    should_skip_confident_no_cv_classifier,
+    split_taxonomy,
+)
+
+_DEFAULT_MAX_BIRD_CROPS = 5
+_MIN_MAX_BIRD_CROPS = 1
+_MAX_MAX_BIRD_CROPS = 20
+_HEAVY_OVERLAP_IOU = 0.75
+_HEAVY_OVERLAP_CONTAINMENT = 0.90
+
+# Pre-classifier dedupe thresholds (boxes only, before SpeciesNet + SAM run).
+# Deliberately TIGHTER than the mask-based final filter above: we only drop a
+# MegaDetector proposal here when it almost perfectly coincides with a
+# higher-confidence proposal, so there is no realistic chance the classifier
+# would have disagreed with the winner. Anything ambiguous falls through and
+# is handled by ``filter_overlapping_detections`` at the end, which uses true
+# mask IoU and is the authoritative pass.
+_PRE_CLASSIFIER_IOU = 0.85
+_PRE_CLASSIFIER_CONTAINMENT = 0.95
+_SUPPORTED_DETECTOR_NAMES = tuple(DETECTOR_ONNX_PATHS.keys())
+_YOLOV9_DETECTOR_NAMES = {"mdv6-mit-yolov9-c", "mdv6-mit-yolov9-e"}
+
+
+def _coerce_max_bird_crops(value) -> int:
+    try:
+        n = int(value)
+    except (TypeError, ValueError):
+        n = _DEFAULT_MAX_BIRD_CROPS
+    return max(_MIN_MAX_BIRD_CROPS, min(_MAX_MAX_BIRD_CROPS, n))
+
+
+def _coerce_detector_name(value: str | None) -> str:
+    if value is None:
+        return DEFAULT_DETECTOR_NAME
+    norm = str(value).strip().lower()
+    if norm in DETECTOR_ONNX_PATHS:
+        return norm
+    supported = ", ".join(_SUPPORTED_DETECTOR_NAMES)
+    raise ValueError(f"Unsupported detector name '{value}'. Supported values: {supported}")
+
+
+def _resolve_detector_onnx_path(detector_name: str) -> Path:
+    name = _coerce_detector_name(detector_name)
+    path = DETECTOR_ONNX_PATHS[name]
+    if not path.is_file():
+        raise FileNotFoundError(
+            f"Detector ONNX not found for '{name}': {path}\n"
+            f"Place the selected detector .onnx and .onnx.data files under: {path.parent}"
+        )
+    return path
+
+
+def _box_iou(box_a, box_b) -> float:
+    """Compute IoU between pipeline-format boxes ``((x1, y1), (x2, y2))``."""
+    (ax1, ay1), (ax2, ay2) = box_a
+    (bx1, by1), (bx2, by2) = box_b
+
+    inter_w = max(0.0, min(float(ax2), float(bx2)) - max(float(ax1), float(bx1)))
+    inter_h = max(0.0, min(float(ay2), float(by2)) - max(float(ay1), float(by1)))
+    inter = inter_w * inter_h
+    if inter <= 0.0:
+        return 0.0
+
+    area_a = max(0.0, float(ax2) - float(ax1)) * max(0.0, float(ay2) - float(ay1))
+    area_b = max(0.0, float(bx2) - float(bx1)) * max(0.0, float(by2) - float(by1))
+    union = area_a + area_b - inter
+    if union <= 0.0:
+        return 0.0
+    return float(inter / union)
+
+
+def _box_intersection_over_min_area(box_a, box_b) -> float:
+    """Compute containment overlap: intersection / min(area_a, area_b)."""
+    (ax1, ay1), (ax2, ay2) = box_a
+    (bx1, by1), (bx2, by2) = box_b
+
+    inter_w = max(0.0, min(float(ax2), float(bx2)) - max(float(ax1), float(bx1)))
+    inter_h = max(0.0, min(float(ay2), float(by2)) - max(float(ay1), float(by1)))
+    inter = inter_w * inter_h
+    if inter <= 0.0:
+        return 0.0
+
+    area_a = max(0.0, float(ax2) - float(ax1)) * max(0.0, float(ay2) - float(ay1))
+    area_b = max(0.0, float(bx2) - float(bx1)) * max(0.0, float(by2) - float(by1))
+    min_area = min(area_a, area_b)
+    if min_area <= 0.0:
+        return 0.0
+    return float(inter / min_area)
+
+
+def filter_overlapping_detections(
+    masks,
+    pred_boxes,
+    pred_class,
+    pred_score,
+    heavy_overlap_iou: float = _HEAVY_OVERLAP_IOU,
+    heavy_overlap_containment: float = _HEAVY_OVERLAP_CONTAINMENT,
+    overlap_rank_scores: Optional[list[float]] = None,
+):
+    """Remove lower-confidence detections when boxes/masks heavily overlap.
+
+    ``overlap_rank_scores`` controls suppression priority only. Returned
+    ``pred_score`` values are preserved for downstream reporting.
+    """
+    if masks is None or len(masks) == 0:
+        return masks, pred_boxes, pred_class, pred_score
+
+    n = len(pred_score)
+    keep = [True] * n
+    rank_scores = overlap_rank_scores if overlap_rank_scores is not None else pred_score
+    if len(rank_scores) != n:
+        raise ValueError("overlap_rank_scores length must match pred_score length")
+
+    sorted_indices = sorted(
+        range(n),
+        key=lambda i: (float(rank_scores[i]), float(pred_score[i])),
+        reverse=True,
+    )
+
+    for i_idx, i in enumerate(sorted_indices):
+        if not keep[i]:
+            continue
+        for j in sorted_indices[i_idx + 1 :]:
+            if not keep[j]:
+                continue
+            intersection = np.logical_and(masks[i], masks[j]).sum()
+            union = np.logical_or(masks[i], masks[j]).sum()
+            min_mask_area = min(float(masks[i].sum()), float(masks[j].sum()))
+            mask_iou = float(intersection / union) if union > 0 else 0.0
+            mask_containment = float(intersection / min_mask_area) if min_mask_area > 0.0 else 0.0
+            box_iou = _box_iou(pred_boxes[i], pred_boxes[j])
+            box_containment = _box_intersection_over_min_area(pred_boxes[i], pred_boxes[j])
+            if (
+                max(mask_iou, box_iou) >= heavy_overlap_iou
+                or max(mask_containment, box_containment) >= heavy_overlap_containment
+            ):
+                keep[j] = False
+
+    indices = [i for i in range(n) if keep[i]]
+    if not indices:
+        return masks, pred_boxes, pred_class, pred_score
+
+    return (
+        masks[indices],
+        [pred_boxes[i] for i in indices],
+        [pred_class[i] for i in indices],
+        [pred_score[i] for i in indices],
+    )
+
+
+def _md_bbox_corners(md_bbox: list) -> tuple[tuple[float, float], tuple[float, float]]:
+    """MegaDetector normalized xywh -> ``((x1, y1), (x2, y2))`` in the same
+    normalized units. IoU/containment ratios are scale-invariant, so the
+    pre-classifier dedupe does not need image dimensions.
+    """
+    x, y, bw, bh = [float(v) for v in md_bbox]
+    return (x, y), (x + bw, y + bh)
+
+
+def prefilter_overlapping_md_boxes(
+    animal_dets: list,
+    iou_thresh: float = _PRE_CLASSIFIER_IOU,
+    containment_thresh: float = _PRE_CLASSIFIER_CONTAINMENT,
+) -> list:
+    """Drop MegaDetector proposals that heavily overlap a higher-confidence
+    proposal, *before* SpeciesNet + SAM run on each of them.
+
+    Assumes ``animal_dets`` is already sorted by ``conf`` descending (which is
+    how ``get_prediction`` produces it). Greedy O(n²) — n is the number of
+    ``animal`` detections on one image, typically small.
+
+    Uses tighter thresholds than the final mask-based overlap filter, so we
+    only drop what is clearly a duplicate at the box level. Anything
+    borderline is deferred to the mask-based pass at the end of
+    ``get_prediction``, which sees the true subject shapes.
+    """
+    n = len(animal_dets)
+    if n <= 1:
+        return list(animal_dets)
+
+    corners = [_md_bbox_corners(d.get("bbox", [0.0, 0.0, 0.0, 0.0])) for d in animal_dets]
+    keep = [True] * n
+    for i in range(n):
+        if not keep[i]:
+            continue
+        for j in range(i + 1, n):
+            if not keep[j]:
+                continue
+            iou = _box_iou(corners[i], corners[j])
+            containment = _box_intersection_over_min_area(corners[i], corners[j])
+            if iou >= iou_thresh or containment >= containment_thresh:
+                keep[j] = False
+    return [animal_dets[i] for i in range(n) if keep[i]]
+
+
+def _md_bbox_to_pixel_box(md_bbox: list, img_w: int, img_h: int) -> tuple[float, float, float, float]:
+    """MegaDetector normalized xywh -> pixel xyxy corners."""
+    x_min_n, y_min_n, bw_n, bh_n = [float(v) for v in md_bbox]
+    x1 = np.clip(x_min_n * img_w, 0, img_w)
+    y1 = np.clip(y_min_n * img_h, 0, img_h)
+    x2 = np.clip((x_min_n + bw_n) * img_w, 0, img_w)
+    y2 = np.clip((y_min_n + bh_n) * img_h, 0, img_h)
+    return x1, y1, x2, y2
+
+
+def _pixel_box_to_pipeline_box(
+    x1: float, y1: float, x2: float, y2: float
+) -> tuple[tuple[float, float], tuple[float, float]]:
+    """Pipeline expects ``pred_boxes[i]`` as ``((xmin, ymin), (xmax, ymax))`` in pixels."""
+    return (float(x1), float(y1)), (float(x2), float(y2))
+
+
+def _speciesnet_bundle_model_name() -> str:
+    """Filesystem path for the bundled SpeciesNet model (see speciesnet.utils.ModelInfo)."""
+    bundle = SPECIESNET_MODEL_DIR
+    info_json = bundle / "info.json"
+    if not info_json.is_file():
+        raise FileNotFoundError(
+            f"SpeciesNet model bundle not found. Expected {info_json} with classifier, detector, and taxonomy files."
+        )
+    return str(bundle.resolve())
+
+
+def _clip_xyxy(x1: float, y1: float, x2: float, y2: float, w: int, h: int) -> tuple[int, int, int, int]:
+    x1i = int(max(0, min(w - 1, x1)))
+    y1i = int(max(0, min(h - 1, y1)))
+    x2i = int(max(0, min(w, x2)))
+    y2i = int(max(0, min(h, y2)))
+    if x2i <= x1i:
+        x2i = min(w, x1i + 1)
+    if y2i <= y1i:
+        y2i = min(h, y1i + 1)
+    return x1i, y1i, x2i, y2i
+
+
+class OnnxClassifier:
+    """
+    Drop-in replacement for SpeciesNetClassifier using ONNX Runtime.
+
+    Implements the same .preprocess() / .predict() interface so it can be
+    swapped in without changing any call sites in get_prediction().
+    """
+
+    IMG_SIZE = 480
+
+    def __init__(self, onnx_path: Path, labels_path: Path, use_gpu: bool = False):
+        import onnxruntime as ort
+
+        providers = gpu_providers() if use_gpu else ["CPUExecutionProvider"]
+        self._session = ort.InferenceSession(str(onnx_path), providers=providers)
+        self.providers_used = self._session.get_providers()
+        with open(labels_path) as f:
+            self._labels = [line.strip() for line in f]
+        print(f"[OnnxClassifier] {len(self._labels)} labels  providers={self.providers_used}")
+
+    def preprocess(self, img_pil: Image.Image, bboxes: list | None = None) -> np.ndarray:
+        """
+        Replicate SpeciesNetClassifier.preprocess() for the 'always_crop' model type.
+
+        Args:
+            img_pil:  PIL RGB image.
+            bboxes:   List of BBox-like objects (first entry used). Each BBox is
+                      speciesnet BBox dataclass with xmin/ymin/width/height (normalized).
+
+        Returns:
+            uint8 numpy array of shape (480, 480, 3) HWC.
+        """
+        if bboxes:
+            b = bboxes[0]
+            # BBox is a frozen dataclass: xmin, ymin, width, height (all normalized)
+            left   = max(0, int(b.xmin   * img_pil.width))
+            top    = max(0, int(b.ymin   * img_pil.height))
+            width  = max(1, min(int(b.width  * img_pil.width),  img_pil.width  - left))
+            height = max(1, min(int(b.height * img_pil.height), img_pil.height - top))
+            crop   = img_pil.crop((left, top, left + width, top + height))
+        else:
+            crop = img_pil
+
+        crop_resized = crop.resize((self.IMG_SIZE, self.IMG_SIZE), Image.BILINEAR)
+        return np.array(crop_resized, dtype=np.uint8)  # (480, 480, 3) HWC uint8
+
+    def predict(self, filepath: str, preprocessed: np.ndarray) -> dict:
+        """
+        Run ONNX inference and return classifications in SpeciesNet format.
+
+        Returns:
+            {"classifications": {"classes": [...all labels desc by score...],
+                                 "scores":  [...corresponding float scores...]}}
+        """
+        inp = (preprocessed.astype(np.float32) / 255.0)[np.newaxis, ...]  # (1,480,480,3)
+        logits = self._session.run(None, {"input": inp})[0][0]             # (N_classes,)
+        exp = np.exp(logits - logits.max())
+        scores = exp / exp.sum()
+        order = np.argsort(scores)[::-1]
+        return {
+            "classifications": {
+                "classes": [self._labels[i] for i in order],
+                "scores":  [float(scores[i]) for i in order],
+            }
+        }
+
+
+class OnnxMDv6Detector:
+    """
+    MegaDetector v6 (RT-DETRv2-C) via ONNX Runtime.
+
+    Interface (identical to MDv6Detector):
+        preprocess(img_pil)          → (img_tensor, orig_w, orig_h)
+        predict(filepath, det_input) → {"filepath": str,
+                                         "detections": [{"label": str,
+                                                          "conf": float,
+                                                          "bbox": [xmin,ymin,w,h]}]}
+
+    Preprocessing squashes the image to 640×640 (CPU, pure numpy).
+    Category map:  0 → "animal"   1 → "person"   2 → "vehicle"
+    """
+
+    _LABEL_MAP: dict[int, str] = {0: "animal", 1: "person", 2: "vehicle"}
+
+    def __init__(self, onnx_path: Path, use_gpu: bool = False) -> None:
+        import onnxruntime as ort
+
+        onnx_path = Path(onnx_path)
+        if not onnx_path.is_file():
+            raise FileNotFoundError(
+                f"MDv6 weights not found: {onnx_path}\n"
+                "Place mdv6-apa-rtdetr-c.onnx (and mdv6-apa-rtdetr-c.onnx.data) "
+                "under models/speciesnet/."
+            )
+        providers = gpu_providers() if use_gpu else ["CPUExecutionProvider"]
+        self._session = ort.InferenceSession(str(onnx_path), providers=providers)
+        _provs = self._session.get_providers()
+        self.device = "ONNX/GPU" if is_gpu_active(_provs) else "ONNX/CPU"
+        print(f"[OnnxMDv6Detector] Loaded {onnx_path.name}  providers={_provs}")
+
+    def preprocess(self, img_pil: "Image.Image") -> tuple:
+        """CPU: squash PIL to 640×640 float tensor; record original dims.
+
+        Returns (img_tensor [1,3,640,640] float32 [0,1], orig_w, orig_h).
+        """
+        orig_w, orig_h = img_pil.size
+        img_640 = np.array(img_pil.resize((640, 640), Image.BILINEAR), dtype=np.float32) / 255.0
+        img_tensor = img_640.transpose(2, 0, 1)[np.newaxis]  # [1, 3, 640, 640]
+        return (img_tensor, orig_w, orig_h)
+
+    def predict(self, filepath: str, det_input: tuple) -> dict:
+        """ONNX inference + decode absolute xyxy → normalised xywh."""
+        img_tensor, orig_w, orig_h = det_input
+        orig_sizes = np.array([[orig_w, orig_h]], dtype=np.float32)
+        labels_b, boxes_b, scores_b = self._session.run(
+            None, {"images": img_tensor, "orig_target_sizes": orig_sizes}
+        )
+        labels = labels_b[0]  # (300,)
+        boxes  = boxes_b[0]   # (300, 4) xyxy absolute pixels in orig space
+        scores = scores_b[0]  # (300,)
+
+        detections: list[dict] = []
+        for i in range(len(labels)):
+            conf = float(scores[i])
+            if conf < 0.01:
+                continue
+            cls_idx = int(labels[i])
+            x1, y1, x2, y2 = float(boxes[i][0]), float(boxes[i][1]), float(boxes[i][2]), float(boxes[i][3])
+            bbox = [
+                x1 / orig_w,
+                y1 / orig_h,
+                (x2 - x1) / orig_w,
+                (y2 - y1) / orig_h,
+            ]
+            label = self._LABEL_MAP.get(cls_idx, "unknown")
+            detections.append({"label": label, "conf": conf, "bbox": bbox})
+        return {"filepath": filepath, "detections": detections}
+
+
+class OnnxMDv5Detector:
+    """
+    MegaDetector v5a (YOLO-style) via ONNX Runtime.
+
+    Interface matches OnnxMDv6Detector:
+        preprocess(img_pil)          → (img_tensor, orig_w, orig_h)
+        predict(filepath, det_input) → {"filepath": str,
+                                         "detections": [{"label": str,
+                                                          "conf": float,
+                                                          "bbox": [xmin,ymin,w,h]}]}
+    """
+
+    _LABEL_MAP: dict[int, str] = {0: "animal", 1: "person", 2: "vehicle"}
+    _INPUT_SIZE = 1280
+    _MIN_CONF = 0.01
+    _NMS_IOU = 0.5
+    _PRE_NMS_LIMIT = 4000
+
+    def __init__(self, onnx_path: Path, use_gpu: bool = False) -> None:
+        import onnxruntime as ort
+
+        onnx_path = Path(onnx_path)
+        if not onnx_path.is_file():
+            raise FileNotFoundError(
+                f"MDv5a weights not found: {onnx_path}\n"
+                "Place mdv5a.onnx (and mdv5a.onnx.data) under models/speciesnet/."
+            )
+        providers = gpu_providers() if use_gpu else ["CPUExecutionProvider"]
+        self._session = ort.InferenceSession(str(onnx_path), providers=providers)
+        _provs = self._session.get_providers()
+        self.device = "ONNX/GPU" if is_gpu_active(_provs) else "ONNX/CPU"
+        print(f"[OnnxMDv5Detector] Loaded {onnx_path.name}  providers={_provs}")
+
+    def preprocess(self, img_pil: "Image.Image") -> tuple:
+        """Resize/squash image to 1280x1280 and normalize to [0,1]."""
+        orig_w, orig_h = img_pil.size
+        img_1280 = np.array(
+            img_pil.resize((self._INPUT_SIZE, self._INPUT_SIZE), Image.BILINEAR),
+            dtype=np.float32,
+        ) / 255.0
+        img_tensor = img_1280.transpose(2, 0, 1)[np.newaxis]
+        return (img_tensor, orig_w, orig_h)
+
+    @staticmethod
+    def _nms_xyxy(boxes: np.ndarray, scores: np.ndarray, iou_threshold: float) -> np.ndarray:
+        if boxes.size == 0:
+            return np.empty((0,), dtype=np.int64)
+
+        x1 = boxes[:, 0]
+        y1 = boxes[:, 1]
+        x2 = boxes[:, 2]
+        y2 = boxes[:, 3]
+        areas = np.maximum(0.0, x2 - x1) * np.maximum(0.0, y2 - y1)
+        order = np.argsort(scores)[::-1]
+
+        keep: list[int] = []
+        while order.size > 0:
+            i = int(order[0])
+            keep.append(i)
+            if order.size == 1:
+                break
+
+            rest = order[1:]
+            xx1 = np.maximum(x1[i], x1[rest])
+            yy1 = np.maximum(y1[i], y1[rest])
+            xx2 = np.minimum(x2[i], x2[rest])
+            yy2 = np.minimum(y2[i], y2[rest])
+
+            inter = np.maximum(0.0, xx2 - xx1) * np.maximum(0.0, yy2 - yy1)
+            union = areas[i] + areas[rest] - inter
+            iou = np.where(union > 0.0, inter / union, 0.0)
+            order = rest[iou <= iou_threshold]
+
+        return np.array(keep, dtype=np.int64)
+
+    def predict(self, filepath: str, det_input: tuple) -> dict:
+        """ONNX inference + decode YOLO-style predictions to normalized xywh."""
+        img_tensor, _orig_w, _orig_h = det_input
+        raw = self._session.run(None, {"images": img_tensor})
+        if not raw:
+            return {"filepath": filepath, "detections": []}
+
+        preds = raw[0]
+        if preds.ndim != 3 or preds.shape[2] < 8:
+            raise RuntimeError(f"Unexpected mdv5a output shape: {preds.shape}")
+
+        pred = preds[0]
+        obj = pred[:, 4]
+        cls_scores = pred[:, 5:8]
+        cls_idx = np.argmax(cls_scores, axis=1).astype(np.int64)
+        best_cls = cls_scores[np.arange(cls_scores.shape[0]), cls_idx]
+        conf = obj * best_cls
+
+        keep = conf >= self._MIN_CONF
+        if not np.any(keep):
+            return {"filepath": filepath, "detections": []}
+
+        pred = pred[keep]
+        cls_idx = cls_idx[keep]
+        conf = conf[keep]
+
+        max_coord = float(np.max(pred[:, :4]))
+        coord_scale = float(self._INPUT_SIZE if max_coord > 2.0 else 1.0)
+        cx = pred[:, 0] / coord_scale
+        cy = pred[:, 1] / coord_scale
+        bw = pred[:, 2] / coord_scale
+        bh = pred[:, 3] / coord_scale
+
+        x1 = np.clip(cx - (bw / 2.0), 0.0, 1.0)
+        y1 = np.clip(cy - (bh / 2.0), 0.0, 1.0)
+        x2 = np.clip(cx + (bw / 2.0), 0.0, 1.0)
+        y2 = np.clip(cy + (bh / 2.0), 0.0, 1.0)
+        boxes = np.stack([x1, y1, x2, y2], axis=1).astype(np.float32)
+
+        selected: list[int] = []
+        for class_id in np.unique(cls_idx):
+            class_indices = np.where(cls_idx == class_id)[0]
+            class_scores = conf[class_indices]
+            if class_scores.size == 0:
+                continue
+
+            if class_scores.size > self._PRE_NMS_LIMIT:
+                top_local = np.argsort(class_scores)[-self._PRE_NMS_LIMIT:]
+                class_indices = class_indices[top_local]
+                class_scores = conf[class_indices]
+
+            keep_local = self._nms_xyxy(
+                boxes[class_indices],
+                class_scores.astype(np.float32),
+                iou_threshold=self._NMS_IOU,
+            )
+            selected.extend(class_indices[keep_local].tolist())
+
+        if not selected:
+            return {"filepath": filepath, "detections": []}
+
+        selected_arr = np.array(selected, dtype=np.int64)
+        order = np.argsort(conf[selected_arr])[::-1]
+        selected_arr = selected_arr[order]
+
+        detections: list[dict] = []
+        for i in selected_arr:
+            cls_id = int(cls_idx[i])
+            label = self._LABEL_MAP.get(cls_id, "unknown")
+            if label == "unknown":
+                continue
+
+            bx1, by1, bx2, by2 = [float(v) for v in boxes[i]]
+            detections.append(
+                {
+                    "label": label,
+                    "conf": float(conf[i]),
+                    "bbox": [
+                        bx1,
+                        by1,
+                        max(0.0, bx2 - bx1),
+                        max(0.0, by2 - by1),
+                    ],
+                }
+            )
+
+        return {"filepath": filepath, "detections": detections}
+
+
+class OnnxMDv6MitYoloV9Detector:
+    """
+    MegaDetector v6 MIT YOLOv9 variants via ONNX Runtime.
+
+    The exported ONNX graph expects two inputs:
+        images    : [1, 3, 640, 640] float32 in [0,1]
+        rev_tensor: [1, 5] = [scale, pad_left, pad_top, pad_left, pad_top]
+
+    It outputs raw class logits and decoded boxes. The graph already applies
+    reverse letterbox transform using ``rev_tensor``, so output boxes are in
+    the original image coordinate space.
+    """
+
+    _LABEL_MAP: dict[int, str] = {0: "animal", 1: "person", 2: "vehicle"}
+    _INPUT_SIZE = 640
+    _MIN_CONF = 0.01
+    _NMS_IOU = 0.5
+    _MAX_BBOX_PER_CLASS = 300
+    _PRE_NMS_LIMIT = 4000
+    _PAD_COLOR = (114, 114, 114)
+
+    def __init__(self, onnx_path: Path, use_gpu: bool = False) -> None:
+        import onnxruntime as ort
+
+        onnx_path = Path(onnx_path)
+        if not onnx_path.is_file():
+            raise FileNotFoundError(
+                f"MDv6 MIT YOLOv9 weights not found: {onnx_path}\n"
+                "Place mdv6-mit-yolov9-*.onnx (and .onnx.data) under models/speciesnet/."
+            )
+
+        providers = gpu_providers() if use_gpu else ["CPUExecutionProvider"]
+        self._session = ort.InferenceSession(str(onnx_path), providers=providers)
+
+        inputs = self._session.get_inputs()
+        outputs = self._session.get_outputs()
+        self._images_input_name = self._pick_io_name(inputs, preferred=("images", "image", "input"))
+        self._rev_input_name = self._pick_io_name(
+            inputs,
+            preferred=("rev_tensor", "rev"),
+            exclude={self._images_input_name},
+        )
+        self._logits_output_name = self._pick_io_name(
+            outputs,
+            preferred=("raw_class_logits", "class", "logits"),
+        )
+        self._boxes_output_name = self._pick_io_name(
+            outputs,
+            preferred=("raw_boxes", "boxes", "bbox"),
+            exclude={self._logits_output_name},
+        )
+
+        _provs = self._session.get_providers()
+        self.device = "ONNX/GPU" if is_gpu_active(_provs) else "ONNX/CPU"
+        print(
+            f"[OnnxMDv6MitYoloV9Detector] Loaded {onnx_path.name}  providers={_provs}"
+            f"  inputs=({self._images_input_name}, {self._rev_input_name})"
+            f"  outputs=({self._logits_output_name}, {self._boxes_output_name})"
+        )
+
+    @staticmethod
+    def _pick_io_name(
+        io_nodes,
+        preferred: tuple[str, ...],
+        exclude: Optional[set[str]] = None,
+    ) -> str:
+        excluded = exclude or set()
+        names = [node.name for node in io_nodes if node.name not in excluded]
+        if not names:
+            raise RuntimeError("Failed to resolve ONNX input/output names.")
+
+        lowered = [name.lower() for name in names]
+        for token in preferred:
+            token = token.lower()
+            for idx, lname in enumerate(lowered):
+                if token in lname:
+                    return names[idx]
+        return names[0]
+
+    @staticmethod
+    def _nms_xyxy(boxes: np.ndarray, scores: np.ndarray, iou_threshold: float) -> np.ndarray:
+        if boxes.size == 0:
+            return np.empty((0,), dtype=np.int64)
+
+        x1 = boxes[:, 0]
+        y1 = boxes[:, 1]
+        x2 = boxes[:, 2]
+        y2 = boxes[:, 3]
+        areas = np.maximum(0.0, x2 - x1) * np.maximum(0.0, y2 - y1)
+        order = np.argsort(scores)[::-1]
+
+        keep: list[int] = []
+        while order.size > 0:
+            i = int(order[0])
+            keep.append(i)
+            if order.size == 1:
+                break
+
+            rest = order[1:]
+            xx1 = np.maximum(x1[i], x1[rest])
+            yy1 = np.maximum(y1[i], y1[rest])
+            xx2 = np.minimum(x2[i], x2[rest])
+            yy2 = np.minimum(y2[i], y2[rest])
+
+            inter = np.maximum(0.0, xx2 - xx1) * np.maximum(0.0, yy2 - yy1)
+            union = areas[i] + areas[rest] - inter
+            iou = np.where(union > 0.0, inter / union, 0.0)
+            order = rest[iou <= iou_threshold]
+
+        return np.array(keep, dtype=np.int64)
+
+    @staticmethod
+    def _sigmoid(x: np.ndarray) -> np.ndarray:
+        x = np.clip(x, -50.0, 50.0)
+        return 1.0 / (1.0 + np.exp(-x))
+
+    def preprocess(self, img_pil: "Image.Image") -> tuple:
+        """Pad-resize image to 640x640 and build rev_tensor expected by the ONNX graph."""
+        orig_w, orig_h = img_pil.size
+
+        scale = min(self._INPUT_SIZE / float(orig_w), self._INPUT_SIZE / float(orig_h))
+        new_w = max(1, int(orig_w * scale))
+        new_h = max(1, int(orig_h * scale))
+
+        resized = img_pil.resize((new_w, new_h), Image.Resampling.LANCZOS)
+        pad_left = (self._INPUT_SIZE - new_w) // 2
+        pad_top = (self._INPUT_SIZE - new_h) // 2
+
+        canvas = Image.new("RGB", (self._INPUT_SIZE, self._INPUT_SIZE), self._PAD_COLOR)
+        canvas.paste(resized, (pad_left, pad_top))
+
+        img_np = np.asarray(canvas, dtype=np.float32) / 255.0
+        img_tensor = img_np.transpose(2, 0, 1)[np.newaxis]
+        rev_tensor = np.array(
+            [[scale, float(pad_left), float(pad_top), float(pad_left), float(pad_top)]],
+            dtype=np.float32,
+        )
+        return (img_tensor, rev_tensor, orig_w, orig_h)
+
+    def predict(self, filepath: str, det_input: tuple) -> dict:
+        """ONNX inference + sigmoid + class-wise NMS, returned as normalized xywh detections."""
+        img_tensor, rev_tensor, orig_w, orig_h = det_input
+        raw = self._session.run(
+            [self._logits_output_name, self._boxes_output_name],
+            {
+                self._images_input_name: img_tensor,
+                self._rev_input_name: rev_tensor,
+            },
+        )
+        if not raw:
+            return {"filepath": filepath, "detections": []}
+
+        class_logits, boxes_b = raw
+        if class_logits.ndim != 3 or boxes_b.ndim != 3:
+            raise RuntimeError(
+                f"Unexpected mdv6-mit-yolov9 output shapes: logits={class_logits.shape}, boxes={boxes_b.shape}"
+            )
+
+        class_probs = self._sigmoid(class_logits[0])
+        boxes = boxes_b[0]
+        if boxes.shape[1] != 4 or class_probs.shape[0] != boxes.shape[0]:
+            raise RuntimeError(
+                f"Unexpected mdv6-mit-yolov9 tensor dimensions: probs={class_probs.shape}, boxes={boxes.shape}"
+            )
+
+        detections: list[dict] = []
+        n_classes = min(class_probs.shape[1], len(self._LABEL_MAP))
+        for class_id in range(n_classes):
+            label = self._LABEL_MAP.get(class_id)
+            if label is None:
+                continue
+
+            scores = class_probs[:, class_id]
+            class_indices = np.where(scores >= self._MIN_CONF)[0]
+            if class_indices.size == 0:
+                continue
+
+            if class_indices.size > self._PRE_NMS_LIMIT:
+                top_local = np.argsort(scores[class_indices])[-self._PRE_NMS_LIMIT:]
+                class_indices = class_indices[top_local]
+
+            keep_local = self._nms_xyxy(
+                boxes[class_indices],
+                scores[class_indices].astype(np.float32),
+                iou_threshold=self._NMS_IOU,
+            )
+            kept_indices = class_indices[keep_local]
+            if kept_indices.size > self._MAX_BBOX_PER_CLASS:
+                top_by_score = np.argsort(scores[kept_indices])[::-1][: self._MAX_BBOX_PER_CLASS]
+                kept_indices = kept_indices[top_by_score]
+
+            for i in kept_indices:
+                x1, y1, x2, y2 = [float(v) for v in boxes[i]]
+                x1 = float(np.clip(x1, 0.0, float(orig_w)))
+                y1 = float(np.clip(y1, 0.0, float(orig_h)))
+                x2 = float(np.clip(x2, 0.0, float(orig_w)))
+                y2 = float(np.clip(y2, 0.0, float(orig_h)))
+                if x2 <= x1 or y2 <= y1:
+                    continue
+
+                detections.append(
+                    {
+                        "label": label,
+                        "conf": float(scores[i]),
+                        "bbox": [
+                            x1 / float(orig_w),
+                            y1 / float(orig_h),
+                            (x2 - x1) / float(orig_w),
+                            (y2 - y1) / float(orig_h),
+                        ],
+                    }
+                )
+
+        detections.sort(key=lambda d: float(d.get("conf", 0.0)), reverse=True)
+        return {"filepath": filepath, "detections": detections}
+
+
+class OnnxSamPredictor:
+    """
+    SAM-HQ ViT-Tiny via ONNX Runtime (split encoder + decoder).
+
+    Usage:
+        predictor = OnnxSamPredictor(enc_path, dec_path)
+        emb, interm, resized_hw, orig_hw = predictor.encode(img_np)
+        # For each detection box on the same image:
+        mask, iou = predictor.decode_box(emb, interm, (x1, y1, x2, y2), resized_hw, orig_hw)
+    """
+
+    _IMG_SIZE = 1024
+
+    def __init__(self, enc_path: Path, dec_path: Path, use_gpu: bool = False) -> None:
+        import onnxruntime as ort
+
+        providers = gpu_providers() if use_gpu else ["CPUExecutionProvider"]
+        self._enc_session = ort.InferenceSession(str(enc_path), providers=providers)
+        self._dec_session = ort.InferenceSession(str(dec_path), providers=providers)
+        _provs = self._enc_session.get_providers()
+        self.device = "ONNX/GPU" if is_gpu_active(_provs) else "ONNX/CPU"
+        print(f"[OnnxSamPredictor] Loaded encoder+decoder  providers={_provs}")
+
+    @staticmethod
+    def _resize_longest_side(image: np.ndarray, target: int) -> np.ndarray:
+        h, w = image.shape[:2]
+        scale = target / max(h, w)
+        new_h, new_w = int(round(h * scale)), int(round(w * scale))
+        return cv2.resize(image, (new_w, new_h), interpolation=cv2.INTER_LINEAR)
+
+    def encode(self, img_np: np.ndarray) -> tuple:
+        """
+        Encode an image to SAM embeddings. Called once per image; reuse
+        the returned embeddings for all per-detection decode_box() calls.
+
+        The ONNX encoder normalizes internally, so input must be float32
+        in [0, 255] — do NOT pre-normalize.
+
+        Args:
+            img_np: uint8 HxWxC RGB numpy array.
+
+        Returns:
+            (image_embeddings, interm_embeddings, resized_hw, original_hw)
+        """
+        orig_h, orig_w = img_np.shape[:2]
+        resized = self._resize_longest_side(img_np, self._IMG_SIZE)
+        resized_h, resized_w = resized.shape[:2]
+
+        img = resized.astype(np.float32)
+        pad_h = self._IMG_SIZE - resized_h
+        pad_w = self._IMG_SIZE - resized_w
+        img = np.pad(img, ((0, pad_h), (0, pad_w), (0, 0)))  # HxWx3
+        img = img.transpose(2, 0, 1)[np.newaxis]             # [1, 3, 1024, 1024]
+
+        image_embeddings, interm_embeddings = self._enc_session.run(None, {"input_image": img})
+        return image_embeddings, interm_embeddings, (resized_h, resized_w), (orig_h, orig_w)
+
+    def decode_box(
+        self,
+        image_embeddings: np.ndarray,
+        interm_embeddings: np.ndarray,
+        box_xyxy: tuple,
+        resized_hw: tuple,
+        original_hw: tuple,
+    ) -> tuple[np.ndarray, float]:
+        """
+        Decode a bounding-box prompt to a mask.
+
+        Args:
+            image_embeddings, interm_embeddings: from encode()
+            box_xyxy: (x1, y1, x2, y2) in original pixel space (absolute coords)
+            resized_hw, original_hw: from encode()
+
+        Returns:
+            (mask bool HxW at original resolution, iou float)
+        """
+        orig_h, orig_w = original_hw
+        resized_h, resized_w = resized_hw
+        x1, y1, x2, y2 = box_xyxy
+
+        # Transform box corners from original space to the resized (apply_image) space
+        box_pts = np.array([
+            [x1 * resized_w / orig_w, y1 * resized_h / orig_h],
+            [x2 * resized_w / orig_w, y2 * resized_h / orig_h],
+        ], dtype=np.float32)
+
+        point_coords = box_pts[np.newaxis]                        # (1, 2, 2)
+        point_labels = np.array([[2.0, 3.0]], dtype=np.float32)   # TL=2, BR=3
+        mask_input   = np.zeros((1, 1, 256, 256), dtype=np.float32)
+        has_mask     = np.array([0.0], dtype=np.float32)
+        orig_im_size = np.array([orig_h, orig_w], dtype=np.float32)  # H, W
+
+        masks_out, iou_out, _ = self._dec_session.run(None, {
+            "image_embeddings":  image_embeddings,
+            "interm_embeddings": interm_embeddings,
+            "point_coords":      point_coords,
+            "point_labels":      point_labels,
+            "mask_input":        mask_input,
+            "has_mask_input":    has_mask,
+            "orig_im_size":      orig_im_size,
+        })
+        mask = masks_out[0, 0] > 0.0
+        iou  = float(iou_out[0, 0])
+        return mask, iou
+
+
+class SpeciesNetSAMHQWrapper:
+    """Detector/classifier/ensemble from SpeciesNet; masks from SAM-HQ (ViT-Tiny ONNX) box prompts."""
+
+    def __init__(
+        self,
+        max_bird_crops: int = _DEFAULT_MAX_BIRD_CROPS,
+        use_gpu: bool = True,
+        detector_name: str = DEFAULT_DETECTOR_NAME,
+    ):
+        self.max_bird_crops = _coerce_max_bird_crops(max_bird_crops)
+        self.use_gpu = bool(use_gpu)
+        self.detector_name = _coerce_detector_name(detector_name)
+        self.predictor: Optional[OnnxSamPredictor] = None
+        self.detector: Optional[Any] = None
+        self.classifier: Optional[OnnxClassifier] = None
+        self.ensemble = None
+        self.model_name: Optional[str] = None
+
+    def _ensure_speciesnet(self) -> None:
+        from speciesnet import SpeciesNetEnsemble
+
+        if self.detector is None or self.classifier is None:
+            self.model_name = _speciesnet_bundle_model_name()
+            detector_path = _resolve_detector_onnx_path(self.detector_name)
+            if self.detector_name == "mdv5a":
+                self.detector = OnnxMDv5Detector(detector_path, use_gpu=self.use_gpu)
+            elif self.detector_name in _YOLOV9_DETECTOR_NAMES:
+                self.detector = OnnxMDv6MitYoloV9Detector(detector_path, use_gpu=self.use_gpu)
+            else:
+                self.detector = OnnxMDv6Detector(detector_path, use_gpu=self.use_gpu)
+            onnx_path   = SPECIESNET_MODEL_DIR / "speciesNet_v4.0.1a.onnx"
+            labels_path = SPECIESNET_MODEL_DIR / "always_crop_99710272_22x8_v12_epoch_00148.labels.20251208.txt"
+            self.classifier = OnnxClassifier(onnx_path, labels_path, use_gpu=self.use_gpu)
+            print(f"[SpeciesNetSAMHQ] Detector model    : {self.detector_name} ({detector_path.name})")
+            print(f"[SpeciesNetSAMHQ] Detector          : {self.detector.device}")
+            print(f"[SpeciesNetSAMHQ] Classifier        : ONNX  providers={self.classifier.providers_used}")
+        if self.ensemble is None:
+            self.ensemble = SpeciesNetEnsemble(self.model_name, geofence=False)
+
+    def ensure_loaded(self) -> None:
+        """Eagerly load SpeciesNet + SAM-HQ models for this wrapper instance."""
+        self._ensure_speciesnet()
+        self._ensure_sam()
+
+    def _ensure_sam(self) -> None:
+        if self.predictor is not None:
+            return
+        if not Path(SAM_ENC_ONNX_PATH).is_file():
+            raise FileNotFoundError(
+                f"SAM-HQ encoder ONNX not found at: {SAM_ENC_ONNX_PATH}\n"
+                "Place sam_hq_vit_tiny_encoder.onnx under models/speciesnet/."
+            )
+        if not Path(SAM_DEC_ONNX_PATH).is_file():
+            raise FileNotFoundError(
+                f"SAM-HQ decoder ONNX not found at: {SAM_DEC_ONNX_PATH}\n"
+                "Place sam_hq_vit_tiny_decoder.onnx under models/speciesnet/."
+            )
+        # Prefer SAM-HQ on GPU (DirectML on Windows, CoreML on macOS) when enabled;
+        # fallback to CPU only if GPU session initialization fails.
+        try:
+            self.predictor = OnnxSamPredictor(
+                SAM_ENC_ONNX_PATH,
+                SAM_DEC_ONNX_PATH,
+                use_gpu=self.use_gpu,
+            )
+        except Exception as e:
+            if not self.use_gpu:
+                raise
+            print(f"[SpeciesNetSAMHQ] SAM-HQ GPU init failed, falling back to CPU: {e}")
+            self.predictor = OnnxSamPredictor(
+                SAM_ENC_ONNX_PATH,
+                SAM_DEC_ONNX_PATH,
+                use_gpu=False,
+            )
+        print(f"[SpeciesNetSAMHQ] SAM-HQ            : {self.predictor.device}")
+
+    def _run_ensemble_for_item(
+        self,
+        filepath: str,
+        classifications: dict[str, Any],
+        detections: list[dict[str, Any]],
+    ) -> dict[str, Any]:
+        if self.ensemble is None:
+            raise RuntimeError("SpeciesNet ensemble is not loaded.")
+        results = self.ensemble.combine(
+            filepaths=[filepath],
+            classifier_results={filepath: {"classifications": classifications}},
+            detector_results={filepath: {"detections": detections}},
+            geolocation_results={filepath: {}},
+            partial_predictions={},
+        )
+        return results[0] if results else {}
+
+    def get_prediction(
+        self,
+        image_data: np.ndarray,
+        image_path: str | Path,
+        *,
+        wildlife_enabled: bool = True,
+        threshold: float = 0.75,
+        mask_threshold: float = 0.5,
+    ):
+        """Run SpeciesNet + SAM-HQ.
+
+        Args:
+            image_data: RGB uint8 image.
+            image_path: Path passed to SpeciesNet (must exist on disk).
+            wildlife_enabled: When False, non-aves animals are omitted.
+            threshold: MegaDetector minimum confidence for an ``animal`` detection.
+            mask_threshold: Unused (legacy Mask R-CNN pixel threshold); retained for API compatibility.
+
+        Returns:
+            (masks, pred_boxes, pred_class, pred_score) — detection/mask contract used by the pipeline.
+        """
+        _ = mask_threshold  # SAM-HQ path does not use Mask R-CNN mask pixel threshold; UI keeps knob for compatibility.
+
+        self._ensure_speciesnet()
+        self._ensure_sam()
+
+        from speciesnet.utils import BBox
+
+        fp = str(Path(image_path).resolve())
+        h, w = image_data.shape[:2]
+        img_pil = Image.fromarray(image_data)
+
+        detector_input = self.detector.preprocess(img_pil)
+        det_result = self.detector.predict(fp, detector_input)
+        detections = det_result.get("detections", []) or []
+
+        detector_threshold = float(threshold)
+
+        # Every MegaDetector "animal" above *detector_threshold* goes to SpeciesNet ensemble + SAM-HQ.
+        # A second gate on the ensemble/classifier ``pred_score`` is applied below so that
+        # MegaDetector false positives that SpeciesNet also can't commit to are dropped.
+        # ``is_ignored_prediction`` / ``route == "ignore"`` still prunes blank/vehicle/human
+        # before the score gate runs.
+        animal_dets: list[dict[str, Any]] = []
+        for det in detections:
+            label = str(det.get("label", ""))
+            conf = float(det.get("conf", 0.0))
+            if label != "animal":
+                continue
+            if conf < detector_threshold:
+                continue
+            animal_dets.append(det)
+
+        animal_dets.sort(key=lambda d: float(d.get("conf", 0.0)), reverse=True)
+
+        # Pre-classifier dedupe: drop near-duplicate MegaDetector boxes before
+        # spending a SpeciesNet forward pass + SAM mask decode on each of them.
+        # The authoritative mask-based overlap filter still runs at the end.
+        pre_nms_count = len(animal_dets)
+        animal_dets = prefilter_overlapping_md_boxes(animal_dets)
+        pre_nms_dropped = pre_nms_count - len(animal_dets)
+        if pre_nms_dropped > 0:
+            print(
+                f"[SpeciesNet] pre-classifier NMS: dropped {pre_nms_dropped} of"
+                f" {pre_nms_count} MegaDetector proposals (IoU>={_PRE_CLASSIFIER_IOU}"
+                f" or containment>={_PRE_CLASSIFIER_CONTAINMENT})"
+            )
+
+        print(
+            f"[SpeciesNet] {os.path.basename(fp)}  animals -> classifier/SAM: {len(animal_dets)}"
+            f"  (detector_threshold={detector_threshold:.2f}, total proposals={len(detections)}"
+            f"{f', pre-NMS dropped {pre_nms_dropped}' if pre_nms_dropped else ''})"
+        )
+
+        bird_rows: list[dict[str, Any]] = []
+        wildlife_rows: list[dict[str, Any]] = []
+
+        if self.predictor is None:
+            return [], [], [], []
+
+        # Encode once — all detections on this image share the same embeddings
+        image_embeddings, interm_embeddings, resized_hw, original_hw = self.predictor.encode(image_data)
+
+        for det_idx, det in enumerate(animal_dets):
+            md_bbox = det.get("bbox", [0.0, 0.0, 0.0, 0.0])
+            label = str(det.get("label", "animal"))
+            conf = float(det.get("conf", 0.0))
+
+            cls_input = self.classifier.preprocess(img_pil, bboxes=[BBox(*md_bbox)])
+            cls_pred = self.classifier.predict(fp, cls_input)
+            cls_info = cls_pred.get("classifications", {})
+
+            fp_det = f"{fp}#det{det_idx}"
+            try:
+                ensemble_det = self._run_ensemble_for_item(
+                    filepath=fp_det,
+                    classifications=cls_info,
+                    detections=[{"label": label, "conf": conf}],
+                )
+                pred_raw = str(ensemble_det.get("prediction", ""))
+                pred_score = float(ensemble_det.get("prediction_score", conf))
+                pred_source = str(ensemble_det.get("prediction_source", ""))
+            except Exception as e:
+                print("[SpeciesNet] ensemble error, fallback to classifier top-1:", e)
+                classes = cls_info.get("classes", [])
+                scores = cls_info.get("scores", [])
+                pred_raw = str(classes[0]) if classes else "unknown"
+                pred_score = float(scores[0]) if scores else conf
+                pred_source = "classifier_fallback"
+
+            route, pred_label, pred_score = route_with_classifier_tiebreak(
+                pred_raw,
+                pred_score,
+                cls_info,
+                wildlife_enabled=wildlife_enabled,
+            )
+
+            if should_skip_confident_no_cv_classifier(cls_info, detector_threshold):
+                cutoff = 1.0 - float(detector_threshold)
+                print(
+                    f"[SpeciesNet] det {det_idx}  SKIPPED — top classifier label is"
+                    f" 'no cv result' with score > {cutoff:.2f} (1 − detector threshold)"
+                    f"  (detector conf={conf:.2f})"
+                )
+                continue
+
+            if is_ambiguous_generic_taxonomy(pred_raw):
+                bb, bo = bird_vs_wildlife_classifier_scores(cls_info)
+                print(
+                    f"[SpeciesNet] det {det_idx}  conf={conf:.2f}  pred={pred_raw!r}"
+                    f"  ambiguous: bird_max={bb:.3f} other={bo:.3f}"
+                    f"  -> route={route} label={pred_label}"
+                )
+            else:
+                print(
+                    f"[SpeciesNet] det {det_idx}  conf={conf:.2f}  pred={pred_raw!r}"
+                    f"  score={pred_score:.3f}  route={route}  label={pred_label}"
+                    f"  via={pred_source}"
+                )
+
+            if route == "ignore" or pred_label is None:
+                reason = "taxonomy routed to ignore"
+                if is_ignored_prediction(pred_raw):
+                    parts = [p.lower() for p in split_taxonomy(pred_raw) if p]
+                    last = parts[-1] if parts else pred_raw
+                    reason = f"ignored class: {last}"
+                elif is_no_cv_result(pred_raw):
+                    # Classifier returned "no cv result" / UNKNOWN and the
+                    # top-k tiebreak did not find a stronger bird hypothesis.
+                    # Treat as a MegaDetector false positive rather than
+                    # emitting an "Unknown wildlife" crop.
+                    bb, bo = bird_vs_wildlife_classifier_scores(cls_info)
+                    reason = (
+                        f"classifier returned Unknown / no cv result with no"
+                        f" bird tiebreak (bird_max={bb:.3f} other={bo:.3f})"
+                    )
+                elif not wildlife_enabled:
+                    reason = "non-bird wildlife disabled"
+                print(
+                    f"[SpeciesNet] det {det_idx}  SKIPPED — {reason}"
+                    f"  (conf={conf:.2f}, pred={pred_raw!r})"
+                )
+                continue
+
+            # Classifier-confidence gate: MegaDetector is tuned to over-propose so
+            # SpeciesNet can prune false positives. Require the ensemble/classifier
+            # score to clear the same user-facing threshold as the detector.
+            if pred_score < detector_threshold:
+                print(
+                    f"[SpeciesNet] det {det_idx}  SKIPPED — classifier pred_score"
+                    f" {pred_score:.3f} < threshold {detector_threshold:.2f}"
+                    f"  (detector conf={conf:.2f}, pred={pred_raw!r})"
+                )
+                continue
+
+            x1, y1, x2, y2 = _md_bbox_to_pixel_box(md_bbox, w, h)
+            xi1, yi1, xi2, yi2 = _clip_xyxy(x1, y1, x2, y2, w, h)
+
+            try:
+                mask, _iou = self.predictor.decode_box(
+                    image_embeddings, interm_embeddings,
+                    (xi1, yi1, xi2, yi2), resized_hw, original_hw,
+                )
+            except Exception as e:
+                print("[SAM-HQ] mask failed:", e)
+                continue
+
+            row = {
+                "mask": mask,
+                "pred_boxes": _pixel_box_to_pipeline_box(x1, y1, x2, y2),
+                "pred_class": pred_label if route == "wildlife" else "bird",
+                "pred_score": pred_score,
+                "detector_confidence": conf,
+            }
+            if route == "bird":
+                bird_rows.append(row)
+            else:
+                wildlife_rows.append(row)
+
+        if len(bird_rows) > self.max_bird_crops:
+            print(
+                f"[SpeciesNet] crop limit: keeping {self.max_bird_crops} of"
+                f" {len(bird_rows)} bird detections"
+            )
+        if len(wildlife_rows) > self.max_bird_crops:
+            print(
+                f"[SpeciesNet] crop limit: keeping {self.max_bird_crops} of"
+                f" {len(wildlife_rows)} wildlife detections"
+            )
+        bird_rows = bird_rows[: self.max_bird_crops]
+        wildlife_rows = wildlife_rows[: self.max_bird_crops]
+
+        combined = bird_rows + wildlife_rows
+        if not combined:
+            return [], [], [], []
+
+        masks_list = [r["mask"] for r in combined]
+        pred_boxes = [r["pred_boxes"] for r in combined]
+        pred_class = [r["pred_class"] for r in combined]
+        pred_score = [r["pred_score"] for r in combined]
+        overlap_rank_scores = [r["detector_confidence"] for r in combined]
+
+        masks_arr = np.stack(masks_list, axis=0)
+        pre_overlap_count = len(combined)
+        result = filter_overlapping_detections(
+            masks_arr,
+            pred_boxes,
+            pred_class,
+            pred_score,
+            heavy_overlap_iou=_HEAVY_OVERLAP_IOU,
+            heavy_overlap_containment=_HEAVY_OVERLAP_CONTAINMENT,
+            overlap_rank_scores=overlap_rank_scores,
+        )
+        post_overlap_count = len(result[2]) if result[2] is not None else 0
+        if post_overlap_count < pre_overlap_count:
+            print(
+                f"[SpeciesNet] overlap filter: removed {pre_overlap_count - post_overlap_count}"
+                f" of {pre_overlap_count} detections (IoU>={_HEAVY_OVERLAP_IOU}"
+                f" or containment>={_HEAVY_OVERLAP_CONTAINMENT})"
+            )
+        return result
+
+    # --- Geometry helpers for square crops and species bbox ---
+
+    @staticmethod
+    def _fsolve(func, xmin, xmax):
+        x_min, x_max = xmin, xmax
+        while x_max - x_min > 10:
+            x_mid = (x_min + x_max) / 2
+            if func(x_mid) < 0:
+                x_min = x_mid
+            else:
+                x_max = x_mid
+        return (x_min + x_max) / 2
+
+    def _get_bounding_box(self, mask):
+        # Compute marginal sums once (two O(N) passes) instead of materialising
+        # all nonzero coordinates with np.where (allocates ~19 MB for a 30% mask).
+        # Also caches mask_sum in the bisection closure, avoiding repeated full-image
+        # scans (was 8+ np.sum(mask) calls, each ~5-10 ms on a 12 MP mask).
+        cols_sum = mask.sum(axis=0, dtype=np.int64)   # (W,)
+        rows_sum = mask.sum(axis=1, dtype=np.int64)   # (H,)
+        mask_sum = int(cols_sum.sum())
+        if mask_sum == 0:
+            h, w = mask.shape[:2]
+            return 0, w, 0, h
+        cx = int(np.dot(cols_sum.astype(np.float64), np.arange(mask.shape[1], dtype=np.float64)) / mask_sum)
+        cy = int(np.dot(rows_sum.astype(np.float64), np.arange(mask.shape[0], dtype=np.float64)) / mask_sum)
+        center = (cx, cy)
+
+        def fraction_inside(center_of_mass, S):
+            x_min2 = max(0, int(center_of_mass[0] - S / 2))
+            x_max2 = min(mask.shape[1], int(center_of_mass[0] + S / 2))
+            y_min2 = max(0, int(center_of_mass[1] - S / 2))
+            y_max2 = min(mask.shape[0], int(center_of_mass[1] + S / 2))
+            return int(mask[y_min2:y_max2, x_min2:x_max2].sum()) / mask_sum  # cached
+
+        S = self._fsolve(lambda S: fraction_inside(center, S) - 0.8, 10, 3000)
+        S = int(S * 1 / 0.5)
+        x_min = int(center[0] - S / 2)
+        x_max = int(center[0] + S / 2)
+        y_min = int(center[1] - S / 2)
+        y_max = int(center[1] + S / 2)
+        x_min = max(0, x_min)
+        x_max = min(mask.shape[1], x_max)
+        y_min = max(0, y_min)
+        y_max = min(mask.shape[0], y_max)
+        slx = x_max - x_min
+        sly = y_max - y_min
+        if slx > sly:
+            center = (int((x_min + x_max) / 2), int((y_min + y_max) / 2))
+            s_new = sly
+        else:
+            center = (int((x_min + x_max) / 2), int((y_min + y_max) / 2))
+            s_new = slx
+        x_min = int(center[0] - s_new / 2)
+        x_max = int(center[0] + s_new / 2)
+        y_min = int(center[1] - s_new / 2)
+        y_max = int(center[1] + s_new / 2)
+        return x_min, x_max, y_min, y_max
+
+    def get_square_crop(self, mask, img, resize=True):
+        bbox = self.get_square_crop_box(mask)
+        x_min = bbox["x_min"]
+        x_max = bbox["x_max"]
+        y_min = bbox["y_min"]
+        y_max = bbox["y_max"]
+        crop = img[y_min:y_max, x_min:x_max]
+        mask_crop = mask[y_min:y_max, x_min:x_max]
+        if resize:
+            crop = cv2.resize(crop, (1024, 1024))
+            mask_crop = cv2.resize(mask_crop.astype(np.uint8), (1024, 1024))
+        return crop, mask_crop
+
+    def get_square_crop_box(self, mask):
+        x_min, x_max, y_min, y_max = self._get_bounding_box(mask)
+        h, w = mask.shape[:2]
+        x_min = max(0, min(int(x_min), max(0, w - 1)))
+        y_min = max(0, min(int(y_min), max(0, h - 1)))
+        x_max = max(x_min + 1, min(int(x_max), w))
+        y_max = max(y_min + 1, min(int(y_max), h))
+
+        width = x_max - x_min
+        height = y_max - y_min
+        w_denom = float(max(1, w))
+        h_denom = float(max(1, h))
+        x_center = x_min + (width / 2.0)
+        y_center = y_min + (height / 2.0)
+
+        return {
+            "x_min": int(x_min),
+            "x_max": int(x_max),
+            "y_min": int(y_min),
+            "y_max": int(y_max),
+            "width": int(width),
+            "height": int(height),
+            "x_min_norm": float(x_min / w_denom),
+            "x_max_norm": float(x_max / w_denom),
+            "y_min_norm": float(y_min / h_denom),
+            "y_max_norm": float(y_max / h_denom),
+            "x_center_norm": float(x_center / w_denom),
+            "y_center_norm": float(y_center / h_denom),
+        }
+
+    @staticmethod
+    def get_species_crop(box, img):
+        xmin = int(box[0][0])
+        ymin = int(box[0][1])
+        xmax = int(box[1][0])
+        ymax = int(box[1][1])
+        return img[ymin:ymax, xmin:xmax]

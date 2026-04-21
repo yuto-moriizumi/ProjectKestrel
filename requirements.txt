@@ -1,7 +1,6 @@
 # Core ML/AI Dependencies
-torch==2.11.0
-torchvision==0.26.0
-tensorflow==2.19.0
+# Note: use onnxruntime-directml instead of onnxruntime to enable DirectML GPU
+# acceleration on Windows (any DX12-compatible GPU). They are mutually exclusive.
 onnxruntime==1.23.2
 
 numpy==2.1.3
@@ -28,3 +27,6 @@ msvc-runtime==14.44.35112
 # EXIF reading
 exifread
 pillow==12.1.1
+
+# Camera-trap detection + classification (ensemble logic only; no PyTorch inference)
+speciesnet==5.0.3

@@ -25,7 +25,8 @@ ProjectKestrel/
 │       ├── similarity.py       # Image similarity detection
 │       ├── ratings.py          # Quality score to rating conversion
 │       └── ml/                 # Machine learning model wrappers
-│           ├── mask_rcnn.py    # Object detection (bird localization)
+│           ├── speciesnet_sam_hq.py  # SpeciesNet + SAM-HQ detection/segmentation
+│           ├── speciesnet_taxonomy.py
 │           ├── bird_species.py # Bird species classification
 │           └── quality.py      # Image quality assessment
 │
@@ -56,6 +57,8 @@ cd ProjectKestrel
 pip install -r requirements.txt
 ```
 
+If `pip` installs both `opencv-python` and `opencv-python-headless` (e.g. via `speciesnet`), `cv2.imwrite` may reject the JPEG quality parameter. For this app, keep the full GUI wheel and run: `pip uninstall -y opencv-python-headless`, then **`pip install --force-reinstall opencv-python==4.11.0.86`** so the `cv2` extension is intact (uninstalling headless can leave a broken `cv2` namespace). Re-pin **`numpy==2.1.3`** afterward if pip upgrades NumPy (TensorFlow expects `numpy<2.2`).
+
 ### 2. Running the Analyzer
 
 **GUI Mode (default):**
@@ -69,9 +72,9 @@ python analyzer/main.py
 All models must be in `analyzer/models/`:
 - `model.onnx` (bird species classifier)
 - `labels.txt`, `labels_scispecies.csv`, `scispecies_dispname.csv`
-- `quality.keras` (quality assessment — re-saved for macOS/XLA compatibility)
-- `quality_old.keras` (backup of the original quality model; not loaded by the app)
-- `mask_rcnn_resnet50_fpn_v2.pth` (object detection)
+- `quality.keras` (quality assessment)
+- `sam_hq_vit_tiny.pth` (SAM-HQ ViT-Tiny segmentation checkpoint; faster than ViT-B; place under `analyzer/models/`, or CI downloads from Hugging Face)
+- SpeciesNet detector/classifier weights (downloaded automatically on first run via the `speciesnet` package)
 
 **CLI Mode (headless):**
 ```bash
@@ -161,7 +164,8 @@ Both applications can be packaged as single-file executables:
 ## Module Dependencies
 
 **External Dependencies** (from requirements.txt):
-- torch, torchvision (Mask R-CNN)
+- torch, torchvision (SpeciesNet, SAM-HQ)
+- speciesnet, segment-anything-hq
 - tensorflow (Quality classifier)
 - onnxruntime (Bird species classifier)
 - opencv-python, pillow, wand (Image processing)
@@ -195,10 +199,18 @@ output shape. Optional flags: `--model-dir`, `--input-name`, `--old-name`.
 
 ## Testing
 
-To test the CLI locally:
+Taxonomy routing (fast, no GPU models):
+```bash
+set PYTHONPATH=analyzer
+python -m unittest analyzer.tests.test_speciesnet_taxonomy -v
+```
+
+To test the CLI locally (requires `sam_hq_vit_tiny.pth` under `analyzer/models/` and SpeciesNet weight download on first run):
 ```bash
 python analyzer/cli.py test_imgs --no-gpu
 ```
+
+For a quick RAW smoke test on one file, use e.g. `test_imgs\IMG_4470.CR3` inside that folder (case may vary by camera; `.CR3` is Canon RAW).
 
 To test the GUI:
 ```bash

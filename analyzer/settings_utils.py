@@ -2,10 +2,36 @@
 
 from __future__ import annotations
 
+import glob
 import json
+import math
 import os
+import shutil
 import sys
+import tempfile
+import threading
+import time
 from typing import Any
+
+# Serializes ``save_persisted_settings`` so the read-existing / monotonic-guard
+# / refresh-.bak / os.replace sequence is atomic with respect to other saves
+# in this process. Concurrent callers include the JS bridge (UI setting
+# changes), the queue worker (impact-counter bumps), and the visualizer
+# startup path — they all hit the same file and previously raced on the
+# shared ``settings.json.tmp`` name (symptom: WinError 2 "cannot find the
+# file specified" on os.replace when the other thread deleted our tmp).
+_SAVE_LOCK = threading.RLock()
+
+# Prefix/suffix for ``tempfile.mkstemp`` tmp files we emit. The glob
+# ``settings.json.*.tmp`` uniquely identifies orphans left by a crashed save.
+_TMP_FILE_PREFIX = 'settings.json.'
+_TMP_FILE_SUFFIX = '.tmp'
+
+# Forward-compatible / unknown keys (e.g. tutorial flags from newer builds) — size limits only.
+_PASSTHROUGH_MAX_STR = 16384
+_PASSTHROUGH_MAX_LIST_LEN = 512
+_PASSTHROUGH_MAX_DICT_KEYS = 256
+_PASSTHROUGH_MAX_DEPTH = 8
 
 SETTINGS_FILENAME = 'settings.json'
 _MAX_PATH_CHARS = 4096
@@ -17,8 +43,7 @@ _ALLOWED_EDITORS = {
     'acdsee', 'paintshop', 'faststone', 'xnview', 'irfanview', 'custom',
 }
 _ALLOWED_RATING_PROFILES = {'very_strict', 'strict', 'balanced', 'lenient', 'very_lenient'}
-_ALLOWED_EXPOSURE_PROFILES = {'lenient', 'normal', 'aggressive'}
-_ALLOWED_EXPOSURE_SOLVERS = {'metered_refine_one_pass', 'convergent_two_pass', 'predictive_fast'}
+_ALLOWED_EXPOSURE_QUALITY = {'lenient', 'balanced', 'aggressive'}
 _ALLOWED_QUEUE_ITEM_STATUSES = {'pending', 'running', 'done', 'error', 'cancelled'}
 
 # Telemetry — failsafe import (never blocks startup)
@@ -216,10 +241,12 @@ def _sanitize_queue_recovery_state(value: Any) -> dict | None:
     state['options'] = {
         'use_gpu': _coerce_bool(opts.get('use_gpu', True), default=True),
         'wildlife_enabled': _coerce_bool(opts.get('wildlife_enabled', True), default=True),
-        'detection_threshold': _coerce_float(opts.get('detection_threshold', 0.75), 0.75, min_value=0.1, max_value=0.99),
+        'detection_threshold': _coerce_float(opts.get('detection_threshold', 0.25), 0.25, min_value=0.1, max_value=0.99),
         'scene_time_threshold': _coerce_float(opts.get('scene_time_threshold', 1.0), 1.0, min_value=0.0, max_value=60.0),
         'mask_threshold': _coerce_float(opts.get('mask_threshold', 0.5), 0.5, min_value=0.5, max_value=0.95),
-        'max_bird_crops': _coerce_int(opts.get('max_bird_crops', 5), 5, min_value=1, max_value=20),
+        'max_bird_crops': _coerce_int(opts.get('max_bird_crops', 10), 10, min_value=1, max_value=20),
+        'parallel_prefetch': _coerce_int(opts.get('parallel_prefetch', 3), 3, min_value=1, max_value=5),
+        'exposure_corrected_thumbs': _coerce_bool(opts.get('exposure_corrected_thumbs', True), default=True),
     }
 
     items_out: list[dict[str, Any]] = []
@@ -246,6 +273,68 @@ def _sanitize_queue_recovery_state(value: Any) -> dict | None:
             break
     state['items'] = items_out
     return state
+
+
+def _passthrough_setting_value(value: Any, depth: int = 0) -> Any | None:
+    """Copy a JSON-like value for persisting unknown settings keys.
+
+    Only bool, None, numbers, strings, lists, and dicts are allowed (same as JSON).
+    Used so newer app versions can add keys without updating this module, and older
+    builds preserve them on load/save instead of dropping them as 'unsupported'.
+    """
+    if depth > _PASSTHROUGH_MAX_DEPTH:
+        return None
+    if value is None or isinstance(value, bool):
+        return value
+    if isinstance(value, int):
+        if abs(value) > 9_007_199_254_740_991:  # practical JS-safe integer range
+            return None
+        return value
+    if isinstance(value, float):
+        if not math.isfinite(value):
+            return None
+        return value
+    if isinstance(value, str):
+        if len(value) > _PASSTHROUGH_MAX_STR:
+            return value[:_PASSTHROUGH_MAX_STR]
+        return value
+    if isinstance(value, list):
+        out: list[Any] = []
+        for item in value[:_PASSTHROUGH_MAX_LIST_LEN]:
+            pv = _passthrough_setting_value(item, depth + 1)
+            if pv is not None:
+                out.append(pv)
+        return out
+    if isinstance(value, dict):
+        out_d: dict[str, Any] = {}
+        for i, (k, v) in enumerate(value.items()):
+            if i >= _PASSTHROUGH_MAX_DICT_KEYS:
+                break
+            if not isinstance(k, str):
+                continue
+            ks = k[:256] if len(k) > 256 else k
+            pv = _passthrough_setting_value(v, depth + 1)
+            if pv is not None:
+                out_d[ks] = pv
+        return out_d
+    return None
+
+
+def _merge_forward_compatible_keys(out: dict[str, Any], data: dict, emit_log: bool) -> None:
+    """Attach unknown keys from *data* onto *out* (keys not already set by core sanitization)."""
+    skipped: list[str] = []
+    for k, v in data.items():
+        if k in out:
+            continue
+        pv = _passthrough_setting_value(v)
+        if pv is not None:
+            out[k] = pv
+        else:
+            skipped.append(k)
+    if emit_log and skipped:
+        sample = ', '.join(skipped[:12])
+        suffix = ' ...' if len(skipped) > 12 else ''
+        log(f'[settings] Could not preserve {len(skipped)} key(s) (unsupported type): {sample}{suffix}')
 
 
 def _sanitize_settings_payload(data: dict, emit_log: bool = False) -> dict:
@@ -289,23 +378,18 @@ def _sanitize_settings_payload(data: dict, emit_log: bool = False) -> dict:
 
     if 'rating_profile' in data:
         out['rating_profile'] = _coerce_enum(data.get('rating_profile'), _ALLOWED_RATING_PROFILES, default='balanced')
-    _set_float('detection_threshold', default=0.75, min_value=0.1, max_value=0.99, digits=4)
+    _set_float('detection_threshold', default=0.25, min_value=0.1, max_value=0.99, digits=4)
     _set_float('scene_time_threshold', default=1.0, min_value=0.0, max_value=60.0, digits=4)
     _set_float('mask_threshold', default=0.5, min_value=0.5, max_value=0.95, digits=4)
-    _set_int('max_bird_crops', default=5, min_value=1, max_value=20)
+    _set_int('max_bird_crops', default=10, min_value=1, max_value=20)
+    _set_int('parallel_prefetch', default=3, min_value=1, max_value=5)
+    _set_bool('exposure_corrected_thumbs', default=True)
 
-    if 'exposure_compensation_profile' in data:
-        out['exposure_compensation_profile'] = _coerce_enum(
-            data.get('exposure_compensation_profile'),
-            _ALLOWED_EXPOSURE_PROFILES,
-            default='aggressive',
-        )
-
-    if 'exposure_compensation_solver' in data:
-        out['exposure_compensation_solver'] = _coerce_enum(
-            data.get('exposure_compensation_solver'),
-            _ALLOWED_EXPOSURE_SOLVERS,
-            default='metered_refine_one_pass',
+    if 'exposure_quality' in data:
+        out['exposure_quality'] = _coerce_enum(
+            data.get('exposure_quality'),
+            _ALLOWED_EXPOSURE_QUALITY,
+            default='balanced',
         )
 
     _set_bool('raw_preview_cache_enabled', default=True)
@@ -313,9 +397,16 @@ def _sanitize_settings_payload(data: dict, emit_log: bool = False) -> dict:
     _set_bool('auto_save_enabled', default=True)
     _set_bool('raw_exposure_correction_disabled', default=False)
 
+    # Analysis-time thumbnail generation (cached export JPEGs + crops). Exposed
+    # as user settings so photographers can trade storage for fidelity.
+    # Width in pixels along the long edge; JPEG quality is cv2's 0–100 param.
+    _set_int('thumbnail_max_width', default=1200, min_value=400, max_value=2400)
+    _set_int('thumbnail_jpeg_quality', default=95, min_value=50, max_value=100)
+
     _set_bool('includeSecondarySpecies', default=False)
     _set_bool('groupByFolder', default=True)
     _set_bool('groupByTime', default=True)
+    _set_bool('showBirdThumbs', default=False)
     _set_bool('onlyManualRatedScenes', default=False)
     _set_float('scene_preview_split_ratio', default=0.68, min_value=0.25, max_value=0.85, digits=4)
 
@@ -344,6 +435,8 @@ def _sanitize_settings_payload(data: dict, emit_log: bool = False) -> dict:
     _set_str('machine_id', max_len=128)
     _set_str('version', max_len=64)
     _set_str('legal_agreed_version', max_len=64)
+    _set_str('legal_agreed_date', max_len=32)
+    _set_str('last_open_ping_utc', max_len=32)
     _set_bool('installed_telemetry_sent', default=False)
     _set_bool('legal_upgrade_self_heal_2026_03', default=False)
 
@@ -364,63 +457,292 @@ def _sanitize_settings_payload(data: dict, emit_log: bool = False) -> dict:
         if pending is not None:
             out['pending_analytics'] = pending
 
-    if emit_log:
-        unknown = sorted([str(k) for k in data.keys() if k not in out])
-        if unknown:
-            sample = ', '.join(unknown[:12])
-            suffix = ' ...' if len(unknown) > 12 else ''
-            log(f'[settings] Dropped unsupported keys ({len(unknown)}): {sample}{suffix}')
+    # Forward compatibility: preserve unknown keys (e.g. settings added by a
+    # newer build) so an older Kestrel doesn't drop them on the round-trip.
+    # ``_merge_forward_compatible_keys`` copies JSON-safe values only and logs
+    # any keys whose structure was unrecoverable.
+    _merge_forward_compatible_keys(out, data, emit_log=emit_log)
 
     return out
 
 
-def load_persisted_settings() -> dict:
+# --- Cumulative counters that must never regress across save/load cycles ---
+# Each entry is (key, coerce_fn). The coerce_fn returns None on unparseable input.
+def _coerce_counter_int(v: Any) -> int | None:
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_counter_float(v: Any) -> float | None:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+_MONOTONIC_COUNTERS: tuple[tuple[str, Any], ...] = (
+    ('kestrel_impact_total_files', _coerce_counter_int),
+    ('kestrel_impact_total_seconds', _coerce_counter_float),
+)
+
+
+def _load_settings_raw() -> tuple[dict | None, str]:
+    """Read ``settings.json`` verbatim, returning ``(data, status)``.
+
+    ``status`` is one of:
+      * ``'ok'``      — file parsed, ``data`` is the raw dict.
+      * ``'missing'`` — file does not exist; ``data`` is ``None``.
+      * ``'corrupt'`` — file exists but failed to parse as a JSON object.
+
+    This is the single source of truth for distinguishing "new install" from
+    "existing file the app cannot read". Callers that need to overwrite the
+    file use ``'corrupt'`` to bail out instead of silently clobbering data
+    a user may still be able to recover manually.
+    """
     path = _get_settings_path()
+    if not os.path.exists(path):
+        return None, 'missing'
     try:
         with open(path, 'r', encoding='utf-8') as f:
             data = json.load(f)
-            return _sanitize_settings_payload(data) if isinstance(data, dict) else {}
-    except FileNotFoundError:
-        return {}
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+        log(f'[settings] WARN: could not parse {path}: {exc}')
+        return None, 'corrupt'
+    if not isinstance(data, dict):
+        return None, 'corrupt'
+    return data, 'ok'
+
+
+def _load_backup_if_valid() -> dict | None:
+    """Return the ``.bak`` sidecar contents if present and parseable, else None."""
+    path = _get_settings_path()
+    bak = path + '.bak'
+    if not os.path.exists(bak):
+        return None
+    try:
+        with open(bak, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+        log(f'[settings] WARN: .bak is also unreadable: {exc}')
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _quarantine_corrupt_settings(path: str) -> str | None:
+    """Move the corrupt ``settings.json`` aside for manual recovery, so the
+    next save can proceed with a fresh file. Returns the quarantine path or
+    ``None`` on failure.
+    """
+    try:
+        ts = time.strftime('%Y%m%d-%H%M%S')
+        quarantine = f'{path}.corrupt-{ts}'
+        # Avoid clobbering a previous quarantine from the same second.
+        attempt = 0
+        while os.path.exists(quarantine):
+            attempt += 1
+            quarantine = f'{path}.corrupt-{ts}-{attempt}'
+        shutil.copy2(path, quarantine)
+        log(f'[settings] Quarantined corrupt settings file to {quarantine}')
+        return quarantine
+    except OSError as exc:
+        log(f'[settings] Failed to quarantine corrupt settings: {exc}')
+        return None
+
+
+def _apply_monotonic_guard(incoming: dict, existing: dict | None) -> dict:
+    """Return a copy of ``incoming`` with cumulative counters clamped to at
+    least the value in ``existing``. Protects against data loss when a stale
+    caller (e.g. a race between queue_manager and the settings dialog) would
+    otherwise regress a counter.
+
+    If ``incoming`` OMITS a counter key entirely but ``existing`` has one,
+    the existing value is resurrected into the output. Callers that mutate
+    only a subset of settings (the UI does this on every save) must not be
+    able to silently zero a counter by virtue of not sending it.
+    """
+    if not isinstance(existing, dict):
+        return dict(incoming)
+    out = dict(incoming)
+    for key, coerce in _MONOTONIC_COUNTERS:
+        prev = coerce(existing.get(key))
+        if prev is None:
+            continue
+        if key not in out:
+            out[key] = prev
+            continue
+        new = coerce(out.get(key))
+        if new is None or new < prev:
+            out[key] = prev
+    return out
+
+
+def load_persisted_settings() -> dict:
+    """Load ``settings.json`` from the user data directory.
+
+    Core keys are validated/coerced; any additional keys present in the file are
+    preserved when JSON-safe (forward compatibility across app versions).
+
+    If the main file is unreadable, transparently falls back to the ``.bak``
+    sidecar written by the last successful save, so a partial write or disk
+    glitch does not silently wipe cumulative state like the impact counter.
+    """
+    data, status = _load_settings_raw()
+    if status == 'ok':
+        return _sanitize_settings_payload(data, emit_log=False)
+    if status == 'corrupt':
+        bak_data = _load_backup_if_valid()
+        if bak_data is not None:
+            log('[settings] Main settings file is corrupt; serving from .bak.')
+            return _sanitize_settings_payload(bak_data, emit_log=False)
+    return {}
+
+
+def _reap_orphan_tmp_files(directory: str) -> None:
+    """Best-effort cleanup of ``settings.json.*.tmp`` orphans from crashed
+    or racing saves. Silent on any error — these files are harmless; they
+    just waste a few bytes until next startup.
+    """
+    try:
+        pattern = os.path.join(directory, _TMP_FILE_PREFIX + '*' + _TMP_FILE_SUFFIX)
+        for orphan in glob.glob(pattern):
+            try:
+                os.remove(orphan)
+            except OSError:
+                pass
     except Exception:
-        return {}
+        pass
 
 
 def save_persisted_settings(data: dict) -> None:
+    """Atomically persist settings with corruption-aware integrity guards.
+
+    Behaviour:
+      * Serialized in-process by ``_SAVE_LOCK`` so concurrent callers (JS
+        bridge, queue worker, startup) cannot race on the temp file.
+      * Each save writes to a **unique** temp file via ``tempfile.mkstemp``
+        so two racing saves never overwrite or delete each other's tmp —
+        this is the fix for the ``WinError 2`` we hit when the old code
+        hardcoded ``settings.json.tmp``.
+      * If the on-disk file is corrupt and a valid ``.bak`` exists, the corrupt
+        file is quarantined to ``<path>.corrupt-<ts>`` and the save proceeds,
+        using ``.bak`` for the monotonic-counter guard so impact totals etc.
+        are not lost in the recovery.
+      * If the on-disk file is corrupt and ``.bak`` is also unusable, the save
+        is **refused** — the corrupt file is preserved verbatim so the user
+        can examine or restore it manually. Running app state stays in memory.
+      * On success, the previous good ``settings.json`` is promoted to
+        ``settings.json.bak`` before the atomic ``os.replace`` of the new file.
+      * The previous non-atomic fallback (a direct write on ``os.replace``
+        failure) has been removed — it was the root cause of partial writes
+        that in turn caused the data-loss symptom being guarded against here.
+    """
     if not isinstance(data, dict):
         raise ValueError('Settings payload must be an object')
-    data = _sanitize_settings_payload(data, emit_log=True)
-        
-    # --- Flush pending analytics on consent ---
-    if data.get('analytics_consent_shown', False) and 'pending_analytics' in data:
-        pending = data.pop('pending_analytics')
-        if data.get('analytics_opted_in', False) and _telemetry is not None:
-            try:
-                _telemetry.send_folder_analytics(**pending)
-                log('[analytics] Flushed pending detailed analytics after opt-in.')
-            except Exception as e:
-                log(f'[analytics] Failed to flush pending analytics: {e}')
-    # ------------------------------------------
 
-    path = _get_settings_path()
-    os.makedirs(os.path.dirname(path), exist_ok=True)
-    tmp = path + '.tmp'
-    try:
-        # Remove any stale .tmp from a previous crash (Windows can't replace a locked file)
+    with _SAVE_LOCK:
+        path = _get_settings_path()
+        directory = os.path.dirname(path)
+        existing_raw, status = _load_settings_raw()
+
+        if status == 'corrupt':
+            bak_data = _load_backup_if_valid()
+            if bak_data is None:
+                log(
+                    f'[settings] REFUSING to save over unreadable {path}; '
+                    f'no valid .bak to recover from. '
+                    f'Remove or repair the file manually, then retry.'
+                )
+                return
+            # Move the corrupt file aside so the atomic write below has a clean slate.
+            _quarantine_corrupt_settings(path)
+            try:
+                os.remove(path)
+            except OSError:
+                # Not fatal — os.replace below will try to overwrite regardless.
+                pass
+            existing_raw = bak_data
+            status = 'missing'
+
+        data = _apply_monotonic_guard(data, existing_raw)
+
+        # Re-sanitize while preserving forward-compatible keys so merges from the UI
+        # cannot strip unknown keys that were loaded from disk.
+        data = _sanitize_settings_payload(data, emit_log=True)
+
+        # --- Flush pending analytics on consent ---
+        if data.get('analytics_consent_shown', False) and 'pending_analytics' in data:
+            pending = data.pop('pending_analytics')
+            if data.get('analytics_opted_in', False) and _telemetry is not None:
+                try:
+                    _telemetry.send_folder_analytics(**pending)
+                    log('[analytics] Flushed pending detailed analytics after opt-in.')
+                except Exception as e:
+                    log(f'[analytics] Failed to flush pending analytics: {e}')
+        # ------------------------------------------
+
+        os.makedirs(directory, exist_ok=True)
+
+        # Unique temp file per save. ``mkstemp`` atomically creates and opens
+        # the file with O_EXCL so no two calls can ever produce the same path.
         try:
-            os.remove(tmp)
-        except FileNotFoundError:
-            pass
-        with open(tmp, 'w', encoding='utf-8') as f:
-            json.dump(data, f, indent=2, sort_keys=True)
-        os.replace(tmp, path)
-    except OSError:
-        # Fallback: write directly — non-atomic but safe for settings
+            tmp_fd, tmp = tempfile.mkstemp(
+                prefix=_TMP_FILE_PREFIX,
+                suffix=_TMP_FILE_SUFFIX,
+                dir=directory,
+            )
+        except OSError as exc:
+            log(
+                f'[settings] FAILED to create temp file for atomic save ({exc}); '
+                f'existing file left unchanged. Check disk space and permissions '
+                f'on {directory}.'
+            )
+            return
+
         try:
-            with open(path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2, sort_keys=True)
-        except OSError as e:
-            print(f'[settings] Failed to save settings: {e}', file=sys.stderr)
+            try:
+                with os.fdopen(tmp_fd, 'w', encoding='utf-8') as f:
+                    json.dump(data, f, indent=2, sort_keys=True)
+                    try:
+                        f.flush()
+                        os.fsync(f.fileno())
+                    except OSError:
+                        # fsync can legitimately fail on some network filesystems;
+                        # proceed with the atomic replace anyway.
+                        pass
+            except Exception:
+                # fdopen took ownership of the fd; if the with-block raised,
+                # the fd is already closed. Just make sure we clean up the
+                # orphan temp file in the outer except.
+                raise
+
+            # Promote the previous good file to .bak before replacement so that
+            # a future corrupt-main scenario can auto-recover.
+            if status == 'ok':
+                try:
+                    shutil.copy2(path, path + '.bak')
+                except OSError as exc:
+                    log(f'[settings] WARN: could not refresh .bak: {exc}')
+
+            os.replace(tmp, path)
+        except OSError as exc:
+            # Do NOT fall back to a non-atomic direct write — that path is how
+            # partial writes corrupt settings.json in the first place. Leave the
+            # existing (possibly older) file in place and log loudly.
+            log(
+                f'[settings] FAILED to atomically save settings ({exc}); '
+                f'existing file left unchanged. Check disk space, permissions, '
+                f'and antivirus locks on {path}.'
+            )
+            try:
+                os.remove(tmp)
+            except OSError:
+                pass
+        else:
+            # Successful save — reap any orphans left by prior crashed saves.
+            _reap_orphan_tmp_files(directory)
 
 
 def log(*args):

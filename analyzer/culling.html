@@ -3,6 +3,10 @@
 <head>
   <meta charset="utf-8" />
   <meta name="viewport" content="width=device-width, initial-scale=1" />
+  <!-- Defense-in-depth CSP: matches the HTTP header set by visualizer.py's
+       Handler.end_headers(). See FINDING-01 for the full rationale. -->
+  <meta http-equiv="Content-Security-Policy"
+        content="default-src 'self'; script-src 'self' 'unsafe-inline'; style-src 'self' 'unsafe-inline'; img-src 'self' data: blob:; media-src 'self' blob:; connect-src 'self' blob:; font-src 'self' data:; object-src 'none'; frame-ancestors 'none'; base-uri 'self'; form-action 'self'" />
   <title>Culling Assistant — Project Kestrel</title>
   <link rel="icon" href="data:," />
   <script src="csv_parser.js"></script>
@@ -464,6 +468,37 @@
       padding: 1px 5px;
       border-radius: 3px;
       font-size: 11px;
+    }
+    .dlg-xmp-field-row {
+      display: flex;
+      gap: 8px;
+      align-items: flex-start;
+      padding: 4px 6px;
+      border-radius: 4px;
+      cursor: pointer;
+    }
+    .dlg-xmp-field-row:hover { background: rgba(74,163,255,0.05); }
+    .dlg-xmp-field-row input[type="checkbox"] {
+      margin-top: 2px;
+      flex-shrink: 0;
+      cursor: pointer;
+    }
+    .dlg-xmp-field-row span {
+      display: flex;
+      flex-direction: column;
+      min-width: 0;
+      gap: 1px;
+    }
+    .dlg-xmp-field-row b {
+      font-size: 12px;
+      color: var(--text);
+      font-weight: 600;
+    }
+    .dlg-xmp-field-row em {
+      font-size: 11px;
+      color: var(--muted);
+      font-style: normal;
+      line-height: 1.35;
     }
     .dlg-xmp-note {
       margin: 0 14px 10px;
@@ -1068,6 +1103,24 @@
             <span>When enabled, images given Accept or Reject by auto rules also receive Green/Red XMP color labels.</span>
           </div>
         </label>
+      </div>
+
+      <!-- XMP field selection (which sections of the .xmp packet to populate) -->
+      <div class="dlg-option-card hidden" id="xmpFieldsCard">
+        <div style="display:flex;gap:10px;align-items:flex-start;width:100%;">
+          <span class="dlg-option-icon" style="font-size:18px;">&#x2699;&#xFE0F;</span>
+          <div class="dlg-option-body" style="flex:1;min-width:0;">
+            <b>Fields to write</b>
+            <span style="margin-bottom:6px;display:block;">Pick which entries the XMP packet should contain. Disabled fields are omitted from each sidecar.</span>
+            <div id="xmpFieldsGrid" style="display:grid;grid-template-columns:1fr 1fr;gap:2px 12px;">
+              <label class="dlg-xmp-field-row"><input type="checkbox" data-xmp-field="rating" checked /><span><b>Star Rating</b><em>xmp:Rating (0–5).</em></span></label>
+              <label class="dlg-xmp-field-row"><input type="checkbox" data-xmp-field="label" checked /><span><b>Color Label</b><em>xmp:Label (Green/Red).</em></span></label>
+              <label class="dlg-xmp-field-row"><input type="checkbox" data-xmp-field="species" checked /><span><b>Species Tag</b><em>kestrel:Species + keyword.</em></span></label>
+              <label class="dlg-xmp-field-row"><input type="checkbox" data-xmp-field="family" checked /><span><b>Family Tag</b><em>kestrel:Family + keyword.</em></span></label>
+              <label class="dlg-xmp-field-row"><input type="checkbox" data-xmp-field="quality" checked /><span><b>Quality Score</b><em>kestrel:QualityScore (0–1).</em></span></label>
+            </div>
+          </div>
+        </div>
       </div>
       <!-- XMP early-access note (shown when checked) -->
       <div class="dlg-xmp-note" id="xmpNote">
@@ -2312,6 +2365,8 @@
       el('#dlgProgressActions').style.display = 'none';
 
       _updateExecuteBtn();
+      // Hydrate XMP field selection from persisted settings (fire-and-forget)
+      _hydrateXmpFieldSelection();
       el('#confirmDlg').showModal();
     }
 
@@ -2322,9 +2377,48 @@
       if (btn) btn.disabled = !any;
       const autoLabel = el('#doAutoLabelCheck');
       const autoLabelCard = el('#xmpAutoLabelCard');
+      const fieldsCard = el('#xmpFieldsCard');
       // Auto-label sub-option only makes sense when writing XMP; Confirm is independent
       if (autoLabel) autoLabel.disabled = !xmpChecked;
       if (autoLabelCard) autoLabelCard.classList.toggle('hidden', !xmpChecked);
+      if (fieldsCard) fieldsCard.classList.toggle('hidden', !xmpChecked);
+    }
+
+    // ---- XMP field selection (which sections of the .xmp packet to write) ----
+    const _XMP_FIELD_KEYS = ['rating', 'label', 'species', 'family', 'quality'];
+    function _xmpFieldDefaults() {
+      return { rating: true, label: true, species: true, family: true, quality: true };
+    }
+    function _readXmpFieldSelection() {
+      const sel = _xmpFieldDefaults();
+      document.querySelectorAll('#xmpFieldsGrid input[data-xmp-field]').forEach(cb => {
+        const key = cb.dataset.xmpField;
+        if (_XMP_FIELD_KEYS.includes(key)) sel[key] = !!cb.checked;
+      });
+      return sel;
+    }
+    function _applyXmpFieldSelection(sel) {
+      const merged = { ..._xmpFieldDefaults(), ...(sel || {}) };
+      document.querySelectorAll('#xmpFieldsGrid input[data-xmp-field]').forEach(cb => {
+        const key = cb.dataset.xmpField;
+        if (_XMP_FIELD_KEYS.includes(key)) cb.checked = !!merged[key];
+      });
+    }
+    async function _hydrateXmpFieldSelection() {
+      try {
+        if (!window.pywebview?.api?.get_settings) return;
+        const r = await window.pywebview.api.get_settings();
+        if (r && r.success && r.settings && typeof r.settings.xmp_fields === 'object') {
+          _applyXmpFieldSelection(r.settings.xmp_fields);
+        }
+      } catch (_) {}
+    }
+    function _persistXmpFieldSelection(sel) {
+      try {
+        if (window.pywebview?.api?.save_settings_data) {
+          window.pywebview.api.save_settings_data({ xmp_fields: sel }).catch(() => {});
+        }
+      } catch (_) {}
     }
 
     function promoteAutoToVerified() {
@@ -2346,6 +2440,10 @@
       const doAutoLabels = doXmp && (el('#doAutoLabelCheck')?.checked ?? true);
       const doPromoteVerified = !!el('#doPromoteVerifiedCheck')?.checked;
       if (!doXmp && !doMove && !doPromoteVerified) return;
+
+      // Snapshot + persist the user's XMP field selection for this write.
+      const xmpFieldSel = _readXmpFieldSelection();
+      if (doXmp) _persistXmpFieldSelection(xmpFieldSel);
 
       // Switch to progress view
       el('#dlgOptions').classList.add('hidden');
@@ -2426,7 +2524,7 @@
           }));
 
           // First pass: detect conflicts (existing non-Kestrel XMPs)
-          const firstXmpRes = await window.pywebview.api.write_xmp_metadata(rootPath, xmpPayload, false, doAutoLabels);
+          const firstXmpRes = await window.pywebview.api.write_xmp_metadata(rootPath, xmpPayload, false, doAutoLabels, xmpFieldSel);
           if (!firstXmpRes.success) {
             setStep('xmp', 'failed', firstXmpRes.error || '');
             anyFailed = true;
@@ -2440,7 +2538,7 @@
             setStep('xmp', 'running');
             if (overwriteExternal) {
               // Second pass: overwrite the conflicting files too
-              const secondXmpRes = await window.pywebview.api.write_xmp_metadata(rootPath, xmpPayload, true, doAutoLabels);
+              const secondXmpRes = await window.pywebview.api.write_xmp_metadata(rootPath, xmpPayload, true, doAutoLabels, xmpFieldSel);
               if (!secondXmpRes.success) {
                 setStep('xmp', 'failed', secondXmpRes.error || '');
                 anyFailed = true;

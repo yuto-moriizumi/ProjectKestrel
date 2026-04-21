@@ -8,21 +8,22 @@ Features:
  - Intended to be frozen into a single executable with PyInstaller.
 
 Usage (development):
-    python visualizer/visualizer.py --port 8765 --root C:/Photos/Trip
+    python analyzer/visualizer.py --port 8765 --root C:/Photos/Trip
 
 After starting it will open the desktop UI (pywebview) at http://127.0.0.1:<port>/ .
 
 Build single-file EXE (example):
-    pyinstaller --onefile --name kestrel_viz visualizer/visualizer.py
+    pyinstaller --onefile --name kestrel_viz analyzer/visualizer.py
 
-Optionally set env vars (same as editor_bridge):
-        KESTREL_ALLOWED_ROOT=C:/Photos/Trip  (restrict paths)
-    KESTREL_BRIDGE_TOKEN=secret              (require auth header)
-    KESTREL_ALLOWED_EXTENSIONS=.cr3,.jpg,... (override allowed list)
-    KESTREL_ALLOW_ANY_EXTENSION=1            (disable extension filtering)
-    KESTREL_ENABLE_LEGACY_HTTP_API=1         (re-enable legacy local HTTP control routes)
-    KESTREL_ENABLE_LEGACY_OPEN_ENDPOINT=1    (re-enable legacy HTTP /open endpoint)
+Optionally set env vars:
+    KESTREL_ALLOWED_ROOT=C:/Photos/Trip       (restrict paths)
+    KESTREL_ALLOWED_EXTENSIONS=.cr3,.jpg,...  (override allowed editor extensions)
 
+The legacy HTTP control API (``/settings``, ``/queue/*``, ``/recovery/*``,
+``/open``, ``/shutdown``, ``/feedback``) has been removed entirely: all
+integration happens through the pywebview JS bridge. The ``KESTREL_ENABLE_LEGACY_*``
+and ``KESTREL_ALLOW_ANY_EXTENSION`` / ``KESTREL_BRIDGE_TOKEN`` environment
+variables are no longer recognised.
 """
 
 from __future__ import annotations
@@ -35,20 +36,17 @@ except Exception:
     pass
 
 import argparse
-import json
 import os
 import sys
-
-import secrets
-from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 import threading
-from urllib.parse import urlparse
+import time
+
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
 from datetime import datetime
-from typing import Optional, Set, TextIO
+from typing import Optional, TextIO
 
 # --- Extracted modules ---
-from settings_utils import load_persisted_settings, save_persisted_settings, log, _normalize
-from editor_launch import launch
+from settings_utils import load_persisted_settings, save_persisted_settings, log
 from queue_manager import _queue_manager
 from api_bridge import Api
 
@@ -63,33 +61,26 @@ except ImportError:
 
 HOST = '127.0.0.1'
 
-# Phase 0 policy lock: desktop pywebview mode is required and API routes use
-# a unified token+origin security policy while the local HTTP bridge exists.
-SECURITY_POLICY_VERSION = '2026-03-30'
+# Phase 1 policy lock: the legacy HTTP control surface is permanently disabled.
+# All integration flows through the pywebview JS bridge (``api_bridge.Api``).
+# These constants are ``False`` literals (not env-derived) so an attacker
+# cannot set ``KESTREL_ENABLE_LEGACY_HTTP_API=1`` in the environment to
+# re-expose the legacy surface. See SECURITY.md / FINDING-07.
+SECURITY_POLICY_VERSION = '2026-04-21'
 BROWSER_ONLY_MODE_SUPPORTED = False
-API_AUTH_POLICY = 'desktop-api-preferred;legacy-http-api-disabled-by-default'
-LEGACY_HTTP_API_ENABLED = os.environ.get('KESTREL_ENABLE_LEGACY_HTTP_API') == '1'
-LEGACY_OPEN_ENDPOINT_ENABLED = os.environ.get('KESTREL_ENABLE_LEGACY_OPEN_ENDPOINT') == '1'
+API_AUTH_POLICY = 'desktop-api-only;legacy-http-api-removed'
+LEGACY_HTTP_API_ENABLED = False
+LEGACY_OPEN_ENDPOINT_ENABLED = False
 LEGAL_SELF_HEAL_MIGRATION_KEY = 'legal_upgrade_self_heal_2026_03'
 
-# --- Security / behavior configuration (env override matches editor_bridge) ---
+# --- Security / behavior configuration ---
 ALLOWED_ROOT = os.environ.get('KESTREL_ALLOWED_ROOT')
 if ALLOWED_ROOT:
     ALLOWED_ROOT = os.path.abspath(os.path.expanduser(ALLOWED_ROOT))
 
-AUTH_TOKEN = os.environ.get('KESTREL_BRIDGE_TOKEN')
-if not AUTH_TOKEN:
-    # Generate an ephemeral token per run for legacy HTTP API compatibility.
-    AUTH_TOKEN = secrets.token_urlsafe(32)
-MAX_REQUEST_BYTES = int(os.environ.get('KESTREL_MAX_REQUEST_BYTES', '4096'))
-ALLOWED_EDITORS: Set[str] = {
-    'system', 'darktable', 'lightroom', 'photoshop', 'capture_one',
-    'affinity', 'gimp', 'rawtherapee', 'luminar', 'dxo', 'on1',
-    'acdsee', 'paintshop', 'faststone', 'xnview', 'irfanview', 'custom',
-}
-_default_exts = ['.cr3', '.cr2', '.nef', '.arw', '.dng', '.raf', '.orf', '.rw2', '.sr2', '.jpg', '.jpeg', '.png', '.tif', '.tiff']
-ALLOWED_EXTENSIONS: Set[str] = set(os.environ.get('KESTREL_ALLOWED_EXTENSIONS', ','.join(_default_exts)).lower().split(','))
-ALLOW_ANY_EXTENSION = os.environ.get('KESTREL_ALLOW_ANY_EXTENSION') == '1'
+# Editor-launch allowlists now live in ``api_bridge`` (the only surface that
+# can invoke ``launch()``). This module only serves static files and does not
+# need a copy. See FINDING-07.
 
 _RUNTIME_LOG_HANDLE: Optional[TextIO] = None
 
@@ -174,7 +165,12 @@ def _utc_now_iso() -> str:
 
 
 def _mark_session_start() -> None:
-    """Mark this app session as active and detect unclean prior shutdown."""
+    """Mark this app session as active and detect unclean prior shutdown.
+
+    Also fires the once-per-UTC-day ``/api/open`` telemetry ping used for
+    daily active user counts. Only one ping is sent per install per UTC day;
+    the last send date is persisted in ``last_open_ping_utc``.
+    """
     try:
         settings = load_persisted_settings()
         prev_started = str(settings.get('app_session_started_utc', '') or '').strip()
@@ -184,169 +180,229 @@ def _mark_session_start() -> None:
         settings['app_session_started_utc'] = _utc_now_iso()
         settings['app_session_closed_cleanly'] = False
         settings['app_session_pid'] = int(os.getpid())
+
+        try:
+            today_utc = datetime.utcnow().strftime('%Y-%m-%d')
+            last_ping = str(settings.get('last_open_ping_utc', '') or '').strip()
+            legal_agreed = str(settings.get('legal_agreed_version', '') or '').strip()
+            if (
+                _telemetry is not None
+                and legal_agreed
+                and last_ping != today_utc
+            ):
+                mid = _telemetry.get_machine_id(settings)
+                version = _telemetry._read_version()
+                _telemetry.send_app_open_telemetry(mid, version=version)
+                settings['last_open_ping_utc'] = today_utc
+        except Exception:
+            pass
+
         save_persisted_settings(settings)
     except Exception:
         pass
 
 
 def _mark_session_clean_exit() -> None:
-    """Mark this app session as closed cleanly."""
+    """Mark this session closed cleanly and clear stale unclean-shutdown recovery."""
     try:
         settings = load_persisted_settings()
         settings['app_session_closed_cleanly'] = True
         settings['last_session_closed_utc'] = _utc_now_iso()
+        settings.pop('last_unclean_shutdown_utc', None)
         save_persisted_settings(settings)
     except Exception:
         pass
 
 
 def _apply_legal_upgrade_self_heal(settings: dict, prev_version: str, current_version: str) -> bool:
-    """One-time migration for legacy installs that lost legal consent markers.
+    """One-time migrations for legacy installs that lost legal consent markers.
 
-    Returns True when the migration marker is updated in the settings payload.
+    Two migrations are applied here:
+
+    1. **Consent marker self-heal (2026-03)** — gated by
+       :data:`LEGAL_SELF_HEAL_MIGRATION_KEY`. Runs once on version change when
+       ``legal_agreed_version`` is missing, restoring the marker so the user
+       is not prompted as brand-new.
+
+    2. **Legal-agreed-date backfill** — not gated by the migration flag.
+       Whenever a user has an existing ``legal_agreed_version`` but no
+       ``legal_agreed_date``, backfill the date to ``2026-03-01`` (the
+       effective date of the previous published Terms/Privacy). This ensures
+       existing installs will correctly see the "terms updated" banner the
+       first time ``legal.json`` advertises a newer effective date, without
+       spuriously reprompting users.
+
+    Returns True when anything in the settings payload was mutated.
     """
     if not isinstance(settings, dict):
         return False
-    prev = str(prev_version or '').strip()
-    curr = str(current_version or '').strip()
-    if not prev or not curr or prev == curr:
-        return False
-    if settings.get(LEGAL_SELF_HEAL_MIGRATION_KEY, False):
-        return False
+
+    mutated = False
 
     legal_agreed = str(settings.get('legal_agreed_version', '') or '').strip()
-    if not legal_agreed:
-        settings['legal_agreed_version'] = prev or curr
-        if 'installed_telemetry_sent' not in settings:
-            settings['installed_telemetry_sent'] = True
-        log('[legal] Applied one-time upgrade self-heal for missing consent markers:', prev, '->', curr)
 
-    settings[LEGAL_SELF_HEAL_MIGRATION_KEY] = True
-    return True
+    prev = str(prev_version or '').strip()
+    curr = str(current_version or '').strip()
+    if (
+        prev and curr and prev != curr
+        and not settings.get(LEGAL_SELF_HEAL_MIGRATION_KEY, False)
+    ):
+        if not legal_agreed:
+            settings['legal_agreed_version'] = prev or curr
+            legal_agreed = settings['legal_agreed_version']
+            if 'installed_telemetry_sent' not in settings:
+                settings['installed_telemetry_sent'] = True
+            log('[legal] Applied one-time upgrade self-heal for missing consent markers:', prev, '->', curr)
+        settings[LEGAL_SELF_HEAL_MIGRATION_KEY] = True
+        mutated = True
+
+    if legal_agreed and not str(settings.get('legal_agreed_date', '') or '').strip():
+        settings['legal_agreed_date'] = '2026-03-01'
+        log('[legal] Backfilled legal_agreed_date to 2026-03-01 for existing install.')
+        mutated = True
+
+    return mutated
 
 
-def build_original_path(root: str, rel: str) -> str:
-    if ALLOWED_ROOT:
-        root = ALLOWED_ROOT
-    else:
-        root = _normalize(root) if root else ''
-    rel = _normalize(rel) if rel else ''
-    if not rel or os.path.isabs(rel):
-        return ''
-    base = os.path.join(root, rel) if root else rel
-    return os.path.abspath(base)
+def build_original_path(*_a, **_k):  # pragma: no cover - legacy stub
+    """Deprecated — callers should use ``api_bridge.Api.open_in_editor``.
+
+    Preserved only so any stale import path short-circuits with a clear
+    exception instead of silently resurrecting the legacy HTTP ``/open``
+    semantics. See FINDING-07.
+    """
+    raise RuntimeError('build_original_path has been removed; use the pywebview API.')
 
 
-def _is_within_root(path: str) -> bool:
-    if not path:
+def _safe_under(base: str, candidate: str) -> bool:
+    """Return True iff ``candidate`` resolves to a path under ``base``.
+
+    Used to jail the ``translate_path`` fallbacks against URL-encoded or raw
+    ``..`` traversal segments in frozen builds (FINDING-03).
+    """
+    if not base or not candidate:
         return False
-    if not ALLOWED_ROOT:
-        return True
     try:
-        common = os.path.commonpath([os.path.realpath(path), os.path.realpath(ALLOWED_ROOT)])
-        return common == os.path.realpath(ALLOWED_ROOT)
-    except Exception:
+        base_real = os.path.realpath(base)
+        cand_real = os.path.realpath(candidate)
+    except (OSError, ValueError):
         return False
-
-
-def _extension_allowed(path: str) -> bool:
-    if ALLOW_ANY_EXTENSION:
-        return True
-    _, ext = os.path.splitext(path)
-    return ext.lower() in ALLOWED_EXTENSIONS
+    try:
+        return os.path.commonpath([cand_real, base_real]) == base_real
+    except ValueError:
+        # Different drives on Windows, etc.
+        return False
 
 
 class Handler(SimpleHTTPRequestHandler):
     # Serve from directory of this script (project root) by default.
     def translate_path(self, path: str) -> str:  # type: ignore[override]
         """Resolve file paths robustly across dev, frozen, and installed builds.
-        
-        Checks multiple locations:
-        1. Normal CWD-relative translation (for dev mode)
-        2. analyzer/ subfolder (for files like culling.html)
-        3. _internal/analyzer/ (for PyInstaller frozen install in Program Files)
+
+        Checks multiple locations, each jailed under its respective base with
+        ``_safe_under`` so a crafted request like ``/../../etc/passwd`` cannot
+        escape the bundle. See FINDING-03.
         """
-        # Try the normal translation first
+        # Try the normal translation first — SimpleHTTPRequestHandler already
+        # strips '..' via posixpath.normpath, so this is the trusted resolver.
         resolved = super().translate_path(path)
         if os.path.exists(resolved):
             return resolved
-        
-        # If not found and path doesn't already contain /analyzer, try analyzer/ prefix
+
+        # Fallbacks: try alternate roots, but reject any resolved path that
+        # escapes that root. Each candidate base is computed relative to a
+        # well-known location (CWD + /analyzer, _internal/, _MEIPASS/).
+        cwd = os.getcwd()
         if not path.startswith('/analyzer'):
             alt = super().translate_path('/analyzer' + path)
-            if os.path.exists(alt):
+            if os.path.exists(alt) and _safe_under(cwd, alt):
                 return alt
-        
-        # For frozen builds, also check _internal subdirectories
+
         if getattr(sys, 'frozen', False):
-            # Try <exe_dir>/_internal/analyzer/<file>
             try:
                 exe_dir = os.path.dirname(sys.executable)
                 internal_dir = os.path.join(exe_dir, '_internal')
-                alt_path = path.lstrip('/')
-                alt = os.path.join(internal_dir, alt_path)
-                if os.path.exists(alt):
-                    return alt
-                # If path already has /analyzer, also check _internal/analyzer/<file>
-                if path.startswith('/analyzer'):
-                    alt_path = path[1:]  # Strip leading /
-                    alt = os.path.join(internal_dir, alt_path)
-                    if os.path.exists(alt):
-                        return alt
+                for prefix in ('', '/analyzer'):
+                    rel = path if path.startswith('/analyzer') else (prefix + path)
+                    candidate = os.path.normpath(os.path.join(internal_dir, rel.lstrip('/')))
+                    if os.path.exists(candidate) and _safe_under(internal_dir, candidate):
+                        return candidate
             except Exception:
                 pass
-            
-            # Try _MEIPASS (PyInstaller temp extraction)
+
             meipass = getattr(sys, '_MEIPASS', None)
             if meipass:
-                alt_path = path.lstrip('/')
-                alt = os.path.join(meipass, alt_path)
-                if os.path.exists(alt):
-                    return alt
-        
-        # Return the original resolution (will 404 if file doesn't exist)
+                candidate = os.path.normpath(os.path.join(meipass, path.lstrip('/')))
+                if os.path.exists(candidate) and _safe_under(meipass, candidate):
+                    return candidate
+
         return resolved
 
-    def end_headers(self):  # Inject basic headers (no wildcard CORS; same-origin only)
+    def end_headers(self):
+        """Inject conservative security headers on every response.
+
+        * ``Content-Security-Policy`` — 'self' for all resources plus
+          inline styles (the existing visualizer.html/culling.html rely on
+          ``<style>`` blocks and ``style=""`` attributes). No inline scripts,
+          no remote scripts, no iframes, no form targets outside the app.
+          This is the fix for the RCE half of FINDING-01: even if an attacker
+          lands arbitrary HTML into the DOM, they cannot execute script.
+        * ``X-Content-Type-Options`` — prevent MIME-sniffing.
+        * ``X-Frame-Options`` — the pywebview shell already disallows this,
+          but the server-side header closes the loophole if the user ever
+          opens ``http://127.0.0.1:<port>`` in an external browser.
+        * ``Referrer-Policy`` — never leak the local URL to third parties.
+        """
         self.send_header('Cache-Control', 'no-store')
+        # Note on ``'unsafe-inline'`` for ``script-src``: the existing
+        # ``visualizer.html`` / ``culling.html`` bundle a large inline
+        # ``<script>`` block and at least one inline ``onclick=`` handler.
+        # Moving all of that behind hashes or nonces is a much bigger change
+        # than this security pass. The primary XSS-to-RCE chain (FINDING-01)
+        # is already closed at the DOM level: the ``sceneName`` innerHTML
+        # sink was replaced with ``textContent`` construction, and
+        # ``Api.open_url`` now rejects ``file:``/``javascript:``/UNC URLs.
+        # The CSP below is defense-in-depth — it still blocks remote
+        # script loads, ``eval``-style CSS injection, plugin embeds, and
+        # form submission to third parties.
+        self.send_header(
+            'Content-Security-Policy',
+            "default-src 'self'; "
+            "script-src 'self' 'unsafe-inline'; "
+            "style-src 'self' 'unsafe-inline'; "
+            "img-src 'self' data: blob:; "
+            "media-src 'self' blob:; "
+            # ``blob:`` is required for ``connect-src`` because the clipboard
+            # copy path (``_blobUrlToBlob``) does ``fetch(blobUrl)`` to
+            # re-hydrate an object URL into a Blob for
+            # ``navigator.clipboard.write``. Without it, CSP silently blocks
+            # the fetch and the "Copy full image"/"Copy bird crop" buttons
+            # in the scene preview fail.
+            "connect-src 'self' blob:; "
+            "font-src 'self' data:; "
+            "object-src 'none'; "
+            "frame-ancestors 'none'; "
+            "base-uri 'self'; "
+            "form-action 'self'",
+        )
+        self.send_header('X-Content-Type-Options', 'nosniff')
+        self.send_header('X-Frame-Options', 'DENY')
+        self.send_header('Referrer-Policy', 'no-referrer')
         super().end_headers()
 
     def do_GET(self):  # type: ignore[override]
-        # Legacy bridge config endpoint kept for compatibility (no token export).
+        # bridge_config.js remains for compatibility with any cached front-end
+        # that still fetches it; it no longer exports a token.
         if self.path == '/bridge_config.js':
             body = (
-                f"// bridge_config.js is deprecated in desktop-only mode\n"
-                f"window.__BRIDGE_ORIGIN=window.location.origin;\n"
-            ).encode('utf-8')
+                b"// bridge_config.js is deprecated in desktop-only mode\n"
+                b"window.__BRIDGE_ORIGIN=window.location.origin;\n"
+            )
             self.send_response(200)
             self.send_header('Content-Type', 'application/javascript')
             self.send_header('Cache-Control', 'no-store')
             self.end_headers()
             self.wfile.write(body)
-            return
-        if self.path == '/settings':
-            if not LEGACY_HTTP_API_ENABLED:
-                self._json(410, {'ok': False, 'error': 'Legacy HTTP API disabled; use pywebview API.'})
-                return
-            if not self._check_auth():
-                return
-            self._json(200, {'ok': True, 'settings': load_persisted_settings()})
-            return
-        if self.path == '/queue/status':
-            if not LEGACY_HTTP_API_ENABLED:
-                self._json(410, {'ok': False, 'error': 'Legacy HTTP API disabled; use pywebview API.'})
-                return
-            if not self._check_auth():
-                return
-            self._json(200, _queue_manager.get_status())
-            return
-        if self.path == '/recovery/status':
-            if not LEGACY_HTTP_API_ENABLED:
-                self._json(410, {'ok': False, 'error': 'Legacy HTTP API disabled; use pywebview API.'})
-                return
-            if not self._check_auth():
-                return
-            self.handle_recovery_status()
             return
         if self.path in ('/', '/index.html'):
             # Prefer analyzer/visualizer.html when present (merged layout).
@@ -389,306 +445,25 @@ class Handler(SimpleHTTPRequestHandler):
             self.path = _find_visualizer()
         return super().do_GET()
 
-    def do_OPTIONS(self):  # Minimal preflight (only allow same-origin JS; token still required)
-        if not (LEGACY_HTTP_API_ENABLED or LEGACY_OPEN_ENDPOINT_ENABLED):
-            log('[security] Reject OPTIONS: legacy HTTP API disabled')
-            self.send_response(410)
-            self.end_headers()
-            return
-        origin = self.headers.get('Origin')
-        if origin and origin != f'http://{HOST}:{self.server.server_port}':  # type: ignore[attr-defined]
-            log('[security] Reject OPTIONS: origin mismatch', origin)
-            self.send_response(403); self.end_headers(); return
-        self.send_response(204)
-        self.send_header('Access-Control-Allow-Origin', origin or f'http://{HOST}:{self.server.server_port}')  # type: ignore[attr-defined]
-        self.send_header('Access-Control-Allow-Headers', 'Content-Type,X-Bridge-Token')
-        self.send_header('Access-Control-Allow-Methods', 'POST, OPTIONS')
+    def do_OPTIONS(self):  # type: ignore[override]
+        # The legacy HTTP control API has been removed. Reject preflight so no
+        # third-party page can probe for control routes. See FINDING-07.
+        log('[security] Reject OPTIONS: legacy HTTP API removed')
+        self.send_response(405)
+        self.send_header('Allow', 'GET')
         self.end_headers()
 
     def do_POST(self):  # type: ignore[override]
-        parsed = urlparse(self.path)
-        if parsed.path == '/open':
-            if LEGACY_OPEN_ENDPOINT_ENABLED or LEGACY_HTTP_API_ENABLED:
-                self.handle_open()
-            else:
-                self._json(410, {'ok': False, 'error': 'HTTP /open is disabled; use pywebview open_in_editor API.'})
-        elif parsed.path == '/settings':
-            if not LEGACY_HTTP_API_ENABLED:
-                self._json(410, {'ok': False, 'error': 'Legacy HTTP API disabled; use pywebview API.'})
-                return
-            self.handle_settings()
-        elif parsed.path == '/feedback':
-            if not LEGACY_HTTP_API_ENABLED:
-                self._json(410, {'ok': False, 'error': 'Legacy HTTP API disabled; use pywebview API.'})
-                return
-            self.handle_feedback()
-        elif parsed.path == '/shutdown':
-            if not LEGACY_HTTP_API_ENABLED:
-                self._json(410, {'ok': False, 'error': 'Legacy HTTP API disabled; use pywebview API.'})
-                return
-            self.handle_shutdown()
-        elif parsed.path == '/queue/start':
-            if not LEGACY_HTTP_API_ENABLED:
-                self._json(410, {'ok': False, 'error': 'Legacy HTTP API disabled; use pywebview API.'})
-                return
-            self.handle_queue_start()
-        elif parsed.path in ('/queue/pause', '/queue/resume', '/queue/cancel', '/queue/clear'):
-            if not LEGACY_HTTP_API_ENABLED:
-                self._json(410, {'ok': False, 'error': 'Legacy HTTP API disabled; use pywebview API.'})
-                return
-            self.handle_queue_control(parsed.path)
-        elif parsed.path == '/recovery/restore':
-            if not LEGACY_HTTP_API_ENABLED:
-                self._json(410, {'ok': False, 'error': 'Legacy HTTP API disabled; use pywebview API.'})
-                return
-            self.handle_recovery_restore()
-        elif parsed.path == '/recovery/clear':
-            if not LEGACY_HTTP_API_ENABLED:
-                self._json(410, {'ok': False, 'error': 'Legacy HTTP API disabled; use pywebview API.'})
-                return
-            self.handle_recovery_clear()
-        elif parsed.path == '/recovery/report':
-            if not LEGACY_HTTP_API_ENABLED:
-                self._json(410, {'ok': False, 'error': 'Legacy HTTP API disabled; use pywebview API.'})
-                return
-            self.handle_recovery_report()
-        else:
-            self.send_response(404); self.end_headers(); self.wfile.write(b'{}')
-
-    def _read_json(self):
-        length = int(self.headers.get('Content-Length', 0))
-        if length > MAX_REQUEST_BYTES:
-            raise ValueError('Request too large')
-        raw = self.rfile.read(length) if length else b''
-        if not raw:
-            return {}
-        return json.loads(raw.decode('utf-8'))
-
-    def _json(self, status: int, obj):
-        body = json.dumps(obj).encode('utf-8')
-        self.send_response(status)
+        # No POST routes exist any more — every mutation goes through the
+        # pywebview JS bridge. See FINDING-07.
+        log('[security] Reject POST: legacy HTTP API removed', self.path)
+        self.send_response(410)
         self.send_header('Content-Type', 'application/json')
-        # Only echo same-origin to mitigate unsolicited cross-origin token use
-        self.send_header('Access-Control-Allow-Origin', f'http://{HOST}:{self.server.server_port}')  # type: ignore[attr-defined]
         self.end_headers()
-        self.wfile.write(body)
-
-    def handle_open(self):
-        if not self._check_auth():
-            return
-        try:
-            payload = self._read_json()
-        except Exception as e:
-            self._json(400, {'ok': False, 'error': str(e)}); return
-        log('payload', payload)
-        root = payload.get('root')
-        rel = payload.get('relative')
-        editor = (payload.get('editor') or 'system')
-        if isinstance(editor, str):
-            editor = editor.strip().lower()
-        else:
-            editor = 'system'
-        if editor not in ALLOWED_EDITORS:
-            editor = 'system'
-        target = build_original_path(root, rel)
-        log('open', editor, root, rel, '->', target)
-        if not target:
-            log('[security] Reject /open: invalid path payload', {'root': root, 'relative': rel})
-            self._json(400, {'ok': False, 'error': 'Invalid path'}); return
-        if not _is_within_root(target):
-            log('[security] Reject /open: path escapes allowed root', target)
-            self._json(403, {'ok': False, 'error': 'Path escapes allowed root'}); return
-        if not os.path.exists(target):
-            self._json(404, {
-                'ok': False,
-                'error': 'File not found',
-                'target': target,
-                'hint': 'Ensure Settings -> Local Root points to the folder containing your RAW files.'
-            }); return
-        if not _extension_allowed(target):
-            log('[security] Reject /open: extension not allowed', target)
-            self._json(415, {'ok': False, 'error': 'Extension not allowed', 'target': target, 'allowed': sorted(ALLOWED_EXTENSIONS)}); return
-        try:
-            launch(target, editor)
-            self._json(200, {'ok': True, 'path': target})
-        except Exception as e:
-            self._json(500, {'ok': False, 'error': str(e)})
-
-    def handle_shutdown(self):
-        if not self._check_auth():
-            return
-        log('Received shutdown request from client; scheduling server shutdown.')
-        # Respond first, then shutdown asynchronously so reply is delivered
-        self._json(200, {'ok': True, 'message': 'Shutting down'})
-        def _shutdown():
-            try:
-                # slight delay to let response flush
-                import time; time.sleep(0.25)
-                self.server.shutdown()
-            except Exception as e:  # noqa: BLE001
-                log('Error during shutdown:', e)
-        threading.Thread(target=_shutdown, daemon=True).start()
-
-    def handle_settings(self):
-        if not self._check_auth():
-            return
-        try:
-            payload = self._read_json()
-            settings = payload.get('settings') if isinstance(payload, dict) else None
-            if not isinstance(settings, dict):
-                raise ValueError('Invalid settings payload')
-            save_persisted_settings(settings)
-            self._json(200, {'ok': True})
-        except Exception as e:
-            self._json(400, {'ok': False, 'error': str(e)})
-
-    def _check_origin(self) -> bool:
-        origin = self.headers.get('Origin')
-        expected_origin = f'http://{HOST}:{self.server.server_port}'  # type: ignore[attr-defined]
-        # Best-effort origin check: browsers send Origin on CORS/XHR/fetch.
-        # We allow missing Origin for compatibility with some local clients.
-        if origin and origin != expected_origin:
-            log('[security] Reject request: origin mismatch', {'origin': origin, 'expected': expected_origin, 'path': self.path})
-            self._json(403, {'ok': False, 'error': 'Origin mismatch'})
-            return False
-        return True
-
-    def _check_auth(self) -> bool:
-        """Return True if token and origin checks pass for API routes."""
-        if AUTH_TOKEN:
-            token = self.headers.get('X-Bridge-Token') or ''
-            if token != AUTH_TOKEN:
-                log('[security] Reject request: auth token mismatch', {'path': self.path, 'origin': self.headers.get('Origin')})
-                self._json(401, {'ok': False, 'error': 'Unauthorized'})
-                return False
-        return self._check_origin()
-
-    def handle_feedback(self):
-        """Accept feedback/bug report submissions (browser-mode fallback)."""
-        if not self._check_auth():
-            return
-        try:
-            payload = self._read_json()
-            if not isinstance(payload, dict):
-                self._json(400, {'ok': False, 'error': 'Invalid payload'}); return
-            if _telemetry is None:
-                self._json(200, {'ok': True, 'note': 'Telemetry unavailable'}); return
-            settings = load_persisted_settings()
-            machine_id = _telemetry.get_machine_id(settings)
-            log_tail = ''
-            if payload.get('include_logs', False):
-                active_folder = str(settings.get('active_analysis_path', '') or '').strip()
-                log_tail = _telemetry.get_recent_log_tail(folder=active_folder or None, runtime_log_files=3)
-            _telemetry.send_feedback(
-                report_type=payload.get('type', 'general'),
-                description=payload.get('description', ''),
-                contact=payload.get('contact', ''),
-                screenshot_b64=payload.get('screenshot_b64', ''),
-                log_tail=log_tail,
-                machine_id=machine_id,
-                version=_telemetry._read_version(),
-            )
-            self._json(200, {'ok': True})
-        except Exception as e:
-            self._json(400, {'ok': False, 'error': str(e)})
-
-    def handle_queue_start(self):
-        if not self._check_auth():
-            return
-        try:
-            payload = self._read_json()
-            paths = payload.get('paths', []) if isinstance(payload, dict) else []
-            use_gpu = bool(payload.get('use_gpu', True)) if isinstance(payload, dict) else True
-            if not isinstance(paths, list):
-                self._json(400, {'ok': False, 'error': '"paths" must be a list'}); return
-            result = _queue_manager.enqueue(paths, use_gpu=use_gpu)
-            self._json(200, {'ok': result['success'], **result})
-        except Exception as e:
-            self._json(400, {'ok': False, 'error': str(e)})
-
-    def handle_queue_control(self, path: str):
-        if not self._check_auth():
-            return
-        if path == '/queue/pause':
-            self._json(200, {'ok': True, **_queue_manager.pause()})
-        elif path == '/queue/resume':
-            self._json(200, {'ok': True, **_queue_manager.resume()})
-        elif path == '/queue/cancel':
-            self._json(200, {'ok': True, **_queue_manager.cancel()})
-        elif path == '/queue/clear':
-            self._json(200, {'ok': True, **_queue_manager.clear_done()})
-        else:
-            self._json(404, {'ok': False, 'error': 'Not found'})
-
-    def handle_recovery_status(self):
-        try:
-            settings = load_persisted_settings()
-            queue_state = _queue_manager.get_persisted_recovery_state()
-            unclean_utc = str(settings.get('last_unclean_shutdown_utc', '') or '').strip()
-            self._json(
-                200,
-                {
-                    'ok': True,
-                    'success': True,
-                    'unclean_shutdown': bool(unclean_utc),
-                    'unclean_shutdown_utc': unclean_utc,
-                    'queue_recovery': queue_state,
-                },
-            )
-        except Exception as e:
-            self._json(400, {'ok': False, 'success': False, 'error': str(e)})
-
-    def handle_recovery_restore(self):
-        if not self._check_auth():
-            return
-        try:
-            result = _queue_manager.restore_from_persisted_state()
-            self._json(200, {'ok': bool(result.get('success')), **result})
-        except Exception as e:
-            self._json(400, {'ok': False, 'success': False, 'error': str(e)})
-
-    def handle_recovery_clear(self):
-        if not self._check_auth():
-            return
-        try:
-            payload = self._read_json()
-            clear_queue_state = True
-            if isinstance(payload, dict):
-                clear_queue_state = bool(payload.get('clear_queue_state', True))
-            settings = load_persisted_settings()
-            settings.pop('last_unclean_shutdown_utc', None)
-            if clear_queue_state:
-                settings.pop('queue_recovery_state', None)
-            save_persisted_settings(settings)
-            self._json(200, {'ok': True, 'success': True})
-        except Exception as e:
-            self._json(400, {'ok': False, 'success': False, 'error': str(e)})
-
-    def handle_recovery_report(self):
-        if not self._check_auth():
-            return
-        try:
-            if _telemetry is None:
-                self._json(200, {'ok': False, 'success': False, 'error': 'Telemetry unavailable'})
-                return
-            settings = load_persisted_settings()
-            machine_id = _telemetry.get_machine_id(settings)
-            active_folder = str(settings.get('active_analysis_path', '') or '').strip()
-            log_tail = _telemetry.get_recent_log_tail(folder=active_folder or None, runtime_log_files=3)
-            _telemetry.send_crash_report(
-                exc=None,
-                tb_str='Recovered unclean shutdown report requested by user.',
-                log_tail=log_tail,
-                session_analytics={
-                    'recovery_report': True,
-                    'active_analysis_path': active_folder,
-                },
-                machine_id=machine_id,
-                version=_telemetry._read_version(),
-            )
-            self._json(200, {'ok': True, 'success': True})
-        except Exception as e:
-            self._json(400, {'ok': False, 'success': False, 'error': str(e)})
+        self.wfile.write(
+            b'{"ok":false,"error":"Legacy HTTP API has been removed; '
+            b'use the pywebview JS bridge instead."}'
+        )
 
 
 def parse_args():
@@ -704,7 +479,7 @@ def main():
     if runtime_log_path:
         log('Runtime log capture enabled:', runtime_log_path)
     log('Security policy:', SECURITY_POLICY_VERSION, API_AUTH_POLICY, 'browser_mode_supported=', BROWSER_ONLY_MODE_SUPPORTED)
-    log('Legacy HTTP control API enabled =', LEGACY_HTTP_API_ENABLED, '| legacy /open enabled =', LEGACY_OPEN_ENDPOINT_ENABLED)
+    log('Legacy HTTP control API: removed (desktop-only). env-var escape hatches are no longer honoured.')
     _mark_session_start()
 
     # ── Crash hardening ───────────────────────────────────────────────────────
@@ -763,10 +538,7 @@ def main():
         os.chdir(os.path.join(os.path.dirname(os.path.abspath(__file__)), '..') or '.')
     server = ThreadingHTTPServer((HOST, args.port), Handler)
     log(f'Serving visualizer at http://{HOST}:{args.port}/  (Press Ctrl+C to stop)')
-    if LEGACY_HTTP_API_ENABLED or LEGACY_OPEN_ENDPOINT_ENABLED:
-        log('HTTP bridge token initialized for legacy endpoint compatibility.')
-    else:
-        log('Legacy HTTP control endpoints are disabled by default.')
+    log('HTTP surface: static-file GET only. Control routes permanently removed.')
 
     # ── Settings init: ensure machine_id and version are persisted ──
     try:
@@ -777,8 +549,8 @@ def main():
             _telemetry.get_machine_id(_init_settings)
             _init_settings['version'] = _current_version
             _init_settings.setdefault('raw_preview_cache_enabled', True)
-            _init_settings.setdefault('exposure_compensation_profile', 'aggressive')
-            _init_settings.setdefault('exposure_compensation_solver', 'metered_refine_one_pass')
+            _init_settings.setdefault('exposure_quality', 'balanced')
+            _init_settings.setdefault('exposure_corrected_thumbs', True)
             _init_settings.setdefault('auto_save_enabled', True)
 
             _apply_legal_upgrade_self_heal(_init_settings, _prev_version, _current_version)
@@ -824,6 +596,22 @@ def main():
                 except Exception as e:
                     log('Cache cleanup on close failed:', e)
 
+            def _cancel_analysis_wait_for_worker_and_telemetry():
+                """Cancel queue, wait for worker (sends completion telemetry), then allow HTTP to finish."""
+                try:
+                    _queue_manager.cancel()
+                except Exception:
+                    pass
+                try:
+                    _queue_manager.join_worker(timeout=120.0)
+                except Exception:
+                    pass
+                try:
+                    # Mirror top-level crash handler: async telemetry uses daemon threads.
+                    time.sleep(2)
+                except Exception:
+                    pass
+
             # When an analysis is running or paused, prompt the user with
             # options to Minimize, Exit (cancel) or Cancel the close.
             if _queue_manager.is_running or _queue_manager.is_paused:
@@ -844,10 +632,7 @@ def main():
                         # IDNO=7  -> Minimize instead of closing
                         # IDCANCEL=2 -> Do not close
                         if resp == 6:
-                            try:
-                                _queue_manager.cancel()
-                            except Exception:
-                                pass
+                            _cancel_analysis_wait_for_worker_and_telemetry()
                             _cleanup_preview_cache_before_exit()
                             return True
                         if resp == 7:
@@ -871,10 +656,7 @@ def main():
                         root.destroy()
                         # askyesnocancel returns True=Yes, False=No, None=Cancel
                         if res is True:
-                            try:
-                                _queue_manager.cancel()
-                            except Exception:
-                                pass
+                            _cancel_analysis_wait_for_worker_and_telemetry()
                             _cleanup_preview_cache_before_exit()
                             return True
                         if res is False:

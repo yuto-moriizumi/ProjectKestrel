@@ -342,9 +342,44 @@ def ensure_columns(database: pd.DataFrame) -> pd.DataFrame:
     return database
 
 
+# Columns the UI writes to the CSV that the pipeline should preserve.
+# These are NOT in BASE_COLUMNS but may be added by the UI's saveCsv().
+_UI_PRESERVE_COLUMNS = ["culled", "culled_origin"]
+
+
 def save_database(database: pd.DataFrame, db_path: str) -> None:
-    """Save database to CSV, stripping any legacy user columns if accidentally present."""
+    """Save database to CSV, preserving UI-written columns from disk.
+
+    The analysis pipeline only writes BASE_COLUMNS. The UI may have saved
+    user-editable columns (culled, culled_origin) to the same CSV between
+    pipeline saves. This function reads those columns from the existing CSV
+    and merges them back into the pipeline's DataFrame before writing, so
+    user decisions made during analysis are not lost.
+
+    Legacy user columns (rating, scene_name, etc.) are stripped — those now
+    live in kestrel_scenedata.json.
+    """
     cols_to_drop = [c for c in LEGACY_USER_COLUMNS if c in database.columns]
     if cols_to_drop:
         database = database.drop(columns=cols_to_drop)
+
+    # Preserve UI-written columns from the existing CSV on disk
+    if os.path.exists(db_path):
+        try:
+            # Only read the columns we need to preserve (+ filename for joining)
+            cols_to_read = ["filename"] + [
+                c for c in _UI_PRESERVE_COLUMNS
+            ]
+            disk_df = pd.read_csv(db_path, usecols=lambda c: c in cols_to_read)
+            if not disk_df.empty and "filename" in disk_df.columns:
+                for col in _UI_PRESERVE_COLUMNS:
+                    if col in disk_df.columns and col not in database.columns:
+                        # Build a filename→value map from disk
+                        col_map = dict(
+                            zip(disk_df["filename"].astype(str), disk_df[col])
+                        )
+                        database[col] = database["filename"].astype(str).map(col_map)
+        except Exception:
+            pass  # If we can't read the existing CSV, just write what we have
+
     database.to_csv(db_path, index=False)

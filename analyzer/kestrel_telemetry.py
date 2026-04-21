@@ -52,7 +52,12 @@ _MAX_RUNTIME_LOG_TOTAL_CHARS = 60_000
 # ---------------------------------------------------------------------------
 
 def _read_version() -> str:
-    """Read the version string from VERSION.txt (failsafe)."""
+    """Read the version string from VERSION.txt (failsafe).
+
+    Supports two formats:
+      - Labelled:   'version: Kentucky Warbler'  (preferred)
+      - Plain-text: 'Kentucky Warbler'            (single non-empty line)
+    """
     try:
         # Check relative to this file, then one level up (repo root)
         for candidate in [
@@ -61,9 +66,14 @@ def _read_version() -> str:
         ]:
             if os.path.isfile(candidate):
                 with open(candidate, 'r', encoding='utf-8') as f:
-                    for line in f:
-                        if line.strip().lower().startswith('version:'):
-                            return line.strip().split(':', 1)[1].strip()
+                    lines = [l.strip() for l in f if l.strip()]
+                # Preferred: explicit 'version:' label on any line
+                for line in lines:
+                    if line.lower().startswith('version:'):
+                        return line.split(':', 1)[1].strip()
+                # Fallback: plain single-line file (e.g. 'Kentucky Warbler')
+                if len(lines) == 1:
+                    return lines[0]
         return 'unknown'
     except Exception:
         return 'unknown'
@@ -261,6 +271,24 @@ def send_installation_telemetry(machine_id: str, version: str = '') -> None:
             'platform': platform.platform(),
         }
         _post_json_async('/api/install', payload)
+    except Exception:
+        pass
+
+
+def send_app_open_telemetry(machine_id: str, version: str = '') -> None:
+    """Send a lightweight ping when the app launches (failsafe).
+
+    Used for daily active user counts. The caller is responsible for rate
+    limiting (typically once per UTC day) by inspecting ``last_open_ping_utc``
+    in the persisted settings.
+    """
+    try:
+        payload = {
+            'machine_id': machine_id,
+            'version': version or _read_version(),
+            'os': _get_os_info(),
+        }
+        _post_json_async('/api/open', payload)
     except Exception:
         pass
 

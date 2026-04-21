@@ -9,6 +9,7 @@ from PyInstaller.utils.hooks import collect_all
 # See if sample_sets exists
 print(os.listdir("sample_sets"))
 # Build datas list with proper sample_sets bundling using Tree()
+# models/ includes bundled SpeciesNet (models/speciesnet/info.json + weights) and SAM-HQ checkpoints.
 datas = [('models', 'models'), ('kestrel_telemetry.py', '.'), ('folder_inspector.py', '.'), ('cli.py', '.'), ('VERSION.txt', '.'), ('kestrel_analyzer', 'kestrel_analyzer'), ('visualizer.html', '.'), ('visualizer.css', '.'), ('visualizer.js', '.'), ('csv_parser.js', '.'), ('culling.html', '.'), ('logo.png', '.'), ('logo.ico', '.'), ('settings_utils.py', '.'), ('editor_launch.py', '.'), ('queue_manager.py', '.'), ('api_bridge.py', '.')]
 
 # Add sample_sets using Tree() - convert 3-element tuples to 2-element format for datas
@@ -16,9 +17,7 @@ sample_sets_tree = Tree('sample_sets', prefix='sample_sets')
 datas += [(item[0], item[1]) for item in sample_sets_tree]  # Only use first 2 elements of each tuple
 binaries = []
 hiddenimports = ['pywebview', 'certifi','PIL','exifread','settings_utils','editor_launch','queue_manager','api_bridge']
-binaries += collect_dynamic_libs('torch')
 binaries += collect_dynamic_libs('onnxruntime')
-binaries += collect_dynamic_libs('tensorflow')
 tmp_ret = collect_all('msvc-runtime')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
 

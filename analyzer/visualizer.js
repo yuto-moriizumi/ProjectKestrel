@@ -1076,25 +1076,40 @@
       return sd.scenes[sceneCount];
     }
 
+    // Labels that the pipeline emits as placeholders for "no usable
+    // classification" — these should never become user-visible scene tags.
+    // 'Unknown' is what SpeciesNet returns for "no cv result" routed wildlife
+    // detections; 'N/A' is used for non-bird placeholder rows; 'No Bird'
+    // is the explicit absence label.
+    const _PLACEHOLDER_SPECIES_LABELS = new Set(['No Bird', 'Unknown', 'N/A']);
+    const _PLACEHOLDER_FAMILY_LABELS = new Set(['Unknown', 'N/A']);
+
+    function _isMeaningfulSpeciesLabel(name) {
+      return !!name && !_PLACEHOLDER_SPECIES_LABELS.has(name);
+    }
+    function _isMeaningfulFamilyLabel(name) {
+      return !!name && !_PLACEHOLDER_FAMILY_LABELS.has(name);
+    }
+
     function _computeSceneTagsFromRows(sceneRows, confThreshold, includeSecondary, includeFamilies = true) {
       const speciesSet = new Set();
       const familySet = new Set();
       for (const r of sceneRows) {
         const conf = parseNumber(r.species_confidence);
-        if (conf >= confThreshold && r.species && r.species !== 'No Bird') speciesSet.add(r.species);
+        if (conf >= confThreshold && _isMeaningfulSpeciesLabel(r.species)) speciesSet.add(r.species);
         if (includeFamilies) {
           const fconf = parseNumber(r.family_confidence);
-          if (fconf >= confThreshold && r.family && r.family !== 'Unknown' && r.family !== 'N/A') familySet.add(r.family);
+          if (fconf >= confThreshold && _isMeaningfulFamilyLabel(r.family)) familySet.add(r.family);
         }
         if (includeSecondary) {
           const secondary = parseSecondarySpecies(r);
           for (const { name, score } of secondary) {
-            if (score >= confThreshold && name && name !== 'No Bird') speciesSet.add(name);
+            if (score >= confThreshold && _isMeaningfulSpeciesLabel(name)) speciesSet.add(name);
           }
           if (includeFamilies) {
             const secFams = parseSecondaryFamilies(r);
             for (const { name, score } of secFams) {
-              if (score >= confThreshold && name && name !== 'Unknown' && name !== 'N/A') familySet.add(name);
+              if (score >= confThreshold && _isMeaningfulFamilyLabel(name)) familySet.add(name);
             }
           }
         }
@@ -1340,6 +1355,11 @@
       const onlyReviewedScenes = !!document.getElementById('filterScenesManualRated')?.checked;
       const groupByFolder = document.getElementById('groupByFolder')?.checked ?? getSetting('groupByFolder', true);
       const groupByTime = document.getElementById('groupByTime')?.checked ?? getSetting('groupByTime', true);
+      const showBirdThumbs = document.getElementById('showBirdThumbs')?.checked ?? getSetting('showBirdThumbs', false);
+      // Widen each card's grid track when bird-crop thumbs are shown, so the
+      // main thumb keeps its "no-crop" height and the crop slots into the
+      // extra width rather than stealing height from the main image.
+      sceneGrid.classList.toggle('grid--bird-thumbs', !!showBirdThumbs);
       const includeSecondaryCheckbox = document.getElementById('includeSecondarySpecies');
       const includeSecondary = includeSecondaryCheckbox ? includeSecondaryCheckbox.checked : !!getSetting('includeSecondarySpecies', false);
       const includeFamilies = true;
@@ -1361,6 +1381,16 @@
       const visibleScenes = onlyReviewedScenes ? scenes.filter(isManuallyReviewedScene) : scenes;
 
       updateStatusBar(visibleScenes);
+
+      // Prevent flash-of-empty-content: lock the grid's current height as a
+      // minimum so the page layout doesn't collapse while we rebuild the DOM,
+      // and save the scroll position of the main container for restoration.
+      const mainEl = document.querySelector('main');
+      const savedScrollTop = mainEl ? mainEl.scrollTop : 0;
+      const currentHeight = sceneGrid.offsetHeight;
+      if (currentHeight > 0) {
+        sceneGrid.style.minHeight = currentHeight + 'px';
+      }
       sceneGrid.innerHTML = '';
 
       // Show welcome panel when no data is loaded; hide it once a folder is open
@@ -1370,46 +1400,108 @@
       // Flat index for shift-click range selection
       _visibleSceneOrder = visibleScenes.map(s => String(s.id));
 
-      // ---- Two-level grouping: folder → time-buckets ----
-      function getTimeBucket(s) {
-        const ct = s.representative?.capture_time;
-        if (!ct) return '';
+      // ---- Two-level grouping: folder → adaptive time clusters ----
+      //
+      // The timeline previously used a fixed 1-hour grid (YYYY-MM-DDTHH) which
+      // both over-segmented long sessions (e.g. 55 minutes → 2 nodes straddling
+      // the hour boundary) and under-segmented bursty ones (50 shots in 3
+      // minutes became a single node identical to 1 shot in 30 minutes).
+      // We now cluster by actual gaps between successive scenes so a "session"
+      // of continuous shooting is one node, and a quiet pause cuts a new node
+      // regardless of clock alignment.
+      //
+      // The gap threshold is derived from the folder itself: we take the
+      // median inter-scene gap and multiply by a constant so anything notably
+      // quieter than the folder's typical rhythm starts a new cluster. This
+      // keeps dense burst folders (gap of ~1s → ~10s threshold) and casual
+      // days (gap of ~30s → ~5min threshold) from needing different settings.
+      // Hard floor/ceiling keep pathological data (single-scene folders,
+      // multi-week bundles) from producing absurd thresholds.
+      const CLUSTER_GAP_MIN_MS = 45 * 1000;       // 45 s — never split bursts
+      const CLUSTER_GAP_MAX_MS = 10 * 60 * 1000;  // 10 min — never merge sessions
+      const CLUSTER_GAP_FALLBACK_MS = 3 * 60 * 1000; // fallback if we can't infer
+      const CLUSTER_GAP_MULTIPLIER = 10;
+
+      function computeDynamicClusterGapMs(scenes) {
+        const times = [];
+        for (const s of scenes) {
+          if (Number.isFinite(s.captureTimeMs)) times.push(s.captureTimeMs);
+        }
+        if (times.length < 3) return CLUSTER_GAP_FALLBACK_MS;
+        times.sort((a, b) => a - b);
+        const gaps = [];
+        for (let i = 1; i < times.length; i++) {
+          const g = times[i] - times[i - 1];
+          if (g > 0) gaps.push(g);
+        }
+        if (!gaps.length) return CLUSTER_GAP_FALLBACK_MS;
+        gaps.sort((a, b) => a - b);
+        const median = gaps[Math.floor(gaps.length / 2)];
+        const threshold = median * CLUSTER_GAP_MULTIPLIER;
+        return Math.max(CLUSTER_GAP_MIN_MS, Math.min(CLUSTER_GAP_MAX_MS, threshold));
+      }
+
+      function _pad2(n) { return String(n).padStart(2, '0'); }
+      function _dayKeyFromMs(ms) {
+        if (!Number.isFinite(ms)) return '';
+        const d = new Date(ms);
+        if (isNaN(d)) return '';
+        return `${d.getFullYear()}-${_pad2(d.getMonth()+1)}-${_pad2(d.getDate())}`;
+      }
+      function formatClusterTime(ms) {
+        if (!Number.isFinite(ms)) return '';
         try {
-          const d = new Date(ct);
-          if (isNaN(d)) return '';
-          const pad = n => String(n).padStart(2, '0');
-          return `${d.getFullYear()}-${pad(d.getMonth()+1)}-${pad(d.getDate())}T${pad(d.getHours())}`;
+          return new Date(ms).toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
         } catch (_) { return ''; }
       }
-      function getBucketDay(bucket) { return bucket ? bucket.split('T')[0] : ''; }
-      function formatNodeTime(bucket) {
-        if (!bucket) return 'Unknown time';
+      function formatClusterDay(ms) {
+        if (!Number.isFinite(ms)) return '';
         try {
-          const d = new Date(bucket + ':00');
-          if (isNaN(d)) return bucket;
-          return d.toLocaleTimeString(undefined, { hour: 'numeric', minute: '2-digit' });
-        } catch (_) { return bucket; }
-      }
-      function formatNodeDay(bucket) {
-        if (!bucket) return '';
-        try {
-          const d = new Date(bucket + ':00');
-          if (isNaN(d)) return '';
-          return d.toLocaleDateString(undefined, { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
+          return new Date(ms).toLocaleDateString(undefined, { weekday: 'long', year: 'numeric', month: 'long', day: 'numeric' });
         } catch (_) { return ''; }
       }
 
-      // Build folderMap: folderKey → { folderPath, buckets: Map<tb, scene[]>, bucketOrder: [] }
+      // Walk scenes in ascending time order, cutting a new cluster each time
+      // the gap between the last scene's time and the next exceeds the
+      // threshold. Scenes lacking capture time are dropped into a final
+      // "untimed" cluster so they remain visible but don't distort ranges.
+      function buildTimeClusters(scenes, gapMs) {
+        const timed = [];
+        const untimed = [];
+        for (const s of scenes) {
+          if (Number.isFinite(s.captureTimeMs)) timed.push(s);
+          else untimed.push(s);
+        }
+        timed.sort((a, b) => a.captureTimeMs - b.captureTimeMs);
+        const clusters = [];
+        for (const s of timed) {
+          const last = clusters[clusters.length - 1];
+          if (!last || s.captureTimeMs - last.endMs > gapMs) {
+            clusters.push({
+              scenes: [s],
+              startMs: s.captureTimeMs,
+              endMs: s.captureTimeMs,
+              untimed: false,
+            });
+          } else {
+            last.scenes.push(s);
+            if (s.captureTimeMs > last.endMs) last.endMs = s.captureTimeMs;
+          }
+        }
+        if (untimed.length) {
+          clusters.push({ scenes: untimed, startMs: null, endMs: null, untimed: true });
+        }
+        return clusters;
+      }
+
+      // Build folderMap: folderKey → { folderPath, scenes: [ordered scene list] }
       const folderOrder = [];
       const folderMap = new Map();
       for (const s of visibleScenes) {
         const rp = groupByFolder ? (s.representative?.__rootPath || '') : '';
         const fk = rp || '__single__';
-        if (!folderMap.has(fk)) { folderMap.set(fk, { folderPath: rp, buckets: new Map(), bucketOrder: [] }); folderOrder.push(fk); }
-        const fd = folderMap.get(fk);
-        const tb = groupByTime ? (getTimeBucket(s) || '__notime__') : '__all__';
-        if (!fd.buckets.has(tb)) { fd.buckets.set(tb, []); fd.bucketOrder.push(tb); }
-        fd.buckets.get(tb).push(s);
+        if (!folderMap.has(fk)) { folderMap.set(fk, { folderPath: rp, scenes: [] }); folderOrder.push(fk); }
+        folderMap.get(fk).scenes.push(s);
       }
       const showFolderHeaders = groupByFolder;
 
@@ -1423,12 +1515,30 @@
         th.className = 'thumb';
         const img = document.createElement('img');
         img.alt = s.representative?.filename || '';
+        applyThumbnailExposureToImg(img, s.representative);
         lazyLoadImg(img, () => getBlobUrlForPath(
           s.representative?.export_path || s.representative?.crop_path,
           s.representative?.__rootPath
         ));
         th.appendChild(img);
-        card.appendChild(th);
+        if (showBirdThumbs && s.representative?.crop_path && s.representative?.export_path) {
+          const row = document.createElement('div');
+          row.className = 'thumb-row';
+          const cropWrap = document.createElement('div');
+          cropWrap.className = 'thumb-bird-crop';
+          const cropImg = document.createElement('img');
+          cropImg.alt = 'Bird crop';
+          lazyLoadImg(cropImg, () => getBlobUrlForPath(
+            s.representative.crop_path,
+            s.representative.__rootPath
+          ));
+          cropWrap.appendChild(cropImg);
+          row.appendChild(th);
+          row.appendChild(cropWrap);
+          card.appendChild(row);
+        } else {
+          card.appendChild(th);
+        }
 
         const body = document.createElement('div');
         body.className = 'body';
@@ -1436,12 +1546,32 @@
         title.className = 'title';
         const _localNum = String(s.id).split(':').pop();
         const _folderName = folderBaseName(s.representative?.__rootPath || '');
-        // Show folder name in title only when a single folder is loaded;
-        // in multi-folder mode the folder group header already shows it.
-        const _titleHtml = (_folderName && !showFolderHeaders)
-          ? `<i class="folder-name">${escapeHtml(_folderName)}</i><span class="title-sep"> / </span><b>#${_localNum}</b>`
-          : `<b>#${_localNum}</b>`;
-        title.innerHTML = _titleHtml + (s.sceneName ? ` <span class="name">\u2014 ${decodeEntities(escapeHtml(s.sceneName))}</span>` : '');
+        // Build the title entirely from text nodes / trusted elements — never
+        // assign to innerHTML with any user-controlled substring. The previous
+        // decodeEntities(escapeHtml(...)) pattern round-tripped the escaped
+        // string back to its raw form, which allowed a crafted scene name
+        // (e.g. from a poisoned kestrel_scenedata.json) to inject a DOM-XSS
+        // and, via the pywebview bridge, escalate to RCE. See FINDING-01.
+        if (_folderName && !showFolderHeaders) {
+          const folderEl = document.createElement('i');
+          folderEl.className = 'folder-name';
+          folderEl.textContent = _folderName;
+          title.appendChild(folderEl);
+          const sep = document.createElement('span');
+          sep.className = 'title-sep';
+          sep.textContent = ' / ';
+          title.appendChild(sep);
+        }
+        const idBold = document.createElement('b');
+        idBold.textContent = `#${_localNum}`;
+        title.appendChild(idBold);
+        if (s.sceneName) {
+          title.appendChild(document.createTextNode(' \u2014 '));
+          const nameSpan = document.createElement('span');
+          nameSpan.className = 'name';
+          nameSpan.textContent = String(s.sceneName);
+          title.appendChild(nameSpan);
+        }
         title.title = (s.representative?.__rootPath || String(s.id)) + (s.sceneName ? ` \u2014 ${s.sceneName}` : '');
         const meta = document.createElement('div');
         // Use a dedicated class for title-level badges so other .meta uses are unaffected
@@ -1501,57 +1631,109 @@
       const batch = 24;
 
       // ---- Timeline builder (used when groupByTime is on) ----
+      //
+      // Each cluster renders as a timeline node with:
+      //   • rail dot (sized by image count) + connecting line
+      //   • a header showing the time range, scene count, and image count
+      //   • a grid of scene cards
+      //
+      // The rail dot scales with the cluster's image count so a quick scroll
+      // down the left edge makes shooting bursts immediately visible — bigger
+      // dot = denser cluster. Sizing uses sqrt so a 200-shot burst isn't 10×
+      // the size of a 20-shot one.
+      const _DOT_MIN_PX = 8;
+      const _DOT_MAX_PX = 26;
+
+      function _clusterImageCount(cluster) {
+        let n = 0;
+        for (const s of cluster.scenes) n += s.imageCount || 0;
+        return n;
+      }
+
+      function _dotSizePx(imageCount, maxInFolder) {
+        if (!Number.isFinite(imageCount) || imageCount <= 0) return _DOT_MIN_PX;
+        if (!Number.isFinite(maxInFolder) || maxInFolder <= 1) return _DOT_MIN_PX + 3;
+        const frac = Math.sqrt(imageCount) / Math.sqrt(maxInFolder);
+        return Math.round(_DOT_MIN_PX + frac * (_DOT_MAX_PX - _DOT_MIN_PX));
+      }
+
       function buildTimeline(fd, containerEl) {
         const timelineEl = document.createElement('div');
         timelineEl.className = 'timeline-body';
+        const gapMs = computeDynamicClusterGapMs(fd.scenes);
+        const clusters = buildTimeClusters(fd.scenes, gapMs);
         let prevDay = null;
-        const allBuckets = fd.bucketOrder;
 
-        for (let ni = 0; ni < allBuckets.length; ni++) {
-          const tb = allBuckets[ni];
-          const tbScenes = fd.buckets.get(tb);
-          const isLast = ni === allBuckets.length - 1;
-          const thisDay = getBucketDay(tb);
+        // Pre-compute the max image count across all clusters so dot sizes
+        // are proportional within this folder (different folders can have
+        // wildly different scales and shouldn't compete on the same axis).
+        let maxImgCountInFolder = 1;
+        for (const c of clusters) {
+          const n = _clusterImageCount(c);
+          if (n > maxImgCountInFolder) maxImgCountInFolder = n;
+        }
 
-          // Day banner when the calendar date changes between buckets
-          if (thisDay && thisDay !== '__notime__' && thisDay !== prevDay) {
+        for (let ni = 0; ni < clusters.length; ni++) {
+          const cluster = clusters[ni];
+          const isLast = ni === clusters.length - 1;
+          const thisDay = cluster.untimed ? '' : _dayKeyFromMs(cluster.startMs);
+
+          // Day banner when the calendar date changes between clusters
+          if (thisDay && thisDay !== prevDay) {
             const banner = document.createElement('div');
             banner.className = 'timeline-day-banner';
-            banner.textContent = formatNodeDay(tb);
+            banner.textContent = formatClusterDay(cluster.startMs);
             timelineEl.appendChild(banner);
             prevDay = thisDay;
           }
 
           const nodeEl = document.createElement('div');
-          nodeEl.className = 'timeline-node';
+          nodeEl.className = 'timeline-node' + (cluster.untimed ? ' timeline-node-untimed' : '');
 
-          // Rail column: dot + connecting line
+          // Rail column: dot (sized by image count) + connecting line
           const railCol = document.createElement('div');
           railCol.className = 'timeline-rail-col';
           const dot = document.createElement('div');
           dot.className = 'timeline-dot';
+          const imgCount = _clusterImageCount(cluster);
+          const dotSize = _dotSizePx(imgCount, maxImgCountInFolder);
+          dot.style.width = dotSize + 'px';
+          dot.style.height = dotSize + 'px';
+          // Title gives a fallback tooltip for folks who want the raw number.
+          dot.title = `${cluster.scenes.length} scene${cluster.scenes.length === 1 ? '' : 's'} · ${imgCount} image${imgCount === 1 ? '' : 's'}`;
           const line = document.createElement('div');
           line.className = 'timeline-line' + (isLast ? ' last' : '');
           railCol.appendChild(dot);
           railCol.appendChild(line);
 
-          // Content column: time label + scene cards
+          // Content column: header + grid
           const contentCol = document.createElement('div');
           contentCol.className = 'timeline-content-col';
 
-          if (tb !== '__all__') {
-            const hdr = document.createElement('div');
-            hdr.className = 'timeline-node-header';
-            const timeSpan = document.createElement('span');
-            timeSpan.className = 'timeline-node-time';
-            timeSpan.textContent = tb === '__notime__' ? 'Unknown time' : formatNodeTime(tb);
-            const countSpan = document.createElement('span');
-            countSpan.className = 'timeline-node-count muted';
-            countSpan.textContent = `${tbScenes.length} scene${tbScenes.length === 1 ? '' : 's'}`;
-            hdr.appendChild(timeSpan);
-            hdr.appendChild(countSpan);
-            contentCol.appendChild(hdr);
+          const hdr = document.createElement('div');
+          hdr.className = 'timeline-node-header';
+
+          const timeSpan = document.createElement('span');
+          timeSpan.className = 'timeline-node-time';
+          if (cluster.untimed) {
+            timeSpan.textContent = 'Unknown time';
+          } else {
+            const spanMs = cluster.endMs - cluster.startMs;
+            // Collapse clusters that span less than two minutes to a single
+            // time (otherwise the header reads "10:42 AM – 10:42 AM").
+            timeSpan.textContent = spanMs < 2 * 60 * 1000
+              ? formatClusterTime(cluster.startMs)
+              : `${formatClusterTime(cluster.startMs)} – ${formatClusterTime(cluster.endMs)}`;
           }
+          hdr.appendChild(timeSpan);
+
+          const countSpan = document.createElement('span');
+          countSpan.className = 'timeline-node-count muted';
+          countSpan.textContent =
+            `${cluster.scenes.length} scene${cluster.scenes.length === 1 ? '' : 's'} · ${imgCount} image${imgCount === 1 ? '' : 's'}`;
+          hdr.appendChild(countSpan);
+
+          contentCol.appendChild(hdr);
 
           const gridEl = document.createElement('div');
           gridEl.className = 'grid timeline-grid';
@@ -1561,9 +1743,9 @@
           nodeEl.appendChild(contentCol);
           timelineEl.appendChild(nodeEl);
 
-          for (let i = 0; i < tbScenes.length; i += batch) {
-            if (myVer !== _renderScenesVersion) return;
-            const slice = tbScenes.slice(i, i + batch);
+          for (let i = 0; i < cluster.scenes.length; i += batch) {
+            if (myVer !== _renderScenesVersion) { sceneGrid.style.minHeight = ''; return; }
+            const slice = cluster.scenes.slice(i, i + batch);
             const frag = document.createDocumentFragment();
             for (const s of slice) frag.appendChild(buildCard(s));
             gridEl.appendChild(frag);
@@ -1575,7 +1757,7 @@
       // ---- Main folder rendering loop ----
       for (const fk of folderOrder) {
         const fd = folderMap.get(fk);
-        const allScenesInFolder = [...fd.buckets.values()].flat();
+        const allScenesInFolder = fd.scenes;
         let bodyEl; // receives the timeline or flat grid
 
         if (showFolderHeaders && fd.folderPath) {
@@ -1606,6 +1788,19 @@
           folderOptionsBtn.title = 'Reset Accept/Reject culling decisions for this folder';
           folderOptionsBtn.addEventListener('click', (ev) => { ev.stopPropagation(); showFolderOptionsDialog(fd.folderPath); });
           leftActions.appendChild(folderOptionsBtn);
+
+          // Adjust Capture Time — shifts every row's capture_time by a
+          // user-supplied offset (hours). Useful when the camera clock was
+          // set to the wrong time zone or drifted relative to another body.
+          const adjustTimeBtn = document.createElement('button');
+          adjustTimeBtn.className = 'action-btn';
+          adjustTimeBtn.innerHTML = '<i>⏱</i> Adjust Capture Time';
+          adjustTimeBtn.title = 'Shift capture timestamps for every image in this folder by a fixed offset (useful for syncing between camera bodies)';
+          adjustTimeBtn.addEventListener('click', (ev) => {
+            ev.stopPropagation();
+            showAdjustCaptureTimeDialog(fd.folderPath);
+          });
+          leftActions.appendChild(adjustTimeBtn);
 
           hdr.appendChild(leftActions);
 
@@ -1658,13 +1853,20 @@
           gridEl.className = 'folder-group-grid grid';
           bodyEl.appendChild(gridEl);
           for (let i = 0; i < allScenesInFolder.length; i += batch) {
-            if (myVer !== _renderScenesVersion) return;
+            if (myVer !== _renderScenesVersion) { sceneGrid.style.minHeight = ''; return; }
             const slice = allScenesInFolder.slice(i, i + batch);
             const frag = document.createDocumentFragment();
             for (const s of slice) frag.appendChild(buildCard(s));
             gridEl.appendChild(frag);
           }
         }
+      }
+
+      // Restore scroll position and release the minimum-height lock now that
+      // the grid is rebuilt, preventing flash-of-empty-content.
+      sceneGrid.style.minHeight = '';
+      if (mainEl && savedScrollTop > 0) {
+        mainEl.scrollTop = savedScrollTop;
       }
     }
 
@@ -1859,6 +2061,74 @@
       return Math.max(-2.0, Math.min(3.0, meterStops));
     }
 
+    /**
+     * Stops to use for thumbnail CSS (approximate full-frame preview vs bird crop).
+     *
+     * Pipeline stores exposure_correction = log2(meter_scale) + subject_stops (see compose_total_stops).
+     * Export JPEGs are built from the meter-balanced full frame *before* subject-only linear
+     * correction is applied to crops — so applying 2^total EV via brightness() re-applies meter
+     * on already-metered sRGB and blows highlights.
+     *
+     * For metered paths we therefore use **subject stops only** (optionally derived from total − meter).
+     * CSS brightness() still operates on gamma-encoded values; we dampen and cap in stopsToThumbnailBrightnessMultiplier.
+     *
+     * Future: analysis will standardize on the numpy linear exposure path only (`numpy_linear_v2`);
+     * other `exposure_pipeline` values may remain only in older `.kestrel` data until a migration/cleanup pass.
+     */
+    function getThumbnailExposureStopsForCss(row) {
+      if (!getSetting('exposure_corrected_thumbs', true)) return 0;
+      if (getSetting('raw_exposure_correction_disabled', false)) return 0;
+
+      const mode = String(row?.exposure_pipeline || '').trim().toLowerCase();
+      // Canonical metered path is numpy_linear_v2; keep legacy strings for old databases.
+      const meteredModes = new Set(['numpy_linear_v2', 'no_auto_bright_metered_v1']);
+
+      if (meteredModes.has(mode)) {
+        let subj = _numberOr(row?.exposure_subject_stops, NaN);
+        if (!Number.isFinite(subj)) {
+          const tot = parseFloat(row?.exposure_correction) || 0;
+          const m = _numberOr(row?.exposure_meter_scale, 1);
+          const meterSt = Math.log2(Math.max(1e-6, m));
+          subj = tot - meterSt;
+        }
+        return Math.max(-4.0, Math.min(4.0, subj));
+      }
+
+      // Legacy / non-metered: single stored EV is the best available hint (no separate meter term).
+      const eff = getRowRawPreviewEffectiveStops(row, false);
+      return Math.max(-4.0, Math.min(4.0, eff));
+    }
+
+    /**
+     * Map stops → CSS brightness() multiplier. Browser brightness scales sRGB channels roughly
+     * linearly in display space; it is **not** linear-light exposure + highlight roll-off like
+     * crop processing. Use gentler gain on brightening and a modest ceiling to limit clipped highlights.
+     */
+    function stopsToThumbnailBrightnessMultiplier(stops) {
+      if (!Number.isFinite(stops) || Math.abs(stops) < 0.0005) return 1;
+      if (stops > 0) {
+        const dampened = stops * 0.62;
+        const mult = Math.pow(2, dampened);
+        return Math.max(0.35, Math.min(2.05, mult));
+      }
+      const mult = Math.pow(2, stops);
+      return Math.max(0.35, Math.min(2.85, mult));
+    }
+
+    function getThumbnailExposureFilterStyle(row) {
+      const stops = getThumbnailExposureStopsForCss(row);
+      if (!Number.isFinite(stops) || Math.abs(stops) < 0.0005) return '';
+      const mult = stopsToThumbnailBrightnessMultiplier(stops);
+      if (Math.abs(mult - 1) < 0.002) return '';
+      return `brightness(${mult})`;
+    }
+
+    function applyThumbnailExposureToImg(imgEl, row) {
+      if (!imgEl || !row) return;
+      const f = getThumbnailExposureFilterStyle(row);
+      imgEl.style.filter = f || '';
+    }
+
     function getSceneRawCacheKey(row) {
       const disabled = getSetting('raw_exposure_correction_disabled', false);
       const expCorr = getRowRawPreviewEffectiveStops(row, disabled);
@@ -1990,11 +2260,13 @@
       zoomLastY = mouseEv.clientY;
 
       // Step 1: Immediately show the already-loaded thumbnail as a placeholder
-      const thumbImgSrc = thumbEl.querySelector('img')?.src;
+      const thumbImgEl = thumbEl.querySelector('img');
+      const thumbImgSrc = thumbImgEl?.src;
       if (thumbImgSrc) {
         _clearScenePreviewBox(previewBox);
         const stub = document.createElement('img');
         stub.src = thumbImgSrc;
+        stub.style.filter = thumbImgEl?.style?.filter || '';
         stub.style.imageRendering = 'crisp-edges';
         stub.onload = () => {
           if (sceneZoomActive && sceneZoomRow === row && sceneZoomThumbEl === thumbEl) {
@@ -2315,6 +2587,7 @@
         const img = document.createElement('img');
         img.alt = r.filename || '';
         img.loading = 'lazy';
+        applyThumbnailExposureToImg(img, r);
         lazyLoadImg(img, () => getBlobUrlForPath(r.export_path || r.crop_path, r.__rootPath));
         th.appendChild(img);
         card.appendChild(th);
@@ -2403,6 +2676,12 @@
       grid.scrollTo({ left: targetScrollLeft, behavior: 'smooth' });
     }
 
+    // Monotonic token used to invalidate stale async preview loads triggered
+    // by rapid filmstrip hovers. Without this, two `await`-ing invocations
+    // could each append an <img> to the preview boxes, producing a
+    // "split in half" rendering as flex layout shrinks both side-by-side.
+    let _filmstripPreviewToken = 0;
+
     async function selectFilmstripImage(idx, scene, isHover = false, overlayActiveCrop = false) {
       if (!scene || !scene.images || idx < 0 || idx >= scene.images.length) return;
       if (!isHover) {
@@ -2413,6 +2692,7 @@
         }
         currentImageIndex = idx;
       }
+      const myToken = ++_filmstripPreviewToken;
       const r = scene.images[idx];
       const cropState = getRowActiveCropState(r);
       const activeCrop = cropState.activeCrop;
@@ -2437,9 +2717,14 @@
       if (exportBox) {
         _clearScenePreviewBox(exportBox);
         const eurl = await getBlobUrlForPath(r.export_path, r.__rootPath);
+        // Bail out if a newer hover/selection has superseded this load.
+        if (myToken !== _filmstripPreviewToken) return;
+        // Re-clear in case other code added children while we were awaiting.
+        _clearScenePreviewBox(exportBox);
         if (eurl) {
           const eimg = document.createElement('img');
           eimg.src = eurl;
+          applyThumbnailExposureToImg(eimg, r);
           exportBox.appendChild(eimg);
         } else {
           const muted = document.createElement('span');
@@ -2454,6 +2739,8 @@
       if (cropBox) {
         _clearScenePreviewBox(cropBox);
         const curl = await getBlobUrlForPath(activeCropPath, r.__rootPath);
+        if (myToken !== _filmstripPreviewToken) return;
+        _clearScenePreviewBox(cropBox);
         if (curl) {
           const cimg = document.createElement('img');
           cimg.src = curl;
@@ -2541,16 +2828,55 @@
         });
       }
 
-      const metaEl = el('#sceneInfoMeta');
-      if (metaEl) {
+      const metaTextEl = el('#sceneInfoMetaText');
+      if (metaTextEl) {
         const sp = decodeEntities(activeSpecies);
         const spConf = fmt3(activeSpeciesConf);
         const fam = decodeEntities(activeFamily);
         const famConf = fmt3(activeFamilyConf);
-        const cropLabel = cropState.crops.length > 0
-          ? ` · Crop ${cropState.activeIndex + 1}/${cropState.crops.length}`
-          : '';
-        metaEl.textContent = `${sp} (${spConf}) | ${fam} (${famConf}) · Image ${idx + 1} of ${scene.images.length}${cropLabel}`;
+        metaTextEl.textContent = `${sp} (${spConf}) | ${fam} (${famConf}) · Image ${idx + 1} of ${scene.images.length}`;
+      }
+
+      // Crop nav (shown only when a row exposes multiple bird crops).
+      const cropNavEl = el('#sceneInfoCropNav');
+      const cropLabelEl = el('#sceneInfoCropLabel');
+      const cropPrevBtn = el('#sceneInfoCropPrev');
+      const cropNextBtn = el('#sceneInfoCropNext');
+      if (cropNavEl && cropLabelEl && cropPrevBtn && cropNextBtn) {
+        const total = cropState.crops.length;
+        if (total > 1) {
+          cropNavEl.classList.remove('hidden');
+          cropLabelEl.textContent = `Crop ${cropState.activeIndex + 1}/${total}`;
+          cropPrevBtn.disabled = false;
+          cropNextBtn.disabled = false;
+          const cycleCrop = (step) => {
+            const stateNow = getRowActiveCropState(r);
+            if (stateNow.crops.length <= 1) return;
+            const next = (stateNow.activeIndex + step + stateNow.crops.length) % stateNow.crops.length;
+            setRowActiveCropIndex(r, next, stateNow.crops);
+            selectFilmstripImage(currentImageIndex, _currentScene, true, true);
+          };
+          cropPrevBtn.onclick = (ev) => { ev.stopPropagation(); cycleCrop(-1); };
+          cropNextBtn.onclick = (ev) => { ev.stopPropagation(); cycleCrop(1); };
+        } else {
+          cropNavEl.classList.add('hidden');
+          cropLabelEl.textContent = '';
+          cropPrevBtn.onclick = null;
+          cropNextBtn.onclick = null;
+        }
+      }
+
+      // "Open in editor" button — label reflects the currently configured editor.
+      const editorBtn = el('#sceneInfoEditorBtn');
+      const editorLabelEl = el('#sceneInfoEditorLabel');
+      if (editorBtn && editorLabelEl) {
+        const editorKey = getSetting('editor', 'darktable');
+        editorLabelEl.textContent = `Open in ${_editorDisplayName(editorKey)}`;
+        editorBtn.title = `Open original in ${_editorDisplayName(editorKey)} (Space)`;
+        editorBtn.onclick = (ev) => {
+          ev.stopPropagation();
+          openInEditor(r);
+        };
       }
 
       // Render star bar in info bar
@@ -2752,6 +3078,8 @@
 
       if (approved) {
         html += '<span class="scene-tag-sep"></span><span class="approval-note" style="font-size:11px">✓ Reviewed</span>';
+      } else {
+        html += '<span class="scene-tag-sep"></span><button class="mark-reviewed-btn" id="markReviewedBtn" title="Confirm that Kestrel\'s tags are correct and mark this scene as reviewed">✓ Mark as Reviewed</button>';
       }
 
       tagsEl.innerHTML = html;
@@ -2833,6 +3161,22 @@
           renderScenes();
         };
       });
+
+      // Wire "Mark as Reviewed" button
+      const markReviewedBtn = tagsEl.querySelector('#markReviewedBtn');
+      if (markReviewedBtn) {
+        markReviewedBtn.onclick = () => {
+          _beginSceneEditDraft(scene.id);
+          _sceneEditMode = true;
+          _finalizeSceneReview(scene.id);
+          _sceneEditMode = false;
+          _sceneEditDraft = null;
+          const updatedScene = reloadScene(scene.id) || scene;
+          renderTopbarTags(updatedScene);
+          renderScenes();
+          showToast('Scene tags marked as reviewed', 2000);
+        };
+      }
 
       // Wire inline input
       const inp = el('#inlineTagInput');
@@ -3555,6 +3899,7 @@
         const img = document.createElement('img');
         img.alt = r.filename || '';
         img.loading = 'lazy';
+        applyThumbnailExposureToImg(img, r);
         lazyLoadImg(img, () => getBlobUrlForPath(r.export_path || r.crop_path, r.__rootPath));
         th.appendChild(img);
         card.appendChild(th);
@@ -3998,33 +4343,20 @@
       // Rating profile
       const profileSelect = document.getElementById('ratingProfile');
       if (profileSelect) profileSelect.value = getSetting('rating_profile', 'balanced');
-      // Detection confidence threshold
-      const dtEl = document.getElementById('detectionThreshold');
-      if (dtEl) dtEl.value = getSetting('detection_threshold', 0.75);
-      // Scene grouping time threshold
-      const sttEl = document.getElementById('sceneTimeThreshold');
-      if (sttEl) sttEl.value = getSetting('scene_time_threshold', 1.0);
-      // Mask threshold
-      const maskThEl = document.getElementById('maskThreshold');
-      if (maskThEl) maskThEl.value = getSetting('mask_threshold', 0.5);
-      const maxBirdCropsEl = document.getElementById('maxBirdCrops');
-      if (maxBirdCropsEl) maxBirdCropsEl.value = getSetting('max_bird_crops', 5);
-      // Exposure compensation profile
-      const expProfileEl = document.getElementById('exposureCompensationProfile');
-      if (expProfileEl) {
-        const savedExpProfile = String(getSetting('exposure_compensation_profile', 'aggressive') || 'aggressive').toLowerCase();
-        expProfileEl.value = ['lenient', 'normal', 'aggressive'].includes(savedExpProfile) ? savedExpProfile : 'aggressive';
-      }
-      const expSolverEl = document.getElementById('exposureCompensationSolver');
-      if (expSolverEl) {
-        const savedExpSolver = String(getSetting('exposure_compensation_solver', 'metered_refine_one_pass') || 'metered_refine_one_pass').toLowerCase();
-        expSolverEl.value = ['metered_refine_one_pass', 'predictive_fast', 'convergent_two_pass'].includes(savedExpSolver)
-          ? savedExpSolver
-          : 'metered_refine_one_pass';
-      }
       // RAW preview cache
       const rawCacheCb = document.getElementById('rawPreviewCacheEnabled');
       if (rawCacheCb) rawCacheCb.checked = getSetting('raw_preview_cache_enabled', true);
+      // Thumbnail resolution + JPEG quality
+      const thumbWidthSel = document.getElementById('thumbnailMaxWidth');
+      if (thumbWidthSel) {
+        const curW = parseInt(getSetting('thumbnail_max_width', 1200), 10) || 1200;
+        // Snap to the nearest option if the stored value isn't in the list.
+        const opts = Array.from(thumbWidthSel.options).map(o => parseInt(o.value, 10));
+        const nearest = opts.reduce((a, b) => (Math.abs(b - curW) < Math.abs(a - curW) ? b : a), opts[0]);
+        thumbWidthSel.value = String(nearest);
+      }
+      const thumbQualInp = document.getElementById('thumbnailJpegQuality');
+      if (thumbQualInp) thumbQualInp.value = parseInt(getSetting('thumbnail_jpeg_quality', 95), 10) || 95;
       const optedIn = getSetting('analytics_opted_in', null);
       const consentShown = getSetting('analytics_consent_shown', false);
       const cb = document.getElementById('settingsAnalyticsOptIn');
@@ -4047,7 +4379,9 @@
 
       const rawExpDisableCb = document.getElementById('rawExposureCorrectionDisabled');
       if (rawExpDisableCb) rawExpDisableCb.checked = getSetting('raw_exposure_correction_disabled', false);
-      
+      const ectSettings = document.getElementById('settingsExposureCorrectedThumbs');
+      if (ectSettings) ectSettings.checked = !!getSetting('exposure_corrected_thumbs', true);
+
       dlg.showModal();
     }
     async function applySettings() {
@@ -4058,59 +4392,33 @@
       const analyticsOptIn = document.getElementById('settingsAnalyticsOptIn').checked;
       const profileEl = document.getElementById('ratingProfile');
       const ratingProfile = profileEl ? profileEl.value : 'balanced';
-      const dtEl2 = document.getElementById('detectionThreshold');
-      const detectionThreshold = dtEl2 ? Math.max(0.1, Math.min(0.99, parseFloat(dtEl2.value) || 0.75)) : 0.75;
-      const sttEl2 = document.getElementById('sceneTimeThreshold');
-      const sceneTimeThreshold = sttEl2 ? Math.max(0, parseFloat(sttEl2.value) || 1.0) : 1.0;
-      const maskThEl2 = document.getElementById('maskThreshold');
-      const maskThreshold = maskThEl2 ? Math.max(0.5, Math.min(0.95, parseFloat(maskThEl2.value) || 0.5)) : 0.5;
-      const maxBirdCropsEl2 = document.getElementById('maxBirdCrops');
-      let maxBirdCrops = 5;
-      if (maxBirdCropsEl2) {
-        const parsedMaxBirdCrops = parseInt(maxBirdCropsEl2.value, 10);
-        maxBirdCrops = Number.isFinite(parsedMaxBirdCrops) ? parsedMaxBirdCrops : 5;
-      }
-      maxBirdCrops = Math.max(1, Math.min(20, maxBirdCrops));
-      const expProfileEl2 = document.getElementById('exposureCompensationProfile');
-      const exposureCompensationProfile = (expProfileEl2 ? String(expProfileEl2.value || 'aggressive') : 'aggressive').toLowerCase();
-      const exposureCompensationProfileSafe = ['lenient', 'normal', 'aggressive'].includes(exposureCompensationProfile)
-        ? exposureCompensationProfile
-        : 'aggressive';
-      const expSolverEl2 = document.getElementById('exposureCompensationSolver');
-      const exposureCompensationSolver = (expSolverEl2 ? String(expSolverEl2.value || 'metered_refine_one_pass') : 'metered_refine_one_pass').toLowerCase();
-      const exposureCompensationSolverSafe = ['metered_refine_one_pass', 'predictive_fast', 'convergent_two_pass'].includes(exposureCompensationSolver)
-        ? exposureCompensationSolver
-        : 'metered_refine_one_pass';
       const rawCacheCb2 = document.getElementById('rawPreviewCacheEnabled');
       const rawPreviewCacheEnabled = rawCacheCb2 ? rawCacheCb2.checked : true;
       const autoSaveCb = document.getElementById('settingsAutoSave');
       const autoSaveEnabled = autoSaveCb ? autoSaveCb.checked : true;
+      const thumbWidthEl = document.getElementById('thumbnailMaxWidth');
+      const thumbnailMaxWidth = Math.max(400, Math.min(2400, parseInt(thumbWidthEl?.value, 10) || 1200));
+      const thumbQualEl = document.getElementById('thumbnailJpegQuality');
+      const thumbnailJpegQuality = Math.max(50, Math.min(100, parseInt(thumbQualEl?.value, 10) || 95));
       // Merge into existing settings so keys like machine_id / analytics_consent_shown are preserved
       const existing = loadSettings();
       const prevProfile = existing.rating_profile || 'balanced';
-      const prevMaxBirdCropsRaw = parseInt(existing.max_bird_crops, 10);
-      const prevMaxBirdCrops = Number.isFinite(prevMaxBirdCropsRaw)
-        ? Math.max(1, Math.min(20, prevMaxBirdCropsRaw))
-        : 5;
-      if (maxBirdCrops > 10 && maxBirdCrops !== prevMaxBirdCrops) {
-        const confirmed = confirm(
-          'Raising "Max Bird Crops Saved Per Image" above 10 can substantially increase compute time and memory overhead. Continue?'
-        );
-        if (!confirmed) return;
-      }
+      const ectCb = document.getElementById('settingsExposureCorrectedThumbs');
+      const exposureCorrectedThumbs = ectCb ? !!ectCb.checked : getSetting('exposure_corrected_thumbs', true);
+      const prevExposureThumbs = getSetting('exposure_corrected_thumbs', true);
+      const rawExpEl = document.getElementById('rawExposureCorrectionDisabled');
+      const rawExposureCorrectionDisabled = rawExpEl ? !!rawExpEl.checked : !!existing.raw_exposure_correction_disabled;
+      const prevRawExposureDisabled = !!existing.raw_exposure_correction_disabled;
       const settings = {
         ...existing, editor, customEditorPath, treeScanDepth,
         analytics_opted_in: analyticsOptIn, analytics_consent_shown: true,
         rating_profile: ratingProfile,
-        detection_threshold: detectionThreshold,
-        scene_time_threshold: sceneTimeThreshold,
-        mask_threshold: maskThreshold,
-        max_bird_crops: maxBirdCrops,
-        exposure_compensation_profile: exposureCompensationProfileSafe,
-        exposure_compensation_solver: exposureCompensationSolverSafe,
         raw_preview_cache_enabled: rawPreviewCacheEnabled,
         auto_save_enabled: autoSaveEnabled,
-        raw_exposure_correction_disabled: document.getElementById('rawExposureCorrectionDisabled').checked,
+        raw_exposure_correction_disabled: rawExposureCorrectionDisabled,
+        exposure_corrected_thumbs: exposureCorrectedThumbs,
+        thumbnail_max_width: thumbnailMaxWidth,
+        thumbnail_jpeg_quality: thumbnailJpegQuality,
       };
       _autoSaveEnabled = autoSaveEnabled;
       if (!_autoSaveEnabled) {
@@ -4127,6 +4435,15 @@
       // If rating profile changed and folders are loaded, reapply immediately
       if (ratingProfile !== prevProfile && rows.length > 0) {
         await reapplyNormalizationForLoadedFolders();
+      }
+      const thumbPreviewChanged =
+        exposureCorrectedThumbs !== prevExposureThumbs || rawExposureCorrectionDisabled !== prevRawExposureDisabled;
+      if (thumbPreviewChanged && rows.length > 0) {
+        await renderScenes();
+        if (sceneDlg?.open && _currentScene) {
+          renderFilmstrip(_currentScene);
+          await selectFilmstripImage(currentImageIndex, _currentScene, false, false);
+        }
       }
     }
 
@@ -4495,6 +4812,33 @@
       return null;
     }
 
+    // Display names for each editor key used by the preferred-editor setting.
+    // Mirrors the <option> list in visualizer.html so the button label reads
+    // naturally (e.g. "Open in Lightroom") instead of raw keys like "lightroom".
+    const _EDITOR_DISPLAY_NAMES = {
+      system: 'Default App',
+      darktable: 'Darktable',
+      lightroom: 'Lightroom',
+      photoshop: 'Photoshop',
+      capture_one: 'Capture One',
+      affinity: 'Affinity',
+      gimp: 'GIMP',
+      rawtherapee: 'RawTherapee',
+      luminar: 'Luminar',
+      dxo: 'DxO PhotoLab',
+      on1: 'ON1',
+      acdsee: 'ACDSee',
+      paintshop: 'PaintShop',
+      faststone: 'FastStone',
+      xnview: 'XnView',
+      irfanview: 'IrfanView',
+      custom: 'Editor',
+    };
+    function _editorDisplayName(key) {
+      if (!key) return 'Editor';
+      return _EDITOR_DISPLAY_NAMES[key] || 'Editor';
+    }
+
     async function openInEditor(row) {
       const origRel = (row.filename || '').replace(/^[\\/]+/, '');
       const settings = loadSettings();
@@ -4548,6 +4892,7 @@
     let _treeFlatOrder = [];           // flat ordered list of visible tree paths for range-select
     let _appVersion = '';              // current app version, fetched once
     let _isFrozenApp = false;          // whether running as frozen (PyInstaller) build
+    let _appPlatform = 'windows';      // 'windows' | 'macos' | 'linux'
 
     async function scanFolderTree(rootPath) {
       if (!hasPywebviewApi || !window.pywebview?.api?.list_subfolders) return false;
@@ -4565,6 +4910,12 @@
         try {
           const fr = await window.pywebview.api.is_frozen_app();
           _isFrozenApp = !!(fr && fr.frozen);
+        } catch (e) { /* ignore */ }
+      }
+      // Fetch platform once
+      if (_appPlatform === 'windows') {
+        try {
+          _appPlatform = await getPlatformInfo();
         } catch (e) { /* ignore */ }
       }
 
@@ -5380,15 +5731,8 @@
         await scanFolderTree(fp);
         if (!folderTreeRootNode) return;
       }
-      // Hide GPU checkbox in frozen (PyInstaller) builds — GPU not supported there
-      const gpuLabel = document.getElementById('analyzeGpuLabel');
-      if (gpuLabel) {
-        gpuLabel.style.display = _isFrozenApp ? 'none' : '';
-        if (_isFrozenApp) {
-          const gpuCb = document.getElementById('analyzeUseGpu');
-          if (gpuCb) gpuCb.checked = false;
-        }
-      }
+      // GPU is always available: DirectML (Windows) and CoreML (macOS) are bundled
+      // with the frozen build, so no platform-specific hiding is needed.
       // Seed the dialog's selected set from any previously-queued paths
       _dlgSelected = new Set(queuedFolderPaths);
       
@@ -5421,6 +5765,21 @@
         if (addBtn) addBtn.disabled = _dlgSelected.size === 0;
         _refreshAnalyzeDlgQueuePreview();
       }
+
+      // Hydrate advanced analysis settings from persisted values
+      const _adlgDt = document.getElementById('adlgDetectionThreshold');
+      if (_adlgDt) _adlgDt.value = getSetting('detection_threshold', 0.25);
+      const _adlgMbc = document.getElementById('adlgMaxBirdCrops');
+      if (_adlgMbc) _adlgMbc.value = getSetting('max_bird_crops', 10);
+      const _adlgEq = document.getElementById('adlgExposureQuality');
+      if (_adlgEq) {
+        const savedEq = String(getSetting('exposure_quality', 'balanced') || 'balanced').toLowerCase();
+        _adlgEq.value = ['lenient', 'balanced', 'aggressive'].includes(savedEq) ? savedEq : 'balanced';
+      }
+      const _adlgSt = document.getElementById('adlgSceneTime');
+      if (_adlgSt) _adlgSt.value = getSetting('scene_time_threshold', 1.0);
+      const _adlgPp = document.getElementById('adlgParallelPrefetch');
+      if (_adlgPp) _adlgPp.value = getSetting('parallel_prefetch', 3);
 
       const treeEl = document.getElementById('analyzeDlgTree');
       treeEl.innerHTML = '';
@@ -6258,7 +6617,22 @@
       if (_autoRefreshTimer) { clearInterval(_autoRefreshTimer); _autoRefreshTimer = null; }
     }
 
-    /** Silently reload CSV data for any paths in _autoRefreshPendingPaths that are checked. */
+    // User-editable row fields that must survive auto-refresh merges.
+    // Pipeline-written columns are updated from disk; these are kept from memory.
+    const _USER_EDITABLE_FIELDS = [
+      'rating', 'rating_origin', 'normalized_rating',
+      'culled', 'culled_origin',
+      'scene_name',
+    ];
+
+    /** Silently reload CSV data for any paths in _autoRefreshPendingPaths that are checked.
+     *
+     *  Merges new pipeline data into existing in-memory rows instead of replacing
+     *  them wholesale, so unsaved user edits (ratings, culling, scene names) are
+     *  preserved.  Only genuinely new images (not yet in memory) are appended.
+     *  Scenedata is merged additively: new scenes are added but user-edited
+     *  scenes are never overwritten.
+     */
     async function silentRefreshPending() {
       if (_autoRefreshPendingPaths.size === 0) return;
       if (_silentRefreshRunning) return;
@@ -6269,48 +6643,157 @@
         if (toRefresh.length === 0) return;
 
         const normPath = p => (p || '').replace(/\\/g, '/');
-        let changed = false;
+        let hasNewRows = false;
+        let hasUpdates = false;
         for (const p of toRefresh) {
           try {
             if (!hasPywebviewApi || !window.pywebview?.api?.read_kestrel_csv) continue;
             const result = await window.pywebview.api.read_kestrel_csv(p);
             if (!result.success) continue;
             const parsed = parseCsvText(result.data);
-            const newRows = parsed.data || [];
+            const diskRows = parsed.data || [];
             const newFields = parsed.meta.fields || [];
             const root = result.root || p;
             const rootN = normPath(root);
             for (const f of newFields) if (!header.includes(f)) header.push(f);
+
+            // Build a lookup of existing in-memory rows for this folder by filename
+            const existingByName = new Map();
+            for (const r of rows) {
+              if (normPath(r.__rootPath) === rootN && r.filename) {
+                existingByName.set(r.filename, r);
+              }
+            }
+
             const sample = rows.find(r => normPath(r.__rootPath) === rootN);
             const slot = sample ? sample.__folderSlot : rows.length;
-            rows = rows.filter(r => normPath(r.__rootPath) !== rootN);
-            for (const r of newRows) { r.__rootPath = root; r.__folderSlot = slot; }
-            rows = rows.concat(newRows);
+            const addedRows = [];
+
+            for (const diskRow of diskRows) {
+              const fname = diskRow.filename;
+              if (!fname) continue;
+              const existing = existingByName.get(fname);
+              if (existing) {
+                // Merge: update pipeline-written fields from disk, keep user edits
+                const savedEdits = {};
+                for (const field of _USER_EDITABLE_FIELDS) {
+                  if (field in existing) savedEdits[field] = existing[field];
+                }
+                // Also preserve internal UI fields
+                const savedInternal = {
+                  __rootPath: existing.__rootPath,
+                  __folderSlot: existing.__folderSlot,
+                  __normalized_rating: existing.__normalized_rating,
+                };
+
+                // Update pipeline fields from disk
+                for (const key of Object.keys(diskRow)) {
+                  if (key.startsWith('__')) continue;
+                  if (!_USER_EDITABLE_FIELDS.includes(key)) {
+                    existing[key] = diskRow[key];
+                  }
+                }
+
+                // Restore user edits
+                for (const [field, val] of Object.entries(savedEdits)) {
+                  // Only restore if the user actually set something
+                  if (val !== undefined && val !== '') existing[field] = val;
+                }
+                // Restore internal fields
+                Object.assign(existing, savedInternal);
+                hasUpdates = true;
+              } else {
+                // Genuinely new row from pipeline — append it
+                diskRow.__rootPath = root;
+                diskRow.__folderSlot = slot;
+                addedRows.push(diskRow);
+              }
+            }
+
+            if (addedRows.length > 0) {
+              rows = rows.concat(addedRows);
+              hasNewRows = true;
+            }
+
+            // Merge scenedata: add new scenes from disk without overwriting user-edited ones
             if (hasPywebviewApi && window.pywebview?.api?.read_kestrel_scenedata) {
               try {
                 const sdRes = await window.pywebview.api.read_kestrel_scenedata(root);
-                if (sdRes?.success) _scenedata[root] = sdRes.data;
+                if (sdRes?.success && sdRes.data) {
+                  const diskSd = sdRes.data;
+                  const memSd = _scenedata[root] || { version: '2.0', image_ratings: {}, scenes: {} };
+
+                  // Merge image_ratings: disk values only for images without user edits
+                  if (diskSd.image_ratings) {
+                    if (!memSd.image_ratings) memSd.image_ratings = {};
+                    for (const [fname, rating] of Object.entries(diskSd.image_ratings)) {
+                      if (!(fname in memSd.image_ratings)) {
+                        memSd.image_ratings[fname] = rating;
+                      }
+                    }
+                  }
+
+                  // Merge scenes: add new scenes, update non-user-edited scenes
+                  if (diskSd.scenes) {
+                    if (!memSd.scenes) memSd.scenes = {};
+                    for (const [sceneId, diskScene] of Object.entries(diskSd.scenes)) {
+                      const memScene = memSd.scenes[sceneId];
+                      if (!memScene) {
+                        // New scene from pipeline — add it
+                        memSd.scenes[sceneId] = diskScene;
+                      } else {
+                        // Existing scene — only update image list, keep user edits
+                        const userFinalized = memScene.user_tags && memScene.user_tags.finalized;
+                        const userRenamed = memScene.name && memScene.name.trim() !== '';
+                        const userAccepted = memScene.status === 'accepted';
+                        if (!userFinalized && !userRenamed && !userAccepted) {
+                          // No user edits — safe to update from disk
+                          // But still merge image_filenames additively
+                          const existingFiles = new Set(memScene.image_filenames || []);
+                          for (const f of (diskScene.image_filenames || [])) {
+                            if (!existingFiles.has(f)) {
+                              memScene.image_filenames.push(f);
+                            }
+                          }
+                        } else {
+                          // User has edited this scene — only add new filenames
+                          const existingFiles = new Set(memScene.image_filenames || []);
+                          for (const f of (diskScene.image_filenames || [])) {
+                            if (!existingFiles.has(f)) {
+                              memScene.image_filenames.push(f);
+                            }
+                          }
+                        }
+                      }
+                    }
+                  }
+
+                  _scenedata[root] = memSd;
+                }
               } catch (_) {}
             }
-            if (hasPywebviewApi && window.pywebview?.api?.apply_normalization) {
+
+            // Apply normalization to new rows only
+            if (addedRows.length > 0 && hasPywebviewApi && window.pywebview?.api?.apply_normalization) {
               try {
                 const normRes = await window.pywebview.api.apply_normalization(root);
                 if (normRes?.success && normRes?.normalized_ratings) {
                   const mapping = normRes.normalized_ratings;
-                  for (const r of newRows) {
+                  for (const r of addedRows) {
                     if (r.filename in mapping) r.__normalized_rating = mapping[r.filename];
                   }
                 }
               } catch (_) {}
             }
-            changed = true;
           } catch (e) {
             console.warn('[autorefresh]', p, e);
           }
         }
 
-        if (changed) {
-          ensureSceneNameColumn();        ensureRatingColumns();        await renderScenes();
+        if (hasNewRows || hasUpdates) {
+          ensureSceneNameColumn();
+          ensureRatingColumns();
+          await renderScenes();
           // If a scene dialog is open, its filmstrip is stale after renderScenes
           // rebuilt the scenes array with fresh row objects — re-render it now.
           if (_currentScene) {
@@ -6318,7 +6801,9 @@
             const safeIdx = Math.max(0, Math.min(currentImageIndex, _currentScene.images.length - 1));
             await selectFilmstripImage(safeIdx, _currentScene);
           }
-          setStatus(`Auto-refreshed ${toRefresh.length} newly-analyzed folder(s)`);
+          if (hasNewRows) {
+            setStatus(`Auto-refreshed: new images added from analysis`);
+          }
         }
       } finally {
         _silentRefreshRunning = false;
@@ -6861,6 +7346,16 @@
       });
     })();
 
+    // Show bird thumbnails toggle
+    (function initShowBirdThumbs() {
+      const t = document.getElementById('showBirdThumbs');
+      if (!t) return;
+      try { t.checked = getSetting('showBirdThumbs', false); } catch { }
+      t.addEventListener('change', () => {
+        const s = loadSettings(); s.showBirdThumbs = !!t.checked; saveSettings(s); renderScenes();
+      });
+    })();
+
     // Scroll position indicator — shows current folder/time-group while scrolling
     (function initScrollPositionIndicator() {
       const mainEl = document.querySelector('main');
@@ -7192,6 +7687,28 @@
           }
         }
 
+        // Persist advanced analysis settings before starting the queue
+        {
+          const dtVal = Math.max(0.1, Math.min(0.99, parseFloat(document.getElementById('adlgDetectionThreshold')?.value) || 0.25));
+          const mbcRaw = parseInt(document.getElementById('adlgMaxBirdCrops')?.value, 10);
+          const mbcVal = Math.max(1, Math.min(20, Number.isFinite(mbcRaw) ? mbcRaw : 10));
+          const eqRaw = String(document.getElementById('adlgExposureQuality')?.value || 'balanced').toLowerCase();
+          const eqVal = ['lenient', 'balanced', 'aggressive'].includes(eqRaw) ? eqRaw : 'balanced';
+          const stVal = Math.max(0, parseFloat(document.getElementById('adlgSceneTime')?.value) || 1.0);
+          const ppRaw = parseInt(document.getElementById('adlgParallelPrefetch')?.value, 10);
+          const ppVal = Math.max(1, Math.min(5, Number.isFinite(ppRaw) ? ppRaw : 3));
+          const adlgSettings = loadSettings();
+          adlgSettings.detection_threshold = dtVal;
+          adlgSettings.max_bird_crops = mbcVal;
+          adlgSettings.exposure_quality = eqVal;
+          adlgSettings.scene_time_threshold = stVal;
+          adlgSettings.parallel_prefetch = ppVal;
+          saveSettings(adlgSettings);
+          if (hasPywebviewApi && window.pywebview?.api?.save_settings_data) {
+            try { await window.pywebview.api.save_settings_data(adlgSettings); } catch (_) { }
+          }
+        }
+
         document.getElementById('analyzeQueueDlg').close();
         analyzeDlgAdd.disabled = true;
         try {
@@ -7255,12 +7772,39 @@
     // ── Welcome Panel action wiring ──────────────────────────────────────────────
 
     // ── Legal Agreement Logic ──────────────────────────────────────────────
+    let _pendingLegalEffectiveDate = '';
+    const DEFAULT_TERMS_URL = 'https://projectkestrel.org/terms-of-use';
+    const DEFAULT_PRIVACY_URL = 'https://projectkestrel.org/privacy-policy';
+
+    function renderLegalBanner(status) {
+      const banner = document.getElementById('legalNotice');
+      const msgEl = document.getElementById('legalNoticeMsg');
+      const termsLink = document.getElementById('legalViewTerms');
+      const privacyLink = document.getElementById('legalViewPrivacy');
+      if (!banner || !msgEl) return;
+
+      const termsUrl = status?.terms_url || DEFAULT_TERMS_URL;
+      const privacyUrl = status?.privacy_url || DEFAULT_PRIVACY_URL;
+      if (termsLink) termsLink.href = termsUrl;
+      if (privacyLink) privacyLink.href = privacyUrl;
+
+      if (status?.reason === 'terms_updated') {
+        msgEl.textContent = 'The Privacy Policy and/or Terms of Use have been updated. Please review and accept to continue using Project Kestrel.';
+      } else {
+        msgEl.textContent = 'By using Project Kestrel you agree to our Terms of Use and Privacy Policy.';
+      }
+      banner.classList.remove('hidden');
+    }
+
     async function checkLegalAgreement() {
       if (!hasPywebviewApi || !window.pywebview?.api?.get_legal_status) return;
       try {
         const status = await window.pywebview.api.get_legal_status();
-        if (!status.agreed) {
-          document.getElementById('legalNotice')?.classList.remove('hidden');
+        _pendingLegalEffectiveDate = status?.effective_date || '';
+        if (!status?.agreed) {
+          renderLegalBanner(status);
+        } else {
+          document.getElementById('legalNotice')?.classList.add('hidden');
         }
       } catch (e) {
         console.error('Failed to check legal status', e);
@@ -7272,7 +7816,7 @@
       legalAgreeBtn.addEventListener('click', async () => {
         try {
           if (hasPywebviewApi && window.pywebview?.api?.agree_to_legal) {
-            await window.pywebview.api.agree_to_legal();
+            await window.pywebview.api.agree_to_legal(_pendingLegalEffectiveDate || '');
             // Keep local settings in sync immediately after consent so later
             // UI-driven settings writes include the persisted legal flags.
             await hydrateSettingsFromServer();
@@ -7487,7 +8031,11 @@
         'min-width:440px',
         'max-width:540px',
         'width:90vw',
-        'height:auto',
+        // `fit-content` hugs the actual content; `auto` can render at the
+        // max-height on Chromium when combined with overflow-y:auto.
+        'height:fit-content',
+        'max-height:92vh',
+        'overflow-x:hidden',
         'overflow-y:auto',
         'box-shadow:0 8px 40px rgba(0,0,0,0.6)',
       ].join(';');
@@ -7561,6 +8109,259 @@
       dlg.showModal();
     }
 
+    // ---- Adjust Capture Time dialog ----
+    //
+    // Shifts every row's `capture_time` in the given folder by a user-supplied
+    // number of hours (can be fractional and/or negative). Values are parsed
+    // as ISO strings, offset in milliseconds, and re-serialised as ISO without
+    // timezone suffixes so the shift stays consistent on reload. Rows that
+    // lack a parseable capture time are left untouched.
+    function _shiftIsoTime(iso, offsetMs) {
+      if (!iso) return '';
+      const trimmed = String(iso).trim();
+      if (!trimmed) return '';
+      let d = new Date(trimmed);
+      if (isNaN(d)) d = new Date(trimmed.replace(' ', 'T'));
+      if (isNaN(d)) return trimmed;
+      const shifted = new Date(d.getTime() + offsetMs);
+      if (isNaN(shifted)) return trimmed;
+      const p = (n) => String(n).padStart(2, '0');
+      // Mirror the pipeline format: local-ish ISO without timezone suffix,
+      // matching `datetime.isoformat()` output on capture_time writes.
+      return `${shifted.getFullYear()}-${p(shifted.getMonth()+1)}-${p(shifted.getDate())}T${p(shifted.getHours())}:${p(shifted.getMinutes())}:${p(shifted.getSeconds())}`;
+    }
+
+    // Format a ms timestamp as a friendly local string like
+    //   "Tue, Oct 14, 2025, 14:32:47"
+    function _formatPrettyLocalTime(ms) {
+      if (!Number.isFinite(ms)) return '—';
+      const d = new Date(ms);
+      try {
+        return d.toLocaleString(undefined, {
+          weekday: 'short', year: 'numeric', month: 'short', day: 'numeric',
+          hour: '2-digit', minute: '2-digit', second: '2-digit', hour12: false,
+        });
+      } catch (_) {
+        return d.toISOString();
+      }
+    }
+
+    // Convert a ms timestamp to a "YYYY-MM-DDTHH:MM:SS" string in local time,
+    // suitable for a <input type="datetime-local" step="1"> value.
+    function _msToDatetimeLocalValue(ms) {
+      if (!Number.isFinite(ms)) return '';
+      const d = new Date(ms);
+      const p = (n) => String(n).padStart(2, '0');
+      return `${d.getFullYear()}-${p(d.getMonth()+1)}-${p(d.getDate())}T${p(d.getHours())}:${p(d.getMinutes())}:${p(d.getSeconds())}`;
+    }
+
+    // Parse a <input type="datetime-local"> value back into a ms timestamp
+    // (interpreted in local time, same convention the pipeline uses).
+    function _datetimeLocalValueToMs(val) {
+      if (!val) return Number.NaN;
+      const m = String(val).match(/^(\d{4})-(\d{2})-(\d{2})T(\d{2}):(\d{2})(?::(\d{2}))?$/);
+      if (!m) return Number.NaN;
+      const d = new Date(
+        Number(m[1]), Number(m[2]) - 1, Number(m[3]),
+        Number(m[4]), Number(m[5]), Number(m[6] || 0),
+      );
+      const ms = d.getTime();
+      return Number.isFinite(ms) ? ms : Number.NaN;
+    }
+
+    // Pretty-print a signed ms offset as "+2h 30m" / "-45m 12s" / "0".
+    function _formatOffsetMs(offsetMs) {
+      if (!Number.isFinite(offsetMs) || offsetMs === 0) return '0';
+      const sign = offsetMs > 0 ? '+' : '−';
+      const totalSec = Math.round(Math.abs(offsetMs) / 1000);
+      const h = Math.floor(totalSec / 3600);
+      const m = Math.floor((totalSec % 3600) / 60);
+      const s = totalSec % 60;
+      const parts = [];
+      if (h) parts.push(`${h}h`);
+      if (m) parts.push(`${m}m`);
+      if (s || !parts.length) parts.push(`${s}s`);
+      return `${sign}${parts.join(' ')}`;
+    }
+
+    function showAdjustCaptureTimeDialog(folderPath) {
+      if (!folderPath) { showToast('No folder selected', 2500); return; }
+      const folderName = folderBaseName(folderPath) || folderPath;
+      const targetRows = rows.filter(r => r.__rootPath === folderPath);
+      if (!targetRows.length) { showToast('No images loaded for this folder', 2500); return; }
+
+      // Sort all rows that have a parseable capture time chronologically so
+      // "the first photo" the user sees is the actual earliest capture — not
+      // whatever happens to be first in the CSV.
+      const timedRows = targetRows
+        .filter(r => Number.isFinite(parseCaptureTimeMs(r.capture_time)))
+        .slice()
+        .sort((a, b) => parseCaptureTimeMs(a.capture_time) - parseCaptureTimeMs(b.capture_time));
+      const anchorRow = timedRows[0] || null;
+      const anchorOriginalIso = anchorRow ? String(anchorRow.capture_time || '') : '';
+      const anchorOriginalMs = anchorRow ? parseCaptureTimeMs(anchorOriginalIso) : Number.NaN;
+      const withTime = timedRows.length;
+
+      const dlg = document.createElement('dialog');
+      dlg.style.cssText = [
+        'border:1px solid #303a52', 'border-radius:12px', 'background:#141a24',
+        'color:#e8f0f8', 'padding:0', 'width:min(540px,96vw)',
+        // `fit-content` rather than `auto` — on Chromium a dialog with
+        // `height:auto` + `max-height:Xvh` + `overflow-y:auto` can render
+        // at the full max-height instead of shrinking to content. Using
+        // `fit-content` consistently hugs the content.
+        'height:fit-content', 'max-height:92vh',
+        'overflow-x:hidden', 'overflow-y:auto',
+        'box-shadow:0 8px 40px rgba(0,0,0,0.6)',
+      ].join(';');
+
+      const initialValue = _msToDatetimeLocalValue(anchorOriginalMs);
+
+      dlg.innerHTML = `
+        <div style="padding:18px 22px 12px;border-bottom:1px solid #222e45;">
+          <div style="font-size:16px;font-weight:700;margin-bottom:3px;">Adjust Capture Time</div>
+          <div style="color:#7a90b8;font-size:12px;white-space:nowrap;overflow:hidden;text-overflow:ellipsis;" title="${escapeHtml(folderPath)}">${escapeHtml(folderName)} · ${targetRows.length} image${targetRows.length === 1 ? '' : 's'} · ${withTime} with capture time</div>
+        </div>
+        <div style="padding:16px 22px;">
+          <div style="font-size:12px;color:#9fb0cc;line-height:1.55;margin-bottom:14px;">
+            Use this when your camera clock was set to the wrong time zone — for example, travelling abroad with a body still on home time, or a daylight-savings change that didn't get picked up. Correcting the time on the photo below will apply the same offset to every photo in this folder.
+          </div>
+          ${anchorRow ? `
+            <div style="display:flex;gap:14px;align-items:flex-start;background:#0f1422;border:1px solid #1e2638;border-radius:8px;padding:12px;margin-bottom:14px;">
+              <div style="flex:0 0 auto;width:104px;height:104px;background:#0a0d15;border:1px solid #1c2438;border-radius:6px;overflow:hidden;display:flex;align-items:center;justify-content:center;">
+                <img id="actThumb" alt="" style="max-width:100%;max-height:100%;object-fit:contain;display:none;" />
+                <div id="actThumbFallback" style="color:#475670;font-size:10px;">loading…</div>
+              </div>
+              <div style="flex:1 1 auto;min-width:0;">
+                <div style="font-size:11px;color:#7a90b8;margin-bottom:2px;">Earliest photo in this folder</div>
+                <div style="font-size:12px;color:#cbd2dc;word-break:break-all;margin-bottom:10px;" title="${escapeHtml(anchorRow.filename || '')}">${escapeHtml(anchorRow.filename || '(unknown file)')}</div>
+                <label style="display:flex;flex-direction:column;gap:4px;">
+                  <span style="font-size:11px;color:#a9c9ee;font-weight:600;">This photo was taken at:</span>
+                  <input id="actDateInput" type="datetime-local" step="1" value="${escapeHtml(initialValue)}"
+                    style="padding:7px 10px;border:1px solid #2a3040;background:#0e1320;color:#e8f0f8;border-radius:6px;font-size:13px;font-family:inherit;" />
+                </label>
+              </div>
+            </div>
+            <div id="actSummary" style="background:#15192a;border:1px solid #243043;border-radius:6px;padding:10px 12px;margin-bottom:16px;font-size:12px;color:#a9c9ee;line-height:1.6;"></div>
+          ` : `
+            <div style="background:#2a1a1a;border:1px solid #52323a;border-radius:6px;padding:12px;margin-bottom:16px;font-size:12px;color:#d0a0a0;line-height:1.5;">
+              No images in this folder have a readable capture time, so there's nothing to shift.
+            </div>
+          `}
+          <div style="display:flex;gap:8px;justify-content:flex-end;">
+            <button id="actCancel" style="padding:8px 16px;border:1px solid #3a465f;background:#1c2433;color:#e8f0f8;border-radius:6px;cursor:pointer;font-size:13px;">Cancel</button>
+            <button id="actApply" ${anchorRow ? '' : 'disabled'} style="padding:8px 16px;border:1px solid #2a5fa8;background:#1a3a6a;color:#7eb8e0;border-radius:6px;cursor:${anchorRow ? 'pointer' : 'not-allowed'};font-size:13px;font-weight:600;opacity:${anchorRow ? '1' : '.55'};">Save</button>
+          </div>
+        </div>
+      `;
+      document.body.appendChild(dlg);
+      const closeAndRemove = () => { try { dlg.close(); } catch (_) {} if (dlg.parentNode) dlg.parentNode.removeChild(dlg); };
+
+      // Load the anchor photo thumbnail asynchronously (desktop only).
+      //
+      // Prefer `export_path` (the cached JPEG preview Kestrel generates for
+      // every image, including raws) and fall back to `crop_path`. Using
+      // `filename` alone fails silently for raw formats like CR3/NEF/ARW
+      // because the browser can't decode them directly — that's why the
+      // placeholder was stuck on "loading…".
+      if (anchorRow) {
+        const thumbRel = anchorRow.export_path || anchorRow.crop_path || anchorRow.filename || '';
+        if (thumbRel) {
+          (async () => {
+            const imgEl = dlg.querySelector('#actThumb');
+            const fbEl = dlg.querySelector('#actThumbFallback');
+            try {
+              const url = await getBlobUrlForPath(thumbRel, folderPath);
+              if (url && imgEl) {
+                imgEl.addEventListener('load', () => {
+                  imgEl.style.display = 'block';
+                  if (fbEl) fbEl.style.display = 'none';
+                });
+                imgEl.addEventListener('error', () => {
+                  if (fbEl) fbEl.textContent = '—';
+                });
+                imgEl.src = url;
+              } else if (fbEl) {
+                fbEl.textContent = '—';
+              }
+            } catch (_) {
+              if (fbEl) fbEl.textContent = '—';
+            }
+          })();
+        }
+      }
+
+      const dateInput = dlg.querySelector('#actDateInput');
+      const summaryEl = dlg.querySelector('#actSummary');
+      const applyBtn = dlg.querySelector('#actApply');
+
+      const setApplyEnabled = (enabled) => {
+        if (!applyBtn) return;
+        applyBtn.disabled = !enabled;
+        applyBtn.style.opacity = enabled ? '1' : '.55';
+        applyBtn.style.cursor = enabled ? 'pointer' : 'not-allowed';
+      };
+
+      const renderSummary = () => {
+        if (!dateInput || !summaryEl) return;
+        const newMs = _datetimeLocalValueToMs(dateInput.value);
+        if (!Number.isFinite(newMs) || !Number.isFinite(anchorOriginalMs)) {
+          summaryEl.innerHTML = '<span style="color:#d08080;">Enter a valid date &amp; time.</span>';
+          setApplyEnabled(false);
+          return;
+        }
+        const offsetMs = newMs - anchorOriginalMs;
+        const prettyOriginal = _formatPrettyLocalTime(anchorOriginalMs);
+        if (offsetMs === 0) {
+          summaryEl.innerHTML = `
+            <div style="color:#7a90b8;">No change — the new time matches what was originally reported.</div>
+            <div style="margin-top:4px;"><span style="color:#7a90b8;">Original reported time:</span> <code style="background:#1c2438;padding:1px 5px;border-radius:3px;">${escapeHtml(prettyOriginal)}</code></div>
+          `;
+          setApplyEnabled(false);
+          return;
+        }
+        setApplyEnabled(true);
+        summaryEl.innerHTML = `
+          <div><span style="color:#7a90b8;">Original reported time:</span> <code style="background:#1c2438;padding:1px 5px;border-radius:3px;">${escapeHtml(prettyOriginal)}</code></div>
+          <div style="margin-top:4px;"><span style="color:#7a90b8;">This will shift all ${withTime} timed photo${withTime === 1 ? '' : 's'} by:</span> <b style="color:#8fc4ff;">${escapeHtml(_formatOffsetMs(offsetMs))}</b></div>
+        `;
+      };
+
+      if (dateInput) {
+        dateInput.addEventListener('input', renderSummary);
+        dateInput.addEventListener('change', renderSummary);
+        renderSummary();
+      }
+
+      dlg.querySelector('#actCancel').addEventListener('click', closeAndRemove);
+      if (anchorRow && applyBtn) {
+        applyBtn.addEventListener('click', () => {
+          const newMs = _datetimeLocalValueToMs(dateInput.value);
+          if (!Number.isFinite(newMs) || !Number.isFinite(anchorOriginalMs)) { closeAndRemove(); return; }
+          const offsetMs = newMs - anchorOriginalMs;
+          if (offsetMs === 0) { closeAndRemove(); return; }
+          let changed = 0;
+          for (const r of targetRows) {
+            const next = _shiftIsoTime(r.capture_time, offsetMs);
+            if (next && next !== r.capture_time) {
+              r.capture_time = next;
+              changed++;
+            }
+          }
+          if (changed > 0) {
+            markDirty(folderPath);
+            try { renderScenes(); } catch (_) {}
+            showToast(`Shifted ${changed} capture time${changed === 1 ? '' : 's'} by ${_formatOffsetMs(offsetMs)}`, 3500);
+          } else {
+            showToast('No capture times changed', 2500);
+          }
+          closeAndRemove();
+        });
+      }
+      dlg.addEventListener('close', () => { if (dlg.parentNode) dlg.parentNode.removeChild(dlg); });
+      dlg.showModal();
+    }
+
     // ---- Write Metadata launcher ----
     async function writeMetadataForFolder(rootPath) {
       if (!window.pywebview?.api) {
@@ -7580,9 +8381,31 @@
       dlg.style.cssText = [
         'border:1px solid #303a52', 'border-radius:12px', 'background:#141a24',
         'color:#e8f0f8', 'padding:0', 'min-width:440px', 'max-width:560px',
-        'width:90vw', 'height:auto', 'overflow-y:auto',
+        'width:90vw',
+        // `fit-content` hugs the actual content (Chromium quirk: `auto` +
+        // `max-height` + `overflow-y:auto` can render at the max-height).
+        'height:fit-content', 'max-height:92vh',
+        'overflow-x:hidden', 'overflow-y:auto',
         'box-shadow:0 8px 40px rgba(0,0,0,0.6)',
       ].join(';');
+
+      const xmpFieldDefaults = {
+        rating: true,
+        label: true,
+        species: true,
+        family: true,
+        quality: true,
+      };
+      const savedXmpFields = getSetting('xmp_fields', xmpFieldDefaults) || {};
+      const xmpFields = { ...xmpFieldDefaults, ...savedXmpFields };
+      const fieldRow = (key, title, desc) => `
+        <label style="display:flex;align-items:flex-start;gap:8px;padding:5px 8px;border-radius:5px;cursor:pointer;" class="wm-field-row">
+          <input type="checkbox" data-xmp-field="${key}" ${xmpFields[key] ? 'checked' : ''} style="margin-top:2px;flex-shrink:0;" />
+          <span style="display:flex;flex-direction:column;gap:1px;min-width:0;">
+            <span style="font-size:12px;font-weight:600;color:#e8f0f8;">${title}</span>
+            <span style="font-size:11px;color:#7a90b8;line-height:1.35;">${desc}</span>
+          </span>
+        </label>`;
 
       dlg.innerHTML = `
         <div style="padding:20px 22px 14px;border-bottom:1px solid #222e45;">
@@ -7596,6 +8419,18 @@
             <div style="flex:1;min-width:0;">
               <div style="font-size:13px;font-weight:600;margin-bottom:4px;">XMP Sidecar Files</div>
               <div style="font-size:12px;color:#7a90b8;line-height:1.5;">Writes a <code style="background:#1c2438;padding:1px 4px;border-radius:3px;">.xmp</code> sidecar file next to each original. Embeds star ratings, Accept/Reject decisions, and species tags in a format readable by Lightroom, Capture One, darktable, and other editors.</div>
+            </div>
+          </div>
+          <div style="background:#15192a;border:1px solid #243043;border-radius:8px;padding:10px 14px;margin-bottom:12px;">
+            <div style="font-size:12px;font-weight:600;color:#a9c9ee;margin-bottom:6px;display:flex;align-items:center;gap:6px;">
+              <span style="font-size:13px;">⚙️</span> Fields to write
+            </div>
+            <div style="display:grid;grid-template-columns:1fr 1fr;gap:2px;">
+              ${fieldRow('rating', 'Star Rating', 'xmp:Rating (0–5 stars).')}
+              ${fieldRow('label', 'Color Label', 'xmp:Label — Green/Red for Accept/Reject.')}
+              ${fieldRow('species', 'Species Tag', 'kestrel:Species + species keyword.')}
+              ${fieldRow('family', 'Family Tag', 'kestrel:Family + family keyword.')}
+              ${fieldRow('quality', 'Quality Score', 'kestrel:QualityScore (0–1).')}
             </div>
           </div>
           <div style="background:#1a1f10;border:1px solid #3a4020;border-radius:6px;padding:10px 14px;margin-bottom:16px;font-size:12px;color:#b0c070;line-height:1.5;">
@@ -7671,11 +8506,33 @@
 
       dlg.querySelector('#wmCancel').addEventListener('click', closeAndRemove);
 
+      // Read the current field selection out of the dialog and persist it so
+      // the next write defaults to whatever the user picked last.
+      const collectFieldSelection = () => {
+        const sel = { ...xmpFieldDefaults };
+        dlg.querySelectorAll('input[data-xmp-field]').forEach(cb => {
+          sel[cb.dataset.xmpField] = !!cb.checked;
+        });
+        return sel;
+      };
+      const persistFieldSelection = (sel) => {
+        try {
+          const cur = loadSettings();
+          cur.xmp_fields = sel;
+          saveSettings(cur);
+          if (window.pywebview?.api?.save_settings_data) {
+            window.pywebview.api.save_settings_data({ xmp_fields: sel }).catch(() => {});
+          }
+        } catch (_) {}
+      };
+
       dlg.querySelector('#wmOk').addEventListener('click', async () => {
+        const fieldSelection = collectFieldSelection();
+        persistFieldSelection(fieldSelection);
         showView('wmProgressView');
         addStep('write', 'Writing XMP sidecar files', 'running');
         try {
-          const res = await window.pywebview.api.write_xmp_metadata(rootPath, payload, false, false);
+          const res = await window.pywebview.api.write_xmp_metadata(rootPath, payload, false, false, fieldSelection);
           if (!res.success) {
             setStep('write', 'failed', res.error || 'Unknown error');
             dlg.querySelector('#wmProgressActions').style.display = 'flex';
@@ -7709,7 +8566,7 @@
               showView('wmProgressView');
               addStep('overwrite', 'Overwriting conflicting XMP files', 'running');
               try {
-                const res2 = await window.pywebview.api.write_xmp_metadata(rootPath, payload, true, false);
+                const res2 = await window.pywebview.api.write_xmp_metadata(rootPath, payload, true, false, fieldSelection);
                 if (!res2.success) {
                   setStep('overwrite', 'failed', res2.error || 'Unknown error');
                 } else {
@@ -7781,34 +8638,40 @@
     }
 
     // ====================================================================
-    // Tutorial System  (Part 1 = Analyze intro, Part 2 = Browse features)
+    // Tutorial System  (Basics = short onboarding, Advanced = full tour)
     // Interactive: some steps require user action before advancing.
-    // Inspired by the website try-it-out demo's waitFor/trigger pattern.
+    // Engine supports: waitFor, waitForChain, inDialog, setupAction,
+    // highlightAlso[], customBody, loadSamplesOnNext, inlineFooter.
     // ====================================================================
 
-    const TUTORIAL_PART1 = [
-      {
-        title: 'Welcome to Project Kestrel!',
-        body: 'Project Kestrel uses machine learning to organize your photos, helping you review them more efficiently, search through your library, and quickly decide which ones to edit and share.<br><br>This guided tutorial will walk you through the core features of Kestrel.',
-        target: null,
-      },
-      {
-        title: 'First, Analyze Your Photos',
-        body: 'Click <b>Analyze Folders\u2026</b> to select folders that contain your bird photos. Kestrel groups them by scene, detects birds using AI, guesses the bird species and family, and scores quality automatically.',
-        target: '#analyzeQueueBtn',
-        position: 'bottom',
-      },
-      {
-        title: 'Open an Analyzed Folder',
-        body: 'Once you\u2019ve analyzed a folder with Kestrel, click <b>Open Folder\u2026</b> to browse it. Kestrel loads your scenes.<br><br>We\u2019ll auto-load some <b>sample bird photos</b> next so you can see it in action!',
-        target: '#pickFolder',
-        position: 'bottom',
-      },
-    ];
+    const _tutWelcomeStep = {
+      title: 'Welcome to Project Kestrel!',
+      body: 'Project Kestrel uses machine learning to organize your bird photography \u2014 helping you review photos more efficiently, search through your library, and quickly find the ones you want to edit and share.<br><br>Click <b>Next</b> and we\u2019ll auto-load some <b>sample bird photos</b> so you can see Kestrel in action.',
+      target: null,
+      loadSamplesOnNext: true,
+    };
 
-    const TUTORIAL_PART2 = [
+    const _tutWorkflowStep = {
+      title: 'Fit Kestrel into your workflow',
+      body: '',
+      target: '.write-metadata-btn',
+      position: 'bottom',
+      customBody: 'workflowCard',
+      highlightAlso: ['.culling-assistant-btn'],
+    };
+
+    const _tutTryYourOwnStepBase = {
+      title: 'Now try it with your own photos',
+      body: 'You\u2019re ready!<br><br>\u2022 Click <b>Analyze Folders\u2026</b> to process a new folder of photos.<br>\u2022 Click <b>Open Folder\u2026</b> (or drop into the Folder Tree) to browse photos Kestrel has already analyzed.<br><br><b>Tip:</b> open a parent folder once to load your whole library \u2014 then search across every outing, every year.',
+      target: '#analyzeQueueBtn',
+      position: 'right',
+      highlightAlso: ['#pickFolder'],
+    };
+
+    const TUTORIAL_BASICS = [
+      _tutWelcomeStep,
       {
-        title: 'Your Photos, Organized by Scene',
+        title: 'Your photos, organized by scene',
         body: 'Kestrel organizes your photos into <b>scenes</b> \u2014 groups of similar images captured in the same burst. The scene grid shows these scenes in the order they were taken.',
         nudge: 'Click on a scene to open it!',
         target: '#sceneGrid .card',
@@ -7816,8 +8679,8 @@
         waitFor: 'clickScene',
       },
       {
-        title: 'Explore Your Scene',
-        body: 'Within each scene, your photos are automatically <b>sorted by quality</b> \u2014 from sharpest to blurriest. You can immediately focus your attention on the best shots!<br><br>Click on a photo in the filmstrip to view its details.',
+        title: 'Explore your scene',
+        body: 'Within each scene, your photos are automatically <b>sorted by quality</b> \u2014 from sharpest to blurriest. Focus your attention on the best shots first.<br><br>Click on a photo in the filmstrip to view its details.',
         nudge: 'Click a photo in the filmstrip below!',
         target: '#imageGrid',
         position: 'top',
@@ -7825,8 +8688,54 @@
         waitFor: 'clickFilmstrip',
       },
       {
-        title: 'Ratings and Culling Decisions',
-        body: 'Kestrel computes <b>star ratings</b> based on each image\u2019s quality score. Click the stars to set your own. <span style="color:#6aa0ff">Blue stars</span> = AI rating \u00b7 <span style="color:#f5c542">Gold stars</span> = your manual override.<br><br>Use the <b>Accept \u00b7 Undecided \u00b7 Reject</b> buttons to make a culling decision for each photo. These will come in handy with the Culling Assistant later!',
+        title: 'Make a culling decision, then close the scene',
+        body: 'Kestrel computes <b>star ratings</b> based on each image\u2019s quality score. Click the stars to set your own. <span style="color:#6aa0ff">Blue stars</span> = AI rating \u00b7 <span style="color:#f5c542">Gold stars</span> = your manual override.<br><br>Use the <b>Accept \u00b7 Undecided \u00b7 Reject</b> buttons to make a culling decision. These decisions power the Culling Assistant later!<br><br>When you\u2019re done, close the scene to continue.',
+        nudge: 'Mark a photo Accept/Reject, then close the scene.',
+        target: '#sceneInfoBar',
+        position: 'top-left',
+        inDialog: true,
+        waitForChain: ['clickCullToggle', 'closeDialog'],
+      },
+      {
+        title: 'Search and filter',
+        body: 'Use the <b>Filter &amp; Sort</b> panel to narrow your scenes down:<br><br>\u2022 <b>Search</b> by bird species or family \u2014 the grid filters instantly.<br>\u2022 <b>Sort</b> by Capture Time, Quality, or Image Count.<br>\u2022 Toggle <b>Group by folder</b> / <b>capture time</b> to reorganize.<br><br>You can always tweak further in the options below.',
+        target: '.filter-panel',
+        position: 'right',
+      },
+      _tutWorkflowStep,
+      {
+        title: 'Which photo editor do you use?',
+        body: 'Pick your preferred photo editor below. Kestrel will use it when you press <b>Space</b> or click the <b>Open</b> button (top-right of the scene info bar) to launch a photo.',
+        target: null,
+        customBody: 'editorPicker',
+      },
+      Object.assign({}, _tutTryYourOwnStepBase, {
+        inlineFooter: 'advancedLink',
+      }),
+    ];
+
+    const TUTORIAL_ADVANCED = [
+      _tutWelcomeStep,
+      {
+        title: 'Your photos, organized by scene',
+        body: 'Kestrel organizes your photos into <b>scenes</b> \u2014 groups of similar images captured in the same burst. The scene grid shows these scenes in the order they were taken.',
+        nudge: 'Click on a scene to open it!',
+        target: '#sceneGrid .card',
+        position: 'right',
+        waitFor: 'clickScene',
+      },
+      {
+        title: 'Explore your scene',
+        body: 'Within each scene, your photos are automatically <b>sorted by quality</b> \u2014 from sharpest to blurriest. Click on a photo in the filmstrip to view its details.',
+        nudge: 'Click a photo in the filmstrip below!',
+        target: '#imageGrid',
+        position: 'top',
+        inDialog: true,
+        waitFor: 'clickFilmstrip',
+      },
+      {
+        title: 'Ratings and culling decisions',
+        body: 'Kestrel computes <b>star ratings</b> based on each image\u2019s quality score. Click the stars to set your own. <span style="color:#6aa0ff">Blue stars</span> = AI rating \u00b7 <span style="color:#f5c542">Gold stars</span> = your manual override.<br><br>Use the <b>Accept \u00b7 Undecided \u00b7 Reject</b> buttons to make a culling decision for each photo. These come in handy with the Culling Assistant later!',
         nudge: 'Mark a photo as Accepted or Rejected to continue!',
         target: '#sceneInfoBar',
         position: 'top-left',
@@ -7834,7 +8743,28 @@
         waitFor: 'clickCullToggle',
       },
       {
-        title: 'Keyboard Shortcuts',
+        title: 'Multiple birds in a scene? Switch crops.',
+        body: 'When a scene has more than one bird, the <b>\u25c2 / \u25b8 crop buttons</b> appear next to the filename. Click them to cycle through each bird crop.<br><br>Equivalent keyboard shortcuts:<br>\u2022 <kbd>\u2191</kbd> / <kbd>\u2193</kbd> \u2014 previous / next crop<br>\u2022 <kbd>Enter</kbd> \u2014 promote the active crop as the scene\u2019s primary bird<br><br>(If the current sample scene only has one bird, the crop buttons stay hidden.)',
+        target: '#sceneInfoCropNav',
+        position: 'top',
+        inDialog: true,
+      },
+      {
+        title: 'Open in your photo editor',
+        body: 'Click this <b>Open</b> button (or press <kbd>Space</kbd>) to launch the original photo in your chosen photo editor. You can change which editor Kestrel uses in <b>Settings</b>.',
+        target: '#sceneInfoEditorBtn',
+        position: 'top-left',
+        inDialog: true,
+      },
+      {
+        title: 'RAW zoom',
+        body: 'Want to pixel-peep the RAW? <b>Click and hold</b> on the full image to load the original RAW file and zoom in at the cursor. <b>Scroll</b> while holding to change zoom level, or use the <b>RAW Zoom</b> slider to set a default.<br><br>Release to return to the normal preview.',
+        target: '#sceneZoomWrap',
+        position: 'top',
+        inDialog: true,
+      },
+      {
+        title: 'Keyboard shortcuts',
         body: 'Kestrel has keyboard shortcuts to make reviewing photos faster. The shortcuts are listed above \u2014 try some out before continuing!',
         target: '#sceneShortcutLegend',
         position: 'bottom',
@@ -7842,8 +8772,8 @@
         setupAction: 'expandShortcuts',
       },
       {
-        title: 'Other Scene Features',
-        body: 'A few more things you can do once you\u2019re browsing your <b>own photos</b> (these won\u2019t work on the sample images):<br><br>\u2022 <b>Click and drag</b> on the full image to load the RAW file and zoom in<br>\u2022 Edit the <b>scene name</b> and <b>tags</b> at the top<br>\u2022 Press <kbd>Space</kbd> to open the photo in your preferred photo editor<br>\u2022 Use <b>\u2702 Split Scene</b> if Kestrel accidentally merged two different scenes<br><br>Click <b>Close</b> to continue!',
+        title: 'A few more scene features',
+        body: 'A few more things you can do once you\u2019re browsing your <b>own photos</b> (some won\u2019t work on the sample images):<br><br>\u2022 Edit the <b>scene name</b> and <b>tags</b> at the top<br>\u2022 Use <b>\u2702 Split Scene</b> if Kestrel accidentally merged two different scenes<br>\u2022 <b>Copy</b> (clipboard) the full image or bird crop straight from the preview<br><br>Close the scene dialog to continue.',
         nudge: 'Close the scene dialog to continue.',
         target: '#closeDlg',
         position: 'bottom',
@@ -7851,18 +8781,25 @@
         waitFor: 'closeDialog',
       },
       {
-        title: 'Filtering Options',
-        body: '\u2022 <b>Search</b> for any bird species or family \u2014 the grid filters instantly as you type.<br>\u2022 Don\u2019t see scenes after searching? Lower the <b>Confidence Threshold</b> to see more results.<br>\u2022 Enable <b>Multi-subject mode</b> if your scenes contain multiple bird species.<br>\u2022 <b>Sort</b> by Quality, Image Count, or Capture Time.',
+        title: 'Filtering options',
+        body: '\u2022 <b>Search</b> for any bird species or family \u2014 the grid filters instantly as you type.<br>\u2022 Don\u2019t see scenes after searching? Lower the <b>Confidence</b> threshold to see more results.<br>\u2022 Enable <b>Multi-subject mode</b> if your scenes contain multiple species.<br>\u2022 <b>Sort</b> by Capture Time, Quality, Scene ID, or Image Count.<br>\u2022 Toggle <b>Group by folder</b> / <b>capture time</b> to reorganize the grid.',
         target: '.filter-panel',
         position: 'right',
       },
       {
-        title: 'Merging Scenes',
-        body: 'The two highlighted scenes above were actually one continuous burst that Kestrel split in two. Hold <kbd>Ctrl</kbd>/<kbd>Cmd</kbd> and click both cards to select them, then click <b>Merge selected scenes</b> to combine them back into one.<br><br>You can also <kbd>Shift+Click</kbd> to range-select a group of scenes at once.',
+        title: 'Merging scenes',
+        body: 'The two highlighted scenes above were actually one continuous burst that Kestrel split in two. Hold <kbd>Ctrl</kbd> and click both cards to select them, then click <b>Merge selected scenes</b> to combine them back into one.<br><br>You can also <kbd>Shift</kbd>+click to range-select a group of scenes at once.',
         target: '#sceneGrid .card:nth-child(2)',
-        highlightFirst: '#sceneGrid .card:nth-child(1)',
+        highlightAlso: ['#sceneGrid .card:nth-child(1)'],
         position: 'bottom',
       },
+      {
+        title: 'Search across your whole library',
+        body: 'Kestrel searches across <b>every loaded folder</b> by species or family.<br><br><b>Tip:</b> open a <b>parent folder</b> once (via <b>Open Folder\u2026</b> or the Folder Tree) and Kestrel loads your entire library at once \u2014 then you can search across every outing and every year without re-loading anything.',
+        target: '#search',
+        position: 'right',
+      },
+      _tutWorkflowStep,
       {
         title: 'Write Photo Metadata',
         body: 'Click <b>Write Photo Metadata</b> to export Kestrel\u2019s star ratings and Accept/Reject decisions into XMP sidecar files alongside your photos. These <code>.xmp</code> files are understood natively by <b>Adobe Lightroom</b>, <b>darktable</b>, <b>Capture One</b>, and other editors.<br><br>\u26a0\ufe0f <b>Write photo metadata <em>before</em> importing into your photo editor</b> \u2014 most catalogues ignore new sidecar files once a photo is already imported. If a sidecar was already created by another application, Kestrel will ask before overwriting it.',
@@ -7877,29 +8814,31 @@
       },
       {
         title: 'Options',
-        body: 'Click <b>Settings</b> to choose your preferred <b>photo editor</b> (Lightroom, Darktable, or system default). Opening a photo with <kbd>Space</kbd> will launch it there. You can also tweak several other options.',
+        body: 'Click <b>Settings</b> to choose your preferred <b>photo editor</b> (Lightroom, Darktable, or system default). Opening a photo with <kbd>Space</kbd> will launch it there. You can also tweak several other options \u2014 including the experimental <b>wildlife mode</b> that detects non-bird wildlife.',
         target: '#openSettings',
         position: 'bottom',
       },
       {
-        title: 'You\u2019re All Set!',
-        body: 'That\u2019s the tour! Quick recap:<br><br>\u2022 <b>Analyze Folders</b> to process new photos<br>\u2022 <b>Open Folder</b> to browse analyzed photos<br>\u2022 <b>Click scenes</b> to view &amp; rate photos<br>\u2022 <b>Culling Assistant</b> for bulk Accept/Reject workflow<br>\u2022 <b>Write Photo Metadata</b> to export to Lightroom, darktable, etc.<br><br>\u26a0\ufe0f <b>Remember:</b> Write photo metadata <em>before</em> importing into Lightroom or Capture One for best results!<br><br>Click the <b>\uD83D\uDCD6 Tutorial</b> button anytime to replay this tour. Happy birding!',
+        title: 'You\u2019re all set!',
+        body: 'That\u2019s the full tour! Quick recap:<br><br>\u2022 <b>Analyze Folders</b> to process new photos<br>\u2022 <b>Open Folder</b> to browse analyzed photos<br>\u2022 <b>Click scenes</b> to view &amp; rate photos<br>\u2022 <b>Culling Assistant</b> for bulk Accept/Reject workflow<br>\u2022 <b>Write Photo Metadata</b> to export to Lightroom, darktable, etc.<br><br>\u26a0\ufe0f <b>Remember:</b> Write photo metadata <em>before</em> importing into Lightroom or Capture One for best results!<br><br>Click the <b>\uD83D\uDCD6 Tutorial</b> button anytime to replay this tour. Happy birding!',
         target: null,
       },
       {
-        title: 'Please Send Feedback!',
+        title: 'Please send feedback!',
         body: 'I (the person who made Project Kestrel) would really love to hear from you! Please tell me if you found the app useful, or if you find any bugs or have suggestions for improvements.<br><br>Thank you for trying Kestrel!',
         target: '#openFeedback',
         position: 'top',
       },
+      _tutTryYourOwnStepBase,
     ];
 
     let _tutStep = 0;
     let _tutSteps = [];
-    let _tutPart = 0;               // 0 = not started, 1 = part1, 2 = part2
+    let _tutBranch = '';             // '' = not started, 'basics', 'advanced'
     let _tutSampleLoaded = false;    // track if we auto-loaded sample sets
     let _tutCleanupFn = null;        // cleanup function for current waitFor listeners
     let _tutInDialog  = false;       // true while tutorial card is inside the scene dialog
+    let _tutChainIdx  = 0;           // index into step.waitForChain
 
     function _tutEl(sel) { return document.querySelector(sel); }
 
@@ -7922,13 +8861,10 @@
     }
 
     function _tutCleanup() {
-      // Remove any highlight-target classes
       document.querySelectorAll('.highlight-target').forEach(function(el) {
         el.classList.remove('highlight-target');
       });
-      // Run cleanup for waitFor listeners
       if (_tutCleanupFn) { _tutCleanupFn(); _tutCleanupFn = null; }
-      // If tutorial card was moved inside the scene dialog (top layer), move it back
       if (_tutInDialog) {
         _tutInDialog = false;
         var _ovl = _tutEl('#tutorialOverlay');
@@ -7938,11 +8874,15 @@
       }
     }
 
-    function startMainTutorial(part, fromStep) {
+    function startMainTutorial(branch, fromStep) {
       _tutCleanup();
-      _tutPart = part || 1;
-      _tutSteps = _tutPart === 1 ? TUTORIAL_PART1 : TUTORIAL_PART2;
+      // Backward-compat: legacy callers passed 1 or 2
+      if (branch === 1) branch = 'basics';
+      else if (branch === 2) branch = 'advanced';
+      _tutBranch = (branch === 'advanced') ? 'advanced' : 'basics';
+      _tutSteps = (_tutBranch === 'advanced') ? TUTORIAL_ADVANCED : TUTORIAL_BASICS;
       _tutStep = fromStep || 0;
+      _tutChainIdx = 0;
       _tutEl('#tutorialOverlay').classList.add('active');
       _showMainTutStep(_tutStep);
     }
@@ -7952,8 +8892,162 @@
       _tutEl('#tutorialOverlay').classList.remove('active', 'has-backdrop');
       _tutEl('#tutorialHighlight').style.display = 'none';
       _tutEl('#tutorialNudge').style.display = 'none';
-      if (_tutPart >= 2) markMainTutorialSeen();
-      _tutPart = 0;
+      if (_tutBranch) markMainTutorialSeen();
+      _tutBranch = '';
+    }
+
+    // Install a single waitFor listener. Returns a cleanup fn that removes it.
+    // onDone is called (with no args) when the gesture is detected.
+    function _installTutWaitFor(key, onDone) {
+      if (key === 'clickScene') {
+        var sceneGridEl = document.getElementById('sceneGrid');
+        if (!sceneGridEl) return function() {};
+        var handler = function(ev) {
+          var cardEl = ev.target.closest('.card');
+          if (cardEl) setTimeout(onDone, 400);
+        };
+        sceneGridEl.addEventListener('click', handler, true);
+        return function() { sceneGridEl.removeEventListener('click', handler, true); };
+      }
+      if (key === 'clickStar') {
+        var onStarClick = function(ev) {
+          var starEl = ev.target.closest('.star, .stars span');
+          if (starEl) setTimeout(onDone, 300);
+        };
+        document.addEventListener('click', onStarClick, true);
+        return function() { document.removeEventListener('click', onStarClick, true); };
+      }
+      if (key === 'clickFilmstrip') {
+        var filmstripEl = document.getElementById('imageGrid');
+        if (!filmstripEl) return function() {};
+        var onFilmstripClick = function(ev) {
+          var cardEl = ev.target.closest('.filmstrip-card, .card');
+          if (cardEl) setTimeout(onDone, 350);
+        };
+        filmstripEl.addEventListener('click', onFilmstripClick, true);
+        return function() { filmstripEl.removeEventListener('click', onFilmstripClick, true); };
+      }
+      if (key === 'clickCullToggle') {
+        var onCullClick = function(ev) {
+          var cullBtn = ev.target.closest('.cull-btn[data-cull="accept"], .cull-btn[data-cull="reject"]');
+          if (cullBtn) setTimeout(onDone, 400);
+        };
+        document.addEventListener('click', onCullClick, true);
+        return function() { document.removeEventListener('click', onCullClick, true); };
+      }
+      if (key === 'closeDialog') {
+        var sceneDlgEl = document.getElementById('sceneDlg');
+        if (!sceneDlgEl) return function() {};
+        var onDlgClose = function() {
+          sceneDlgEl.removeEventListener('close', onDlgClose);
+          setTimeout(onDone, 250);
+        };
+        sceneDlgEl.addEventListener('close', onDlgClose);
+        return function() { sceneDlgEl.removeEventListener('close', onDlgClose); };
+      }
+      return function() {};
+    }
+
+    function _renderTutWorkflowCard(bodyEl) {
+      bodyEl.innerHTML =
+        '<div class="tut-workflow-intro">Pick the workflow that fits how you already edit \u2014 Kestrel plugs into any of them.</div>' +
+        '<div class="tut-workflow-tabs" role="tablist">' +
+          '<button type="button" class="tut-wf-tab active" data-tab="none">No workflow changes</button>' +
+          '<button type="button" class="tut-wf-tab" data-tab="cull">Cut the blurry bulk</button>' +
+          '<button type="button" class="tut-wf-tab" data-tab="favs">Just my favorites</button>' +
+        '</div>' +
+        '<div class="tut-workflow-panels">' +
+          '<div class="tut-wf-panel active" data-panel="none">' +
+            '<div class="tut-wf-flow">' +
+              '<div class="tut-wf-node">Your Photos</div>' +
+              '<div class="tut-wf-arrow">\u2192</div>' +
+              '<div class="tut-wf-node accent">Kestrel Analyzes</div>' +
+              '<div class="tut-wf-arrow">\u2192</div>' +
+              '<div class="tut-wf-node highlight">Write Metadata</div>' +
+            '</div>' +
+            '<div class="tut-wf-caption">Just export Kestrel\u2019s analysis as XMP sidecars, then browse them in the photo editor you already use.</div>' +
+          '</div>' +
+          '<div class="tut-wf-panel" data-panel="cull">' +
+            '<div class="tut-wf-flow">' +
+              '<div class="tut-wf-node">Your Photos</div>' +
+              '<div class="tut-wf-arrow">\u2192</div>' +
+              '<div class="tut-wf-node accent">Kestrel Analyzes</div>' +
+              '<div class="tut-wf-arrow">\u2192</div>' +
+              '<div class="tut-wf-node highlight">Culling Assistant</div>' +
+              '<div class="tut-wf-arrow">\u2192</div>' +
+              '<div class="tut-wf-node">Accepts / Rejects</div>' +
+            '</div>' +
+            '<div class="tut-wf-caption">Use the <b>Culling Assistant</b> to cut the blurry bulk \u2014 keep the sharp photos and archive the rest in one pass.</div>' +
+          '</div>' +
+          '<div class="tut-wf-panel" data-panel="favs">' +
+            '<div class="tut-wf-flow">' +
+              '<div class="tut-wf-node">Your Photos</div>' +
+              '<div class="tut-wf-arrow">\u2192</div>' +
+              '<div class="tut-wf-node accent">Kestrel Analyzes</div>' +
+              '<div class="tut-wf-arrow">\u2192</div>' +
+              '<div class="tut-wf-node">Pick Favorites</div>' +
+              '<div class="tut-wf-arrow">\u2192</div>' +
+              '<div class="tut-wf-node highlight">Open in Editor</div>' +
+            '</div>' +
+            '<div class="tut-wf-caption">Browse your scenes in Kestrel and press <kbd>Space</kbd> on the ones you love \u2014 they open straight in your photo editor.</div>' +
+          '</div>' +
+        '</div>' +
+        '<div class="tut-workflow-hint">We\u2019ve highlighted the two buttons you\u2019ll use most: <b>Write Photo Metadata</b> and <b>Open Culling Assistant</b>.</div>';
+
+      var tabs = bodyEl.querySelectorAll('.tut-wf-tab');
+      var panels = bodyEl.querySelectorAll('.tut-wf-panel');
+      tabs.forEach(function(tab) {
+        tab.addEventListener('click', function() {
+          var key = tab.getAttribute('data-tab');
+          tabs.forEach(function(t) { t.classList.toggle('active', t === tab); });
+          panels.forEach(function(p) { p.classList.toggle('active', p.getAttribute('data-panel') === key); });
+        });
+      });
+    }
+
+    function _renderTutEditorPicker(bodyEl, onChosen) {
+      var intro = document.createElement('div');
+      intro.className = 'tut-editor-intro';
+      intro.innerHTML = 'Inside any scene, press <kbd>Space</kbd> or click the <b>Open</b> button (top-right of the info bar) to launch the original in your chosen editor.';
+      bodyEl.innerHTML = '';
+      bodyEl.appendChild(intro);
+
+      var grid = document.createElement('div');
+      grid.className = 'tut-editor-grid';
+      var choices = [
+        { key: 'lightroom',   label: 'Adobe Lightroom Classic' },
+        { key: 'darktable',   label: 'Darktable' },
+        { key: 'capture_one', label: 'Capture One' },
+        { key: 'photoshop',   label: 'Adobe Photoshop' },
+        { key: 'system',      label: 'System Default' },
+        { key: '__other',     label: 'Other\u2026 (open Settings)' },
+      ];
+      choices.forEach(function(c) {
+        var b = document.createElement('button');
+        b.type = 'button';
+        b.className = 'tut-editor-btn';
+        b.setAttribute('data-key', c.key);
+        b.innerHTML = '<span class="tut-editor-label">' + c.label + '</span>';
+        b.addEventListener('click', function() { onChosen(c.key, b); });
+        grid.appendChild(b);
+      });
+      bodyEl.appendChild(grid);
+
+      var foot = document.createElement('div');
+      foot.className = 'tut-editor-foot';
+      foot.textContent = 'You can change this anytime in Settings.';
+      bodyEl.appendChild(foot);
+    }
+
+    async function _applyChosenEditor(key) {
+      try {
+        var s = loadSettings();
+        s.editor = key;
+        saveSettings(s);
+        if (hasPywebviewApi && window.pywebview?.api?.save_settings_data) {
+          try { await window.pywebview.api.save_settings_data(s); } catch (_) {}
+        }
+      } catch (e) { console.warn('[tutorial] apply editor failed', e); }
     }
 
     function _showMainTutStep(idx) {
@@ -7966,8 +9060,10 @@
       var card    = _tutEl('#tutorialCard');
       var nudge   = _tutEl('#tutorialNudge');
       var nextBtn = _tutEl('#tutorialNext');
+      var bodyEl  = _tutEl('#tutorialBody');
 
-      // Pre-step setup actions (run before target positioning)
+      card.classList.remove('tut-card-workflow', 'tut-card-editor');
+
       if (step.setupAction === 'expandShortcuts') {
         var legend = document.getElementById('sceneShortcutLegend');
         if (legend && legend.classList.contains('hidden')) {
@@ -7976,20 +9072,54 @@
         }
       }
 
-      // Text
       _tutEl('#tutorialCounter').textContent = 'Step ' + (idx + 1) + ' of ' + _tutSteps.length;
       _tutEl('#tutorialTitle').innerHTML = step.title;
-      _tutEl('#tutorialBody').innerHTML  = step.body;
 
-      // Nudge (click-to-advance hint)
-      if (step.nudge) {
-        nudge.textContent = step.nudge;
-        nudge.style.display = '';
+      if (step.customBody === 'workflowCard') {
+        card.classList.add('tut-card-workflow');
+        _renderTutWorkflowCard(bodyEl);
+      } else if (step.customBody === 'editorPicker') {
+        card.classList.add('tut-card-editor');
+        _renderTutEditorPicker(bodyEl, async function(key, btnEl) {
+          bodyEl.querySelectorAll('.tut-editor-btn').forEach(function(b) {
+            b.classList.toggle('selected', b === btnEl);
+            b.disabled = true;
+          });
+          if (key === '__other') {
+            try { showSettings(); } catch (_) {}
+            var dlg2 = document.getElementById('settingsDlg');
+            var onClose = function() {
+              if (dlg2) dlg2.removeEventListener('close', onClose);
+              setTimeout(function() { _tutAdvance(); }, 250);
+            };
+            if (dlg2) dlg2.addEventListener('close', onClose);
+            else setTimeout(function() { _tutAdvance(); }, 400);
+          } else {
+            await _applyChosenEditor(key);
+            setTimeout(function() { _tutAdvance(); }, 350);
+          }
+        });
       } else {
-        nudge.style.display = 'none';
+        bodyEl.innerHTML = step.body || '';
       }
 
-      // Dots
+      // Optional inline footer link (e.g. Basics → Advanced)
+      if (step.inlineFooter === 'advancedLink') {
+        var foot = document.createElement('div');
+        foot.className = 'tut-inline-foot';
+        foot.innerHTML = 'Want the deep dive? <a href="#" id="tutStartAdvancedLink">Open the Advanced Tutorial</a>';
+        bodyEl.appendChild(foot);
+        var ln = foot.querySelector('#tutStartAdvancedLink');
+        if (ln) ln.addEventListener('click', function(ev) {
+          ev.preventDefault();
+          _closeMainTutorial();
+          setTimeout(function() { startMainTutorial('advanced', 0); }, 120);
+        });
+      }
+
+      if (step.nudge) { nudge.textContent = step.nudge; nudge.style.display = ''; }
+      else nudge.style.display = 'none';
+
       var dotsCont = _tutEl('#tutorialProgress');
       dotsCont.innerHTML = '';
       _tutSteps.forEach(function(_, i) {
@@ -7998,58 +9128,56 @@
         dotsCont.appendChild(d);
       });
 
-      // Back / Next labels
       _tutEl('#tutorialBack').disabled = (idx === 0);
       var isLast = (idx === _tutSteps.length - 1);
       nextBtn.textContent = isLast ? 'Finish \u2713' : 'Next \u2192';
 
-      // If this step uses waitFor, hide the Next button until the action completes
-      var hasWaitFor = !!step.waitFor;
-      nextBtn.style.display = hasWaitFor ? 'none' : '';
+      var hasWaitFor = !!step.waitFor || !!(step.waitForChain && step.waitForChain.length);
+      // customBody === 'editorPicker' manages its own advance via buttons.
+      var customManagesAdvance = (step.customBody === 'editorPicker');
+      nextBtn.style.display = (hasWaitFor || customManagesAdvance) ? 'none' : '';
 
-      // Find the target element
       var target = step.target ? document.querySelector(step.target) : null;
 
-      // For inDialog steps, check if the scene dialog is open
       var _inDialogActive = false;
       if (step.inDialog) {
         var dlg = document.getElementById('sceneDlg');
         if (!dlg || !dlg.open) {
-          // Dialog not open — show a message and allow Next to skip
-          _tutEl('#tutorialBody').innerHTML = step.body + '<br><br><span style="color:var(--brand);font-weight:600">Open a scene first, then this step will highlight the right element.</span>';
+          bodyEl.insertAdjacentHTML('beforeend', '<br><br><span style="color:var(--brand);font-weight:600">Open a scene first, then this step will highlight the right element.</span>');
           nudge.style.display = 'none';
           nextBtn.style.display = '';  // show Next even if waitFor was set
-          target = null;  // treat as center
+          target = null;
           hasWaitFor = false;
         } else {
-          // Dialog is open — physically move the tutorial card into the dialog so it
-          // appears in the browser's top layer (above the modal dialog content)
           _inDialogActive = true;
           _tutInDialog = true;
           if (card.parentElement !== dlg) { dlg.appendChild(card); }
-          overlay.style.display = 'none'; // hide the main-page dim; dialog has its own backdrop
+          overlay.style.display = 'none';
         }
       }
-      // For steps that have a separate first-element highlight target
-      if (step.highlightFirst && !_inDialogActive) {
-        var _hfEl = document.querySelector(step.highlightFirst);
-        if (_hfEl) _hfEl.classList.add('highlight-target');
+
+      // Generalized multi-target highlight (replaces the old single highlightFirst)
+      var extraTargets = [];
+      if (step.highlightFirst) extraTargets.push(step.highlightFirst);
+      if (Array.isArray(step.highlightAlso)) extraTargets = extraTargets.concat(step.highlightAlso);
+      if (!_inDialogActive) {
+        extraTargets.forEach(function(sel) {
+          var el = document.querySelector(sel);
+          if (el) el.classList.add('highlight-target');
+        });
       }
 
       if (!target || (target.offsetWidth === 0 && target.offsetHeight === 0)) {
-        // Center-screen card, full backdrop
         hl.style.display = 'none';
         overlay.classList.add('has-backdrop');
         card.style.transform = 'translate(-50%, -50%)';
         card.style.top  = '50%';
         card.style.left = '50%';
       } else {
-        // For inDialog active steps the card is inside the dialog (top layer); skip overlay hl
         hl.style.display = _inDialogActive ? 'none' : '';
         overlay.classList.remove('has-backdrop');
         card.style.transform = '';
 
-        // Add highlight-target class for the pulsing effect
         target.classList.add('highlight-target');
 
         var pad = 8;
@@ -8061,104 +9189,73 @@
           hl.style.height = (r.height + pad * 2) + 'px';
         }
 
-        // Position card near target
         var pos    = step.position || 'right';
         var margin = 18;
         var vw     = window.innerWidth;
         var vh     = window.innerHeight;
-        var cw     = 380 + margin;
+        var cw     = (card.offsetWidth || 380) + margin;
         var ch     = card.offsetHeight || 220;
-        var top, left;
-        if (pos === 'right')       { left = r.right + margin;                 top = r.top + r.height / 2 - ch / 2; }
-        else if (pos === 'left')     { left = r.left - cw - margin;             top = r.top + r.height / 2 - ch / 2; }
-        else if (pos === 'bottom')   { left = r.left + r.width / 2 - cw / 2;   top = r.bottom + margin; }
-        else if (pos === 'top-left') { left = r.left;                           top = r.top - ch - margin; }
-        else                         { left = r.left + r.width / 2 - cw / 2;   top = r.top - ch - margin; } // 'top'
-        left = Math.max(margin, Math.min(left, vw - cw - margin));
-        top  = Math.max(margin, Math.min(top,  vh - ch - margin));
-        card.style.left = left + 'px';
-        card.style.top  = top  + 'px';
+        var topV, leftV;
+        if (pos === 'right')        { leftV = r.right + margin;                  topV = r.top + r.height / 2 - ch / 2; }
+        else if (pos === 'left')    { leftV = r.left - cw - margin;              topV = r.top + r.height / 2 - ch / 2; }
+        else if (pos === 'bottom')  { leftV = r.left + r.width / 2 - cw / 2;     topV = r.bottom + margin; }
+        else if (pos === 'top-left'){ leftV = r.left;                            topV = r.top - ch - margin; }
+        else                         { leftV = r.left + r.width / 2 - cw / 2;    topV = r.top - ch - margin; } // 'top'
+        leftV = Math.max(margin, Math.min(leftV, vw - cw - margin));
+        topV  = Math.max(margin, Math.min(topV,  vh - ch - margin));
+        card.style.left = leftV + 'px';
+        card.style.top  = topV  + 'px';
       }
 
-      // ---- Set up interactive waitFor listeners ----
-      if (hasWaitFor && step.waitFor === 'clickScene') {
-        // User must click any scene card in the grid. Listen on sceneGrid for clicks.
-        var sceneGridEl = document.getElementById('sceneGrid');
-        if (sceneGridEl) {
-          var handler = function(ev) {
-            var cardEl = ev.target.closest('.card');
-            if (cardEl) {
-              // Scene card was clicked — it will open the dialog via its own click handler.
-              // Wait a beat for the dialog to show, then advance.
-              setTimeout(function() { _tutAdvance(); }, 400);
-            }
+      // ---- Interactive waitFor / waitForChain ----
+      if (hasWaitFor) {
+        if (step.waitForChain && step.waitForChain.length) {
+          _tutChainIdx = 0;
+          var installChain;
+          installChain = function() {
+            if (_tutChainIdx >= step.waitForChain.length) { _tutAdvance(); return; }
+            var key = step.waitForChain[_tutChainIdx];
+            _tutCleanupFn = _installTutWaitFor(key, function() {
+              if (_tutCleanupFn) { _tutCleanupFn(); _tutCleanupFn = null; }
+              _tutChainIdx++;
+              installChain();
+            });
           };
-          sceneGridEl.addEventListener('click', handler, true);
-          _tutCleanupFn = function() { sceneGridEl.removeEventListener('click', handler, true); };
-        }
-      }
-      else if (hasWaitFor && step.waitFor === 'clickStar') {
-        // User must click a star in the scene dialog
-        var onStarClick = function(ev) {
-          var starEl = ev.target.closest('.star, .stars span');
-          if (starEl) {
-            setTimeout(function() { _tutAdvance(); }, 300);
-          }
-        };
-        document.addEventListener('click', onStarClick, true);
-        _tutCleanupFn = function() { document.removeEventListener('click', onStarClick, true); };
-      }
-      else if (hasWaitFor && step.waitFor === 'clickFilmstrip') {
-        // User must click a photo in the filmstrip
-        var filmstripEl = document.getElementById('imageGrid');
-        if (filmstripEl) {
-          var onFilmstripClick = function(ev) {
-            var cardEl = ev.target.closest('.filmstrip-card, .card');
-            if (cardEl) {
-              setTimeout(function() { _tutAdvance(); }, 350);
-            }
-          };
-          filmstripEl.addEventListener('click', onFilmstripClick, true);
-          _tutCleanupFn = function() { filmstripEl.removeEventListener('click', onFilmstripClick, true); };
-        }
-      }
-      else if (hasWaitFor && step.waitFor === 'clickCullToggle') {
-        // User must click the Accept or Reject button (not Undecided)
-        var onCullClick = function(ev) {
-          var cullBtn = ev.target.closest('.cull-btn[data-cull="accept"], .cull-btn[data-cull="reject"]');
-          if (cullBtn) {
-            setTimeout(function() { _tutAdvance(); }, 400);
-          }
-        };
-        document.addEventListener('click', onCullClick, true);
-        _tutCleanupFn = function() { document.removeEventListener('click', onCullClick, true); };
-      }
-      else if (hasWaitFor && step.waitFor === 'closeDialog') {
-        // User must close the scene dialog
-        var sceneDlgEl = document.getElementById('sceneDlg');
-        if (sceneDlgEl) {
-          var onDlgClose = function() {
-            sceneDlgEl.removeEventListener('close', onDlgClose);
-            _tutCleanupFn = null;
-            setTimeout(function() { _tutAdvance(); }, 250);
-          };
-          sceneDlgEl.addEventListener('close', onDlgClose);
-          _tutCleanupFn = function() { sceneDlgEl.removeEventListener('close', onDlgClose); };
+          installChain();
+        } else if (step.waitFor) {
+          _tutCleanupFn = _installTutWaitFor(step.waitFor, function() { _tutAdvance(); });
         }
       }
     }
 
+    async function _handleLoadSamplesOnNext() {
+      var bodyEl = _tutEl('#tutorialBody');
+      var nextBtn = _tutEl('#tutorialNext');
+      var backBtn = _tutEl('#tutorialBack');
+      var skipBtn = _tutEl('#tutorialSkip');
+      nextBtn.disabled = true; backBtn.disabled = true; skipBtn.disabled = true;
+      var loading = document.createElement('div');
+      loading.className = 'tut-loading';
+      loading.innerHTML = '<span class="tut-spinner"></span> Loading sample photos\u2026';
+      bodyEl.appendChild(loading);
+      try {
+        await _autoLoadSamples();
+      } finally {
+        nextBtn.disabled = false; backBtn.disabled = false; skipBtn.disabled = false;
+      }
+      _tutStep++;
+      _showMainTutStep(_tutStep);
+    }
+
     function _tutAdvance() {
+      var cur = _tutSteps[_tutStep];
+      if (cur && cur.loadSamplesOnNext && !_tutSampleLoaded) {
+        _handleLoadSamplesOnNext();
+        return;
+      }
       _tutStep++;
       if (_tutStep >= _tutSteps.length) {
-        // End of current part
-        if (_tutPart === 1) {
-          _closeMainTutorial();
-          // Transition to Part 2: auto-load sample sets then start part 2
-          _autoLoadSamplesAndStartPart2();
-        } else {
-          _closeMainTutorial();
-        }
+        _closeMainTutorial();
       } else {
         _showMainTutStep(_tutStep);
       }
@@ -8168,94 +9265,274 @@
       if (_tutStep > 0) { _tutStep--; _showMainTutStep(_tutStep); }
     }
 
-    async function _autoLoadSamplesAndStartPart2() {
-      if (!hasPywebviewApi) { startMainTutorial(2, 0); return; }
+    // Load sample photos (once per session). Returns when samples are ready.
+    async function _autoLoadSamples() {
+      if (_tutSampleLoaded) return;
+      if (!hasPywebviewApi) { _tutSampleLoaded = true; return; }
       try {
-        console.log('[tutorial] Calling get_sample_sets_paths()...');
         var res = await window.pywebview.api.get_sample_sets_paths();
-        console.log('[tutorial] get_sample_sets_paths() response:', res);
-        
         if (res && res.success && res.paths && res.paths.length > 0) {
-          console.log('[tutorial] Found', res.paths.length, 'sample sets:', res.paths);
           _tutSampleLoaded = true;
-          // Scan the parent folder so the folder tree sidebar shows backyard_birds + forest_trail
           var sampleParent = res.paths[0].replace(/[/\\][^/\\]+$/, '');
-          console.log('[tutorial] Sample parent folder:', sampleParent);
-          try { 
-            await scanFolderTree(sampleParent);
-            console.log('[tutorial] Folder tree scanned successfully');
-          } catch(e) {
-            console.warn('[tutorial] Folder tree scan error:', e);
-          }
-          try {
-            console.log('[tutorial] Loading', res.paths.length, 'folders via loadMultipleFolders...');
-            await loadMultipleFolders(res.paths);
-            console.log('[tutorial] Folders loaded successfully');
-          } catch(e) {
-            console.warn('[tutorial] loadMultipleFolders error:', e);
-            throw e;
-          }
-          // Small delay for render, then start Part 2
-          console.log('[tutorial] Starting Part 2 of tutorial');
-          setTimeout(function() { startMainTutorial(2, 0); }, 600);
+          try { await scanFolderTree(sampleParent); } catch (e) { console.warn('[tutorial] scanFolderTree:', e); }
+          try { await loadMultipleFolders(res.paths); }
+          catch (e) { console.warn('[tutorial] loadMultipleFolders:', e); }
+          await new Promise(function(r) { setTimeout(r, 500); });
         } else {
-          // No sample sets found -- just start Part 2 anyway
-          console.warn('[tutorial] No sample sets found. res.success=', res?.success, 'res.paths=', res?.paths);
-          startMainTutorial(2, 0);
+          console.warn('[tutorial] No sample sets found');
         }
       } catch (e) {
-        console.warn('[tutorial] _autoLoadSamplesAndStartPart2 error:', e);
-        console.error(e);
-        startMainTutorial(2, 0);
+        console.warn('[tutorial] _autoLoadSamples error:', e);
       }
     }
 
-    // Wire up tutorial buttons
+    // Chooser dialog: click Tutorial button (or Welcome Start Tutorial) to pick branch.
+    function openTutorialChooser() {
+      var dlg = document.getElementById('tutorialChooserDlg');
+      if (!dlg) { startMainTutorial('basics', 0); return; }
+      try { dlg.showModal(); } catch (_) { try { dlg.show(); } catch(__) {} }
+    }
+    // Expose on window so inline onclick handlers can reach it.
+    window.openTutorialChooser = openTutorialChooser;
+    window.startMainTutorial = startMainTutorial;
+
+    var _tutChooserDlg = document.getElementById('tutorialChooserDlg');
+    if (_tutChooserDlg) {
+      var _chooseBasics = _tutChooserDlg.querySelector('#tutChooseBasics');
+      var _chooseAdv    = _tutChooserDlg.querySelector('#tutChooseAdvanced');
+      var _chooseCancel = _tutChooserDlg.querySelector('#tutChooseCancel');
+      if (_chooseBasics) _chooseBasics.addEventListener('click', function() {
+        try { _tutChooserDlg.close(); } catch (_) {}
+        startMainTutorial('basics', 0);
+      });
+      if (_chooseAdv) _chooseAdv.addEventListener('click', function() {
+        try { _tutChooserDlg.close(); } catch (_) {}
+        startMainTutorial('advanced', 0);
+      });
+      if (_chooseCancel) _chooseCancel.addEventListener('click', function() {
+        try { _tutChooserDlg.close(); } catch (_) {}
+      });
+    }
+
     var helpBtnMain = document.getElementById('helpBtnMain');
     if (helpBtnMain) {
-      helpBtnMain.addEventListener('click', function() {
-        startMainTutorial(1, 0);
-      });
+      helpBtnMain.addEventListener('click', function() { openTutorialChooser(); });
     }
 
     _tutEl('#tutorialNext').addEventListener('click', _tutAdvance);
     _tutEl('#tutorialBack').addEventListener('click', _tutGoBack);
     _tutEl('#tutorialSkip').addEventListener('click', function() {
-      if (_tutPart === 1) {
-        // Skipping part 1 still transitions to part 2 with samples
-        _closeMainTutorial();
-        _autoLoadSamplesAndStartPart2();
-      } else {
-        _closeMainTutorial();
-      }
+      _closeMainTutorial();
     });
 
-    // Keyboard: only Escape closes the tutorial (arrow keys intentionally removed —
-    // users navigate via Next/Back buttons or by completing the waitFor action)
+    // Escape closes tutorial
     document.addEventListener('keydown', function(ev) {
       if (!_tutEl('#tutorialOverlay').classList.contains('active')) return;
-      if (_tutPart === 0) return;
+      if (!_tutBranch) return;
       if (ev.key === 'Escape') { _closeMainTutorial(); }
     });
 
-    // Also wire welcome panel tutorial link to start inline tutorial
+    // Welcome panel Tutorial link
     var welcomeTutLink = document.getElementById('welcomeTutorialLink');
     if (welcomeTutLink) {
       welcomeTutLink.addEventListener('click', function(e) {
         e.preventDefault();
-        startMainTutorial(1, 0);
+        openTutorialChooser();
       });
     }
 
-    // Auto-start tutorial on first launch (pywebview mode only)
+    // Auto-start tutorial on first launch (pywebview mode only) — Basics branch.
     (async function() {
       if (!hasPywebviewApi) return;
-      // Wait a moment for the UI to settle
       await new Promise(function(r) { setTimeout(r, 800); });
       var seen = await checkMainTutorialSeen();
       if (!seen) {
-        startMainTutorial(1, 0);
+        startMainTutorial('basics', 0);
       }
+    })();
+
+    // ====================================================================
+    // Welcome panel: "What's New" banner + rotating tip carousel
+    // ====================================================================
+
+    // Bump this whenever you author a new changelog. Clients with a matching
+    // `last_seen_whats_new_version` will not see the banner again.
+    const WHATS_NEW = {
+      version: 'gambels-quail',
+      headline: "New in v(Gambel's Quail) \u2014 our biggest update yet",
+      items: [
+        'New <b>pipeline v2.0</b> is up to <b>500% faster</b> with better bird detection and exposure compensation \u2014 all powered by ONNX Runtime with GPU acceleration.',
+        'Detects <b>1,200+ wildlife species</b> (squirrels, bears, and more) using <b>MegaDetector</b>, <b>SpeciesNet</b>, and <b>SAM-HQ</b>. Enable in Settings \u2192 Analysis.',
+        'New <b>bird thumbnail</b> view shows the crop side-by-side with the full scene, plus new Scene view buttons: <b>Mark as Reviewed</b>, <b>Open in [editor]</b>, and subject-switcher arrows for multi-bird scenes.',
+        'Rebuilt in-app tutorial with <b>Basics</b> and <b>Advanced</b> branches, a rotating tips carousel, and a new <b>Adjust Capture Time</b> dialog for timeline fixes.',
+      ],
+    };
+
+    const WELCOME_TIPS = [
+      {
+        icon: '\uD83E\uDD8B',
+        title: 'Try wildlife mode',
+        badge: 'New!',
+        body: 'Kestrel can detect squirrels, bears, and other wildlife in addition to birds. Enable it in <b>Settings &rarr; Analysis</b>.',
+        action: { label: 'Open Settings', onClick: function() { try { showSettings(); } catch (_) {} } },
+      },
+      {
+        icon: '\u2795',
+        title: 'Merge scenes',
+        body: 'Hold <kbd>Ctrl</kbd> and click scene cards to select multiple, then click <b>Merge selected scenes</b> to combine them into one.',
+      },
+      {
+        icon: '\uD83D\uDDBC\uFE0F',
+        title: 'Multiple birds in one scene?',
+        body: 'Use the <b>\u25C2 / \u25B8 crop buttons</b> in the scene info bar (or <kbd>\u2191</kbd> / <kbd>\u2193</kbd>) to flip through each bird, and press <kbd>Enter</kbd> to promote one as the scene\u2019s primary.',
+      },
+      {
+        icon: '\uD83D\uDCC2',
+        title: 'Open a parent folder once',
+        body: 'Kestrel searches across <b>every loaded folder</b>. Open a parent folder and browse your entire library by species or family without re-loading anything.',
+      },
+      {
+        icon: '\u2328\uFE0F',
+        title: 'Space = open in editor',
+        body: 'Press <kbd>Space</kbd> on any photo to open the original in your chosen photo editor. Set your preference in Settings.',
+        action: { label: 'Open Settings', onClick: function() { try { showSettings(); } catch (_) {} } },
+      },
+      {
+        icon: '\uD83D\uDDD1\uFE0F',
+        title: 'Cull faster with the Culling Assistant',
+        body: 'Batch Accept / Reject photos by your own quality rules \u2014 and optionally move rejects into an archive folder.',
+      },
+      {
+        icon: '\u26A0\uFE0F',
+        title: 'Write metadata before importing',
+        body: '<b>Write Photo Metadata</b> before importing into Lightroom or Capture One \u2014 most catalogues ignore sidecar files added <i>after</i> import.',
+      },
+      {
+        icon: '\u2B50',
+        title: 'Not satisfied with the star ratings?',
+        body: 'Tune the rating thresholds and profile in Settings. Your manual overrides are always saved as gold stars.',
+        action: { label: 'Open Settings', onClick: function() { try { showSettings(); } catch (_) {} } },
+      },
+    ];
+
+    (function setupWelcomeWhatsNew() {
+      var banner = document.getElementById('welcomeWhatsNew');
+      if (!banner) return;
+      (async function() {
+        var lastSeen = null;
+        if (hasPywebviewApi) {
+          try {
+            var res = await window.pywebview.api.get_settings();
+            lastSeen = res && res.settings && res.settings.last_seen_whats_new_version;
+          } catch (_) {}
+        }
+        if (lastSeen === WHATS_NEW.version) return;
+        var items = WHATS_NEW.items.map(function(it) {
+          return '<li>' + it + '</li>';
+        }).join('');
+        banner.innerHTML =
+          '<div class="wwn-head">' +
+            '<span class="wwn-badge">New</span>' +
+            '<span class="wwn-title">' + WHATS_NEW.headline + '</span>' +
+            '<button type="button" class="wwn-dismiss" id="wwnDismiss" aria-label="Dismiss">\u2715</button>' +
+          '</div>' +
+          '<ul class="wwn-list">' + items + '</ul>';
+        banner.classList.remove('hidden');
+        var dismiss = banner.querySelector('#wwnDismiss');
+        if (dismiss) dismiss.addEventListener('click', async function() {
+          banner.classList.add('hidden');
+          if (hasPywebviewApi) {
+            try {
+              var r2 = await window.pywebview.api.get_settings();
+              var s = (r2 && r2.success ? r2.settings : {}) || {};
+              s.last_seen_whats_new_version = WHATS_NEW.version;
+              await window.pywebview.api.save_settings_data(s);
+            } catch (_) {}
+          }
+        });
+      })();
+    })();
+
+    (function setupWelcomeTipCarousel() {
+      var root = document.getElementById('welcomeTipCarousel');
+      if (!root || !WELCOME_TIPS.length) return;
+      var iconEl   = root.querySelector('#wtcIcon');
+      var titleEl  = root.querySelector('#wtcTitle');
+      var badgeEl  = root.querySelector('#wtcBadge');
+      var bodyEl   = root.querySelector('#wtcBody');
+      var actionEl = root.querySelector('#wtcAction');
+      var dotsEl   = root.querySelector('#wtcDots');
+      var cardEl   = root.querySelector('#wtcCard');
+      var prevBtn  = root.querySelector('.wtc-prev');
+      var nextBtn  = root.querySelector('.wtc-next');
+
+      var idx = 0;
+      var paused = false;
+      var rotateTimer = null;
+
+      dotsEl.innerHTML = '';
+      WELCOME_TIPS.forEach(function(_, i) {
+        var d = document.createElement('button');
+        d.type = 'button';
+        d.className = 'wtc-dot' + (i === 0 ? ' active' : '');
+        d.setAttribute('aria-label', 'Tip ' + (i + 1));
+        d.addEventListener('click', function() { goTo(i, true); });
+        dotsEl.appendChild(d);
+      });
+
+      function render(i) {
+        var t = WELCOME_TIPS[i];
+        if (!t) return;
+        iconEl.textContent = t.icon || '\uD83D\uDCA1';
+        titleEl.innerHTML = t.title || '';
+        if (t.badge) { badgeEl.textContent = t.badge; badgeEl.classList.remove('hidden'); }
+        else badgeEl.classList.add('hidden');
+        bodyEl.innerHTML = t.body || '';
+        if (t.action && t.action.label) {
+          actionEl.innerHTML = '';
+          var btn = document.createElement('button');
+          btn.type = 'button';
+          btn.className = 'wtc-link';
+          btn.textContent = t.action.label;
+          btn.addEventListener('click', function(ev) { ev.preventDefault(); if (typeof t.action.onClick === 'function') t.action.onClick(); });
+          actionEl.appendChild(btn);
+          actionEl.classList.remove('hidden');
+        } else {
+          actionEl.classList.add('hidden');
+          actionEl.innerHTML = '';
+        }
+        Array.prototype.forEach.call(dotsEl.children, function(d, di) {
+          d.classList.toggle('active', di === i);
+        });
+      }
+
+      function goTo(i, manual) {
+        idx = (i + WELCOME_TIPS.length) % WELCOME_TIPS.length;
+        cardEl.classList.remove('wtc-in');
+        cardEl.classList.add('wtc-out');
+        setTimeout(function() {
+          render(idx);
+          cardEl.classList.remove('wtc-out');
+          cardEl.classList.add('wtc-in');
+        }, 180);
+        if (manual) resetTimer();
+      }
+
+      function next() { goTo(idx + 1, false); }
+      function prev() { goTo(idx - 1, false); }
+
+      function resetTimer() {
+        if (rotateTimer) clearInterval(rotateTimer);
+        rotateTimer = setInterval(function() { if (!paused) next(); }, 7000);
+      }
+
+      prevBtn.addEventListener('click', function() { goTo(idx - 1, true); });
+      nextBtn.addEventListener('click', function() { goTo(idx + 1, true); });
+      root.addEventListener('mouseenter', function() { paused = true; });
+      root.addEventListener('mouseleave', function() { paused = false; });
+
+      render(0);
+      resetTimer();
     })();
 
 

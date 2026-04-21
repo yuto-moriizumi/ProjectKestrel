@@ -1,16 +1,4 @@
 import sys
-import os
-import platform
-if platform.system() == "Windows": # REQUIRED to prevent pytorch dll load errors caused by importing pyqt before torch
-    import ctypes
-    from importlib.util import find_spec
-    try:
-        if (spec := find_spec("torch")) and spec.origin and os.path.exists(
-            dll_path := os.path.join(os.path.dirname(spec.origin), "lib", "c10.dll")
-        ):
-            ctypes.CDLL(os.path.normpath(dll_path))
-    except Exception:
-        pass
 
 def _create_splash(app):
     splash = QWidget()
@@ -55,14 +43,8 @@ if __name__ == "__main__":
     app = QApplication(sys.argv)
     splash = _create_splash(app)
 
-    _set_splash_text(app, splash, "Loading PyTorch…")
-    import torch as t
-
     _set_splash_text(app, splash, "Loading ONNX Runtime…")
     import onnxruntime as ort
-
-    _set_splash_text(app, splash, "Loading TensorFlow…")
-    import tensorflow as tf
 
     _set_splash_text(app, splash, "Starting UI…")
 

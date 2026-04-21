@@ -15,6 +15,70 @@ from settings_utils import load_persisted_settings, log
 _DARKTABLE_EXE = None
 
 
+def _validate_custom_editor_path(raw: str) -> str | None:
+    """Return a canonicalised ``customEditorPath`` or ``None`` if unsafe.
+
+    Minimum hardening for FINDING-05. The feature is intentionally retained,
+    with its inherent "execute whatever the user configured" risk documented,
+    but we close the most obvious foot-guns:
+
+      * Reject empty / non-string values.
+      * Reject any control character (incl. newline, NUL) — no shell is
+        spawned via ``Popen([...])``, but these still confuse logs and have
+        historically been used as argument-splitting delimiters on some
+        shells.
+      * Require an absolute path.
+      * Reject UNC paths (``\\\\server\\share\\evil.exe``) and forward-slash
+        UNC equivalents on Windows — those exfiltrate to arbitrary SMB
+        shares via authentication-on-attempt.
+      * Require the target to actually exist as a regular file on disk.
+        On macOS we additionally allow ``.app`` bundles (which are
+        directories). Directories anywhere else are rejected.
+
+    If the path is acceptable, returns ``os.path.realpath(expanded)`` so any
+    symlink games are resolved once, up front.
+    """
+    if not isinstance(raw, str):
+        return None
+    candidate = raw.strip()
+    if not candidate:
+        return None
+    for ch in candidate:
+        o = ord(ch)
+        if o < 0x20 or o == 0x7F:
+            log('[security] customEditorPath contains control characters; rejecting.')
+            return None
+    # UNC paths — drive-by NTLM relay risk.
+    if sys.platform.startswith('win'):
+        if candidate.startswith('\\\\') or candidate.startswith('//'):
+            log(f'[security] customEditorPath rejected (UNC not allowed): {candidate!r}')
+            return None
+    expanded = os.path.expanduser(candidate)
+    if not os.path.isabs(expanded):
+        log(f'[security] customEditorPath rejected (must be absolute): {candidate!r}')
+        return None
+    try:
+        resolved = os.path.realpath(expanded)
+    except (OSError, ValueError):
+        log(f'[security] customEditorPath could not be resolved: {candidate!r}')
+        return None
+    if not os.path.exists(resolved):
+        log(f'[security] customEditorPath does not exist: {resolved!r}')
+        return None
+    if os.path.isdir(resolved):
+        # macOS ``.app`` bundles are directories and are valid targets for
+        # ``open -a``. Everywhere else, a directory target is almost always
+        # a misconfiguration or an attempt to hand a bogus value to Popen.
+        if sys.platform == 'darwin' and resolved.endswith('.app'):
+            return resolved
+        log(f'[security] customEditorPath rejected (is a directory): {resolved!r}')
+        return None
+    if not os.path.isfile(resolved):
+        log(f'[security] customEditorPath is neither file nor .app bundle: {resolved!r}')
+        return None
+    return resolved
+
+
 def _find_darktable_exe() -> str:
     """Best-effort discovery of darktable.exe on Windows.
 
@@ -52,11 +116,18 @@ def launch(path: str, editor: str):
         print(f"[LAUNCH] ERROR: path does not exist: {path}", flush=True)
         raise FileNotFoundError(path)
 
-    # Custom editor: load path from settings
+    # Custom editor: load path from settings and validate before exec.
+    # We can't prove the user-chosen binary is benign, but we can refuse the
+    # obviously-dangerous cases (UNC, non-existent, control chars, relative
+    # paths). See FINDING-05.
     if editor == 'custom':
         settings = load_persisted_settings()
-        custom_exe = (settings.get('customEditorPath') or '').strip()
+        raw_custom = settings.get('customEditorPath')
+        custom_exe = _validate_custom_editor_path(raw_custom) if raw_custom else None
         if custom_exe:
+            # Audit log every custom-editor launch so the trail is obvious if
+            # something goes sideways.
+            log(f'[editor] launching custom editor: exe={custom_exe!r} target={path!r}')
             try:
                 if sys.platform == 'darwin' and custom_exe.endswith('.app'):
                     subprocess.Popen(['open', '-a', custom_exe, path]); return
@@ -64,7 +135,9 @@ def launch(path: str, editor: str):
                     subprocess.Popen([custom_exe, path]); return
             except Exception as e:
                 log(f'Custom editor launch failed ({custom_exe}): {e}, falling back to system default')
-        # Fall through to system default
+        else:
+            if raw_custom:
+                log(f'[security] customEditorPath failed validation; falling back to system default.')
         editor = 'system'
 
     # Editor name -> (Windows exe candidates, macOS app name, Linux commands)
@@ -255,16 +328,14 @@ def launch(path: str, editor: str):
         except Exception as e:
             print(f"[LAUNCH] macOS: open() raised: {e}", flush=True)
 
-        # Fallback: try AppleScript via osascript
-        try:
-            script = f'tell application "Finder" to open (POSIX file "{path}")'
-            print(f"[LAUNCH] macOS: trying osascript: {script}", flush=True)
-            p = subprocess.run(['osascript', '-e', script], capture_output=True, text=True)
-            print(f"[LAUNCH] macOS: osascript rc={p.returncode} stdout={p.stdout!r} stderr={p.stderr!r}", flush=True)
-            if p.returncode == 0:
-                return
-        except Exception as e:
-            print(f"[LAUNCH] macOS: osascript failed: {e}", flush=True)
+        # NOTE: the previous ``osascript -e 'tell ... open (POSIX file "<path>")'``
+        # fallback has been removed. Interpolating ``path`` into an AppleScript
+        # string allowed a filename containing a literal double-quote to break
+        # out of the POSIX-file literal and inject arbitrary AppleScript —
+        # which in turn can ``do shell script``. See FINDING-04. ``open path``
+        # above is the canonical macOS launcher; the only remaining fallback
+        # is Finder reveal (which is argv-safe because ``path`` is passed as a
+        # distinct argv element, not interpolated into any DSL).
 
         # Last resort: reveal in Finder
         try:

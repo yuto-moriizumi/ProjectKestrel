@@ -96,10 +96,9 @@ Features of the visualizer:
 
 ## How It Works
 
-### 1. Bird Detection
-- Uses PyTorch's Mask R-CNN ResNet50 FPN v2 model
-- Detects and segments birds in images
-- Generates precise masks to ensure image quality is assessed on bird pixels only, not background pixels.
+### 1. Wildlife detection and segmentation
+- Uses Google's [SpeciesNet](https://github.com/google/cameratrapai) ensemble (MegaDetector + species classifier) for animal bounding boxes and taxonomy, and [SAM-HQ](https://github.com/SysCV/sam-hq) (ViT-B) for high-quality masks.
+- Detects animals, routes birds vs other wildlife, and segments subjects so quality is assessed on wildlife pixels, not background.
 
 ### 2. Species Classification
 - A custom machine learning model was trained for bird species identification for North American birds.
