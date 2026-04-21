@@ -19,6 +19,67 @@ _NS_LR = 'http://ns.adobe.com/lightroom/1.0/'
 # Species/family values that indicate no meaningful detection
 _EMPTY_LABELS = {'', 'unknown', 'no bird', 'n/a'}
 
+
+def _safe_sidecar_path(root: str, filename: str) -> str | None:
+    """Resolve ``<root>/<filename>`` to an absolute path that is guaranteed to
+    live directly inside ``root`` and return it, or ``None`` if ``filename``
+    is unsafe.
+
+    Policy (FINDING-02): ``filename`` MUST already be a bare basename. Any
+    directory component (``../``, ``..\\``, absolute path, drive letter, UNC
+    prefix, leading separator, NUL byte, Windows ``altsep``) causes the
+    entry to be rejected outright — we deliberately do not silently reduce
+    ``../../etc/evil`` to ``evil`` and write it into the root, because
+    callers that pass non-bare names are either buggy or attacking, and in
+    either case the user's data is better served by an error than by a
+    surprise write.
+    """
+    if not isinstance(filename, str):
+        return None
+    name = filename.strip()
+    if not name:
+        return None
+    # Control chars / NUL byte — reject before any further interpretation.
+    if '\x00' in name:
+        return None
+    # Reject absolute paths, drive letters, and UNC prefixes up front.
+    if os.path.isabs(name):
+        return None
+    # ``ntpath.splitdrive`` catches Windows drive prefixes like ``C:foo``
+    # even on POSIX builds, because the attacker gets to choose the input.
+    import ntpath as _nt
+    drive, _rest = _nt.splitdrive(name)
+    if drive:
+        return None
+    # Reject any path separator (POSIX ``/``, Windows ``\\``) and the
+    # traversal pseudo-names. These are not legal characters in a sidecar
+    # basename and their presence indicates the caller is trying to
+    # redirect the write elsewhere.
+    if '/' in name or '\\' in name:
+        return None
+    if name in ('.', '..'):
+        return None
+    # os.sep / os.altsep are already covered above but keep the belt-and-
+    # suspenders check for future-proofing if someone ever adds new seps.
+    if os.sep in name or (os.altsep and os.altsep in name):
+        return None
+    try:
+        root_real = os.path.realpath(root)
+        candidate = os.path.realpath(os.path.join(root_real, name))
+    except (OSError, ValueError):
+        return None
+    try:
+        if os.path.commonpath([candidate, root_real]) != root_real:
+            return None
+    except ValueError:
+        # Different drives (Windows) — not under root.
+        return None
+    # Defence against ``realpath`` resolving a symlink back up out of root:
+    # require the final component to match the name we validated.
+    if os.path.basename(candidate) != name:
+        return None
+    return candidate
+
 # Default field selection for XMP writes — every field on. The frontend can
 # override individual flags via the `fields` parameter to write_xmp_metadata().
 _DEFAULT_FIELDS = {
@@ -267,9 +328,18 @@ def write_xmp_metadata(
                 except (TypeError, ValueError):
                     quality_score = -1.0
 
-                base, _ext = os.path.splitext(filename)
-                xmp_filename = base + '.xmp'
-                xmp_path = os.path.join(root_path, xmp_filename)
+                # Jail sidecar writes to ``root_path``. A crafted filename
+                # with traversal segments (``../sensitive``) or an absolute
+                # path would otherwise let the caller write .xmp files
+                # anywhere on disk. See FINDING-02.
+                resolved_image = _safe_sidecar_path(root_path, filename)
+                if resolved_image is None:
+                    errors.append(f'{filename}: rejected (unsafe filename)')
+                    log(f'[security] write_xmp_metadata rejected unsafe filename: {filename!r}')
+                    continue
+                base, _ext = os.path.splitext(resolved_image)
+                xmp_path = base + '.xmp'
+                xmp_filename = os.path.basename(xmp_path)
 
                 # Safety check: if XMP already exists, verify origin
                 if os.path.exists(xmp_path):

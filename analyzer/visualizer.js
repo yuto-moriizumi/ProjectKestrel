@@ -1546,12 +1546,32 @@
         title.className = 'title';
         const _localNum = String(s.id).split(':').pop();
         const _folderName = folderBaseName(s.representative?.__rootPath || '');
-        // Show folder name in title only when a single folder is loaded;
-        // in multi-folder mode the folder group header already shows it.
-        const _titleHtml = (_folderName && !showFolderHeaders)
-          ? `<i class="folder-name">${escapeHtml(_folderName)}</i><span class="title-sep"> / </span><b>#${_localNum}</b>`
-          : `<b>#${_localNum}</b>`;
-        title.innerHTML = _titleHtml + (s.sceneName ? ` <span class="name">\u2014 ${decodeEntities(escapeHtml(s.sceneName))}</span>` : '');
+        // Build the title entirely from text nodes / trusted elements — never
+        // assign to innerHTML with any user-controlled substring. The previous
+        // decodeEntities(escapeHtml(...)) pattern round-tripped the escaped
+        // string back to its raw form, which allowed a crafted scene name
+        // (e.g. from a poisoned kestrel_scenedata.json) to inject a DOM-XSS
+        // and, via the pywebview bridge, escalate to RCE. See FINDING-01.
+        if (_folderName && !showFolderHeaders) {
+          const folderEl = document.createElement('i');
+          folderEl.className = 'folder-name';
+          folderEl.textContent = _folderName;
+          title.appendChild(folderEl);
+          const sep = document.createElement('span');
+          sep.className = 'title-sep';
+          sep.textContent = ' / ';
+          title.appendChild(sep);
+        }
+        const idBold = document.createElement('b');
+        idBold.textContent = `#${_localNum}`;
+        title.appendChild(idBold);
+        if (s.sceneName) {
+          title.appendChild(document.createTextNode(' \u2014 '));
+          const nameSpan = document.createElement('span');
+          nameSpan.className = 'name';
+          nameSpan.textContent = String(s.sceneName);
+          title.appendChild(nameSpan);
+        }
         title.title = (s.representative?.__rootPath || String(s.id)) + (s.sceneName ? ` \u2014 ${s.sceneName}` : '');
         const meta = document.createElement('div');
         // Use a dedicated class for title-level badges so other .meta uses are unaffected

@@ -90,8 +90,53 @@ _DEFAULT_EDITOR_EXTENSIONS = [
     '.cr3', '.cr2', '.nef', '.arw', '.dng', '.raf', '.orf', '.rw2', '.sr2',
     '.jpg', '.jpeg', '.png', '.tif', '.tiff'
 ]
+_EXTERNAL_URL_SCHEME_ALLOWLIST = frozenset({'http', 'https', 'mailto'})
+
+
+def _is_safe_external_url(url) -> bool:
+    """Return True iff ``url`` is safe to hand to ``webbrowser.open``.
+
+    Only plain ``http://``, ``https://``, and ``mailto:`` URLs are allowed.
+    Everything else — ``file://``, ``javascript:``, ``data:``, Windows-specific
+    custom schemes like ``ms-appdata:`` / ``search-ms:``, UNC paths (``\\\\host``
+    or forward-slash ``//host``), and any URL containing control characters —
+    is rejected.
+
+    Rationale (FINDING-01): ``webbrowser.open`` ultimately calls
+    ``ShellExecute`` on Windows, which happily launches local executables when
+    given a ``file://`` URL or a custom URI scheme bound to an installed
+    handler. Combined with the stored DOM-XSS formerly present in the scene
+    renderer, that was a clean stored-XSS-to-RCE chain. The allowlist closes
+    the browser side of that chain.
+    """
+    if not isinstance(url, str):
+        return False
+    u = url.strip()
+    if not u:
+        return False
+    # Reject any ASCII control character (incl. newline, CR, NUL, DEL).
+    for ch in u:
+        o = ord(ch)
+        if o < 0x20 or o == 0x7F:
+            return False
+    # Reject UNC paths and backslash injection (Windows ShellExecute
+    # interprets these as local file references).
+    if '\\' in u or u.startswith('//'):
+        return False
+    scheme, sep, _rest = u.partition(':')
+    if not sep:
+        return False
+    return scheme.strip().lower() in _EXTERNAL_URL_SCHEME_ALLOWLIST
+
+
 _ALLOWED_EDITOR_EXTENSIONS: set[str] = set()
-_ALLOW_ANY_EDITOR_EXTENSION = os.environ.get('KESTREL_ALLOW_ANY_EXTENSION') == '1'
+# ``KESTREL_ALLOW_ANY_EXTENSION`` was previously an env-var escape hatch that
+# let users bypass the extension allowlist on the ``open_in_editor`` surface.
+# That's a FINDING-07 escape hatch and is now hard-off: the set of allowed
+# extensions is fixed to ``_DEFAULT_EDITOR_EXTENSIONS`` plus the user's
+# ``KESTREL_ALLOWED_EXTENSIONS`` override (still validated), and the check is
+# never bypassed.
+_ALLOW_ANY_EDITOR_EXTENSION = False
 
 
 def _normalize_extensions(exts):
@@ -1228,8 +1273,17 @@ class Api:
             return {'success': False, 'error': str(e)}
 
     def open_url(self, url: str):
-        """Open a URL in the system default browser (pywebview desktop mode)."""
+        """Open an external URL in the system default browser.
+
+        Gated by ``_is_safe_external_url``: only plain ``http``, ``https``,
+        and ``mailto`` schemes are passed through. Everything else (``file``,
+        ``javascript``, ``data``, custom URI handlers, UNC paths, control
+        characters) is rejected. See FINDING-01.
+        """
         try:
+            if not _is_safe_external_url(url):
+                log(f'[security] open_url refused unsafe URL: {url!r}')
+                return {'success': False, 'error': 'URL scheme not allowed'}
             webbrowser.open(url)
             return {'success': True}
         except Exception as e:

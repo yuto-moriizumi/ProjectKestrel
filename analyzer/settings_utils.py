@@ -5,7 +5,9 @@ from __future__ import annotations
 import json
 import math
 import os
+import shutil
 import sys
+import time
 from typing import Any
 
 # Forward-compatible / unknown keys (e.g. tutorial flags from newer builds) — size limits only.
@@ -438,13 +440,125 @@ def _sanitize_settings_payload(data: dict, emit_log: bool = False) -> dict:
         if pending is not None:
             out['pending_analytics'] = pending
 
-    if emit_log:
-        unknown = sorted([str(k) for k in data.keys() if k not in out])
-        if unknown:
-            sample = ', '.join(unknown[:12])
-            suffix = ' ...' if len(unknown) > 12 else ''
-            log(f'[settings] Dropped unsupported keys ({len(unknown)}): {sample}{suffix}')
+    # Forward compatibility: preserve unknown keys (e.g. settings added by a
+    # newer build) so an older Kestrel doesn't drop them on the round-trip.
+    # ``_merge_forward_compatible_keys`` copies JSON-safe values only and logs
+    # any keys whose structure was unrecoverable.
+    _merge_forward_compatible_keys(out, data, emit_log=emit_log)
 
+    return out
+
+
+# --- Cumulative counters that must never regress across save/load cycles ---
+# Each entry is (key, coerce_fn). The coerce_fn returns None on unparseable input.
+def _coerce_counter_int(v: Any) -> int | None:
+    try:
+        return int(float(v))
+    except (TypeError, ValueError):
+        return None
+
+
+def _coerce_counter_float(v: Any) -> float | None:
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if math.isfinite(f) else None
+
+
+_MONOTONIC_COUNTERS: tuple[tuple[str, Any], ...] = (
+    ('kestrel_impact_total_files', _coerce_counter_int),
+    ('kestrel_impact_total_seconds', _coerce_counter_float),
+)
+
+
+def _load_settings_raw() -> tuple[dict | None, str]:
+    """Read ``settings.json`` verbatim, returning ``(data, status)``.
+
+    ``status`` is one of:
+      * ``'ok'``      — file parsed, ``data`` is the raw dict.
+      * ``'missing'`` — file does not exist; ``data`` is ``None``.
+      * ``'corrupt'`` — file exists but failed to parse as a JSON object.
+
+    This is the single source of truth for distinguishing "new install" from
+    "existing file the app cannot read". Callers that need to overwrite the
+    file use ``'corrupt'`` to bail out instead of silently clobbering data
+    a user may still be able to recover manually.
+    """
+    path = _get_settings_path()
+    if not os.path.exists(path):
+        return None, 'missing'
+    try:
+        with open(path, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+        log(f'[settings] WARN: could not parse {path}: {exc}')
+        return None, 'corrupt'
+    if not isinstance(data, dict):
+        return None, 'corrupt'
+    return data, 'ok'
+
+
+def _load_backup_if_valid() -> dict | None:
+    """Return the ``.bak`` sidecar contents if present and parseable, else None."""
+    path = _get_settings_path()
+    bak = path + '.bak'
+    if not os.path.exists(bak):
+        return None
+    try:
+        with open(bak, 'r', encoding='utf-8') as f:
+            data = json.load(f)
+    except (json.JSONDecodeError, OSError, UnicodeDecodeError) as exc:
+        log(f'[settings] WARN: .bak is also unreadable: {exc}')
+        return None
+    return data if isinstance(data, dict) else None
+
+
+def _quarantine_corrupt_settings(path: str) -> str | None:
+    """Move the corrupt ``settings.json`` aside for manual recovery, so the
+    next save can proceed with a fresh file. Returns the quarantine path or
+    ``None`` on failure.
+    """
+    try:
+        ts = time.strftime('%Y%m%d-%H%M%S')
+        quarantine = f'{path}.corrupt-{ts}'
+        # Avoid clobbering a previous quarantine from the same second.
+        attempt = 0
+        while os.path.exists(quarantine):
+            attempt += 1
+            quarantine = f'{path}.corrupt-{ts}-{attempt}'
+        shutil.copy2(path, quarantine)
+        log(f'[settings] Quarantined corrupt settings file to {quarantine}')
+        return quarantine
+    except OSError as exc:
+        log(f'[settings] Failed to quarantine corrupt settings: {exc}')
+        return None
+
+
+def _apply_monotonic_guard(incoming: dict, existing: dict | None) -> dict:
+    """Return a copy of ``incoming`` with cumulative counters clamped to at
+    least the value in ``existing``. Protects against data loss when a stale
+    caller (e.g. a race between queue_manager and the settings dialog) would
+    otherwise regress a counter.
+
+    If ``incoming`` OMITS a counter key entirely but ``existing`` has one,
+    the existing value is resurrected into the output. Callers that mutate
+    only a subset of settings (the UI does this on every save) must not be
+    able to silently zero a counter by virtue of not sending it.
+    """
+    if not isinstance(existing, dict):
+        return dict(incoming)
+    out = dict(incoming)
+    for key, coerce in _MONOTONIC_COUNTERS:
+        prev = coerce(existing.get(key))
+        if prev is None:
+            continue
+        if key not in out:
+            out[key] = prev
+            continue
+        new = coerce(out.get(key))
+        if new is None or new < prev:
+            out[key] = prev
     return out
 
 
@@ -453,25 +567,70 @@ def load_persisted_settings() -> dict:
 
     Core keys are validated/coerced; any additional keys present in the file are
     preserved when JSON-safe (forward compatibility across app versions).
+
+    If the main file is unreadable, transparently falls back to the ``.bak``
+    sidecar written by the last successful save, so a partial write or disk
+    glitch does not silently wipe cumulative state like the impact counter.
     """
-    path = _get_settings_path()
-    try:
-        with open(path, 'r', encoding='utf-8') as f:
-            data = json.load(f)
-            return _sanitize_settings_payload(data, emit_log=False) if isinstance(data, dict) else {}
-    except FileNotFoundError:
-        return {}
-    except Exception:
-        return {}
+    data, status = _load_settings_raw()
+    if status == 'ok':
+        return _sanitize_settings_payload(data, emit_log=False)
+    if status == 'corrupt':
+        bak_data = _load_backup_if_valid()
+        if bak_data is not None:
+            log('[settings] Main settings file is corrupt; serving from .bak.')
+            return _sanitize_settings_payload(bak_data, emit_log=False)
+    return {}
 
 
 def save_persisted_settings(data: dict) -> None:
+    """Atomically persist settings with corruption-aware integrity guards.
+
+    Behaviour:
+      * If the on-disk file is corrupt and a valid ``.bak`` exists, the corrupt
+        file is quarantined to ``<path>.corrupt-<ts>`` and the save proceeds,
+        using ``.bak`` for the monotonic-counter guard so impact totals etc.
+        are not lost in the recovery.
+      * If the on-disk file is corrupt and ``.bak`` is also unusable, the save
+        is **refused** — the corrupt file is preserved verbatim so the user
+        can examine or restore it manually. Running app state stays in memory.
+      * On success, the previous good ``settings.json`` is promoted to
+        ``settings.json.bak`` before the atomic ``os.replace`` of the new file.
+      * The previous non-atomic fallback (a direct write on ``os.replace``
+        failure) has been removed — it was the root cause of partial writes
+        that in turn caused the data-loss symptom being guarded against here.
+    """
     if not isinstance(data, dict):
         raise ValueError('Settings payload must be an object')
+
+    path = _get_settings_path()
+    existing_raw, status = _load_settings_raw()
+
+    if status == 'corrupt':
+        bak_data = _load_backup_if_valid()
+        if bak_data is None:
+            log(
+                f'[settings] REFUSING to save over unreadable {path}; '
+                f'no valid .bak to recover from. '
+                f'Remove or repair the file manually, then retry.'
+            )
+            return
+        # Move the corrupt file aside so the atomic write below has a clean slate.
+        _quarantine_corrupt_settings(path)
+        try:
+            os.remove(path)
+        except OSError:
+            # Not fatal — os.replace below will try to overwrite regardless.
+            pass
+        existing_raw = bak_data
+        status = 'missing'
+
+    data = _apply_monotonic_guard(data, existing_raw)
+
     # Re-sanitize while preserving forward-compatible keys so merges from the UI
     # cannot strip unknown keys that were loaded from disk.
     data = _sanitize_settings_payload(data, emit_log=True)
-        
+
     # --- Flush pending analytics on consent ---
     if data.get('analytics_consent_shown', False) and 'pending_analytics' in data:
         pending = data.pop('pending_analytics')
@@ -483,7 +642,6 @@ def save_persisted_settings(data: dict) -> None:
                 log(f'[analytics] Failed to flush pending analytics: {e}')
     # ------------------------------------------
 
-    path = _get_settings_path()
     os.makedirs(os.path.dirname(path), exist_ok=True)
     tmp = path + '.tmp'
     try:
@@ -494,14 +652,34 @@ def save_persisted_settings(data: dict) -> None:
             pass
         with open(tmp, 'w', encoding='utf-8') as f:
             json.dump(data, f, indent=2, sort_keys=True)
+            try:
+                f.flush()
+                os.fsync(f.fileno())
+            except OSError:
+                # fsync can legitimately fail on some network filesystems;
+                # proceed with the atomic replace anyway.
+                pass
+        # Promote the previous good file to .bak before replacement so that
+        # a future corrupt-main scenario can auto-recover.
+        if status == 'ok':
+            try:
+                shutil.copy2(path, path + '.bak')
+            except OSError as exc:
+                log(f'[settings] WARN: could not refresh .bak: {exc}')
         os.replace(tmp, path)
-    except OSError:
-        # Fallback: write directly — non-atomic but safe for settings
+    except OSError as exc:
+        # Do NOT fall back to a non-atomic direct write — that path is how
+        # partial writes corrupt settings.json in the first place. Leave the
+        # existing (possibly older) file in place and log loudly.
+        log(
+            f'[settings] FAILED to atomically save settings ({exc}); '
+            f'existing file left unchanged. Check disk space, permissions, '
+            f'and antivirus locks on {path}.'
+        )
         try:
-            with open(path, 'w', encoding='utf-8') as f:
-                json.dump(data, f, indent=2, sort_keys=True)
-        except OSError as e:
-            print(f'[settings] Failed to save settings: {e}', file=sys.stderr)
+            os.remove(tmp)
+        except OSError:
+            pass
 
 
 def log(*args):
