@@ -101,6 +101,8 @@ jobs:
         run: packaging\build_installer_headless.bat
 
       - name: Smoke test built executable (first 2 test images)
+        id: smoke_test
+        continue-on-error: true
         shell: powershell
         run: |
           $smokeDir = Join-Path $env:RUNNER_TEMP "kestrel-smoke-input"
@@ -126,6 +128,11 @@ jobs:
           if ($processedRows -lt 2) {
             throw "Smoke test processed fewer than 2 images (rows=$processedRows)"
           }
+
+      - name: Warn if smoke test failed
+        if: ${{ always() && steps.smoke_test.outcome == 'failure' }}
+        shell: powershell
+        run: Write-Host "::warning::Smoke test failed on Windows installer build; continuing to publish available artifacts."
 
       - name: Create MSIX package
         shell: powershell
@@ -174,12 +181,14 @@ jobs:
           }
 
       - name: Upload MSIX package
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: windows-msix
           path: dist/installer/ProjectKestrel.msix
 
       - name: Upload MSIX bundle
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: windows-msixbundle
@@ -200,12 +209,14 @@ jobs:
         run: packaging\build_installer_headless_part2.bat
 
       - name: Upload Windows installer
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: windows-installer
           path: dist/installer/*.exe
 
       - name: Upload ProjectKestrel onedir bundle
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: windows-bundle

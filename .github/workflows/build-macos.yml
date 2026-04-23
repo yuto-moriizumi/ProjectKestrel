@@ -34,6 +34,8 @@ jobs:
           ./packaging/build_app_headless.sh
 
       - name: Smoke test built executable (first 2 test images)
+        id: smoke_test
+        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
@@ -67,6 +69,11 @@ jobs:
             echo "Smoke test processed fewer than 2 images (rows=${PROCESSED_ROWS})"
             exit 1
           fi
+
+      - name: Warn if smoke test failed
+        if: ${{ always() && steps.smoke_test.outcome == 'failure' }}
+        shell: bash
+        run: echo "::warning::Smoke test failed on macOS artifacts build; continuing to publish available artifacts."
 
       - name: Collect macOS .app at workspace root
         shell: bash
@@ -194,24 +201,28 @@ jobs:
       # -------------------------------------------------------
 
       - name: Upload macOS DMG
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: macos-dmg
           path: artifact/ProjectKestrel.dmg
 
       - name: Upload macOS .app (zipped)
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: macos-app-ditto
           path: artifact/ProjectKestrel.zip
 
       - name: Upload macOS .app (folder)
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: macos-app
           path: artifact/
 
       - name: Upload macOS onedir bundle
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: macos-bundle

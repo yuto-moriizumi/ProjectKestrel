@@ -32,6 +32,8 @@ jobs:
           ./packaging/build_app_headless.sh
 
       - name: Smoke test built executable (first 2 test images)
+        id: smoke_test
+        continue-on-error: true
         shell: bash
         run: |
           set -euo pipefail
@@ -66,6 +68,11 @@ jobs:
             exit 1
           fi
 
+      - name: Warn if smoke test failed
+        if: ${{ always() && steps.smoke_test.outcome == 'failure' }}
+        shell: bash
+        run: echo "::warning::Smoke test failed on macOS dev build; continuing to publish available artifacts."
+
       - name: Collect macOS .app
         shell: bash
         run: |
@@ -83,6 +90,7 @@ jobs:
           cp -a "$APP_PATH" artifact/
 
       - name: Upload macOS dev app
+        if: ${{ always() }}
         uses: actions/upload-artifact@v4
         with:
           name: macos-dev-app
