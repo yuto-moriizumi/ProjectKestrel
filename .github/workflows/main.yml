@@ -11,6 +11,8 @@ jobs:
     steps:
       - name: Checkout repo
         uses: actions/checkout@v4
+        with:
+          lfs: true
 
       - name: Locate makeappx.exe
         id: find_makeappx
@@ -95,6 +97,33 @@ jobs:
           # See requirements-windows.txt.
           pip install -r requirements-windows.txt
           pip install pyinstaller
+
+      - name: Smoke test CLI from source (repo root, first 2 test images)
+        shell: powershell
+        run: |
+          $smokeDir = Join-Path $env:RUNNER_TEMP "kestrel-smoke-source-input"
+          Remove-Item -Recurse -Force $smokeDir -ErrorAction Ignore
+          New-Item -ItemType Directory -Path $smokeDir | Out-Null
+
+          $images = Get-ChildItem -Path "test_imgs" -File | Sort-Object Name | Select-Object -First 2
+          if ($images.Count -lt 2) {
+            throw "Expected at least 2 images in test_imgs/ for source smoke test"
+          }
+
+          foreach ($img in $images) {
+            Copy-Item $img.FullName -Destination $smokeDir
+          }
+
+          & ".\.venv2\Scripts\python.exe" "analyzer\cli.py" $smokeDir --no-gpu --parallel-prefetch 1
+
+          $metadataPath = Join-Path $smokeDir ".kestrel\metadata.csv"
+          if (!(Test-Path $metadataPath)) {
+            throw "Source CLI smoke test did not produce metadata.csv"
+          }
+          $processedRows = (Get-Content $metadataPath | Measure-Object -Line).Lines - 1
+          if ($processedRows -lt 2) {
+            throw "Source CLI smoke test processed fewer than 2 images (rows=$processedRows)"
+          }
 
       - name: Build ProjectKestrel with PyInstaller
         shell: cmd
