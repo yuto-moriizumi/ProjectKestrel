@@ -73,7 +73,7 @@ All models must be in `analyzer/models/`:
 - `model.onnx` (bird species classifier)
 - `labels.txt`, `labels_scispecies.csv`, `scispecies_dispname.csv`
 - `quality.keras` (quality assessment)
-- `sam_hq_vit_tiny.pth` (SAM-HQ ViT-Tiny segmentation checkpoint; faster than ViT-B; place under `analyzer/models/`, or CI downloads from Hugging Face)
+- `sam_hq_vit_tiny.pth` (SAM-HQ ViT-Tiny segmentation checkpoint; faster than ViT-B; bundled for CI builds)
 - SpeciesNet detector/classifier weights (downloaded automatically on first run via the `speciesnet` package)
 
 **CLI Mode (headless):**

@@ -80,29 +80,6 @@ jobs:
             Write-Host ("Added $dir to PATH for later steps")
           }
 
-      - name: Download model files
-        shell: powershell
-        run: |
-          Write-Host "Downloading model files from GitHub release..."
-          New-Item -ItemType Directory -Force -Path "analyzer\models" | Out-Null
-
-          $models = @(
-            @{ name = "sam_hq_vit_tiny.pth"; url = "https://huggingface.co/lkeab/hq-sam/resolve/main/sam_hq_vit_tiny.pth" }
-          )
-
-          foreach ($m in $models) {
-            Write-Host "  -> $($m.name)"
-            Invoke-WebRequest -Uri $m.url -OutFile "analyzer\models\$($m.name)"
-            $size = (Get-Item "analyzer\models\$($m.name)").Length
-            $minBytes = if ($m.name -like "sam_*.pth") { 20000000 } else { 100000 }
-            if ($size -lt $minBytes) { throw "Downloaded $($m.name) is too small ($size bytes)" }
-            Write-Host "     OK ($size bytes)"
-          }
-
-          Write-Host ""
-          Write-Host "Contents of analyzer\models\:"
-          Get-ChildItem "analyzer\models\" | Format-Table Name, Length, LastWriteTime
-
       - name: Set up Python 3.11
         uses: actions/setup-python@v5
         with:
