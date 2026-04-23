@@ -424,7 +424,8 @@ class AnalysisPipeline:
         rating_profile = "balanced"
         exposure_quality = "balanced"
         thumbnail_max_width = 1200
-        thumbnail_jpeg_quality = 95
+        thumbnail_jpeg_compression = 0.75
+        thumbnail_jpeg_quality = 75
         if callable(load_persisted_settings):
             try:
                 sett = load_persisted_settings() or {}
@@ -437,13 +438,23 @@ class AnalysisPipeline:
                     thumbnail_max_width = int(sett.get('thumbnail_max_width', 1200))
                 except (TypeError, ValueError):
                     thumbnail_max_width = 1200
-                try:
-                    thumbnail_jpeg_quality = int(sett.get('thumbnail_jpeg_quality', 95))
-                except (TypeError, ValueError):
-                    thumbnail_jpeg_quality = 95
+                raw_compression = sett.get('thumbnail_jpeg_compression', None)
+                if raw_compression is None:
+                    try:
+                        legacy_quality = int(sett.get('thumbnail_jpeg_quality', 75))
+                    except (TypeError, ValueError):
+                        legacy_quality = 75
+                    thumbnail_jpeg_compression = float(legacy_quality) / 100.0
+                else:
+                    try:
+                        thumbnail_jpeg_compression = float(raw_compression)
+                    except (TypeError, ValueError):
+                        thumbnail_jpeg_compression = 0.75
             except Exception:
                 rating_thresholds = None
         thumbnail_max_width = max(400, min(2400, thumbnail_max_width))
+        thumbnail_jpeg_compression = max(0.5, min(1.0, thumbnail_jpeg_compression))
+        thumbnail_jpeg_quality = int(round(thumbnail_jpeg_compression * 100.0))
         thumbnail_jpeg_quality = max(50, min(100, thumbnail_jpeg_quality))
         jpeg_params = [int(cv2.IMWRITE_JPEG_QUALITY), thumbnail_jpeg_quality]
 
@@ -1291,6 +1302,7 @@ class AnalysisPipeline:
                             "exposure_render_mode": render_mode_meta,
                             "exposure_pipeline_version": 3,
                             "thumbnail_max_width": int(thumbnail_max_width),
+                            "thumbnail_jpeg_compression": float(round(thumbnail_jpeg_compression, 4)),
                             "thumbnail_jpeg_quality": int(thumbnail_jpeg_quality),
                         }
                         with open(metadata_path, "w", encoding="utf-8") as mf:

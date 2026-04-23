@@ -31,6 +31,13 @@ except ImportError:
 # ---------------------------------------------------------------------------
 _pipeline_import_error = ''
 _AnalysisPipeline = None   # populated lazily on first use
+_DEFAULT_DETECTOR_NAME = 'mdv6-e'
+_ALLOWED_DETECTOR_NAMES = {'mdv6-e', 'mdv5a'}
+
+
+def _coerce_detector_name(value) -> str:
+    name = str(value or _DEFAULT_DETECTOR_NAME).strip().lower()
+    return name if name in _ALLOWED_DETECTOR_NAMES else _DEFAULT_DETECTOR_NAME
 
 
 def _utc_timestamp() -> str:
@@ -174,6 +181,7 @@ class QueueManager:
         self._mask_threshold = 0.5
         self._max_bird_crops = 10
         self._parallel_prefetch = 3
+        self._detector_name = _DEFAULT_DETECTOR_NAME
 
     def _collect_restore_paths_locked(self) -> list:
         restore_statuses = {'pending', 'running', 'cancelled'}
@@ -198,6 +206,7 @@ class QueueManager:
             'options': {
                 'use_gpu': bool(self._use_gpu),
                 'wildlife_enabled': bool(self._wildlife_enabled),
+                'detector_name': str(self._detector_name),
                 'detection_threshold': float(self._detection_threshold),
                 'scene_time_threshold': float(self._scene_time_threshold),
                 'mask_threshold': float(self._mask_threshold),
@@ -291,6 +300,7 @@ class QueueManager:
             restore_paths,
             use_gpu=bool(options.get('use_gpu', True)),
             wildlife_enabled=bool(options.get('wildlife_enabled', True)),
+            detector_name=_coerce_detector_name(options.get('detector_name', _DEFAULT_DETECTOR_NAME)),
             detection_threshold=_safe_float(options.get('detection_threshold', 0.25), 0.25),
             scene_time_threshold=_safe_float(options.get('scene_time_threshold', 1.0), 1.0),
             mask_threshold=_safe_float(options.get('mask_threshold', 0.5), 0.5),
@@ -339,6 +349,7 @@ class QueueManager:
         paths: list,
         use_gpu: bool = True,
         wildlife_enabled: bool = True,
+        detector_name: str = _DEFAULT_DETECTOR_NAME,
         detection_threshold: float = 0.25,
         scene_time_threshold: float = 1.0,
         mask_threshold: float = 0.5,
@@ -387,6 +398,7 @@ class QueueManager:
             self._detection_threshold = float(detection_threshold)
             self._scene_time_threshold = float(scene_time_threshold)
             self._mask_threshold = float(mask_threshold)
+            self._detector_name = _coerce_detector_name(detector_name)
             try:
                 max_bird_crops_num = int(float(max_bird_crops))
             except (TypeError, ValueError):
@@ -496,7 +508,12 @@ class QueueManager:
                 log('[queue] Pipeline unavailable, aborting:', _pipeline_import_error)
                 self._persist_recovery_state()
                 return
-            self._pipeline = cls(use_gpu=self._use_gpu)
+            self._pipeline = cls(use_gpu=self._use_gpu, detector_name=self._detector_name)
+        else:
+            try:
+                self._pipeline.detector_name = self._detector_name
+            except Exception:
+                pass
 
         while not self._cancel_event.is_set():
             with self._lock:

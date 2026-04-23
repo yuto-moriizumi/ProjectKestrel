@@ -44,6 +44,8 @@ _ALLOWED_EDITORS = {
 }
 _ALLOWED_RATING_PROFILES = {'very_strict', 'strict', 'balanced', 'lenient', 'very_lenient'}
 _ALLOWED_EXPOSURE_QUALITY = {'lenient', 'balanced', 'aggressive'}
+_ALLOWED_WILDLIFE_MODEL_MODES = {'fast', 'accurate'}
+_ALLOWED_QUEUE_DETECTOR_NAMES = {'mdv6-e', 'mdv5a'}
 _ALLOWED_QUEUE_ITEM_STATUSES = {'pending', 'running', 'done', 'error', 'cancelled'}
 
 # Telemetry — failsafe import (never blocks startup)
@@ -241,6 +243,11 @@ def _sanitize_queue_recovery_state(value: Any) -> dict | None:
     state['options'] = {
         'use_gpu': _coerce_bool(opts.get('use_gpu', True), default=True),
         'wildlife_enabled': _coerce_bool(opts.get('wildlife_enabled', True), default=True),
+        'detector_name': _coerce_enum(
+            opts.get('detector_name', 'mdv6-e'),
+            _ALLOWED_QUEUE_DETECTOR_NAMES,
+            default='mdv6-e',
+        ),
         'detection_threshold': _coerce_float(opts.get('detection_threshold', 0.25), 0.25, min_value=0.1, max_value=0.99),
         'scene_time_threshold': _coerce_float(opts.get('scene_time_threshold', 1.0), 1.0, min_value=0.0, max_value=60.0),
         'mask_threshold': _coerce_float(opts.get('mask_threshold', 0.5), 0.5, min_value=0.5, max_value=0.95),
@@ -384,6 +391,18 @@ def _sanitize_settings_payload(data: dict, emit_log: bool = False) -> dict:
     _set_int('max_bird_crops', default=10, min_value=1, max_value=20)
     _set_int('parallel_prefetch', default=3, min_value=1, max_value=5)
     _set_bool('exposure_corrected_thumbs', default=True)
+    if 'wildlife_model_mode' in data:
+        out['wildlife_model_mode'] = _coerce_enum(
+            data.get('wildlife_model_mode'),
+            _ALLOWED_WILDLIFE_MODEL_MODES,
+            default='fast',
+        )
+    if 'detector_name' in data:
+        out['detector_name'] = _coerce_enum(
+            data.get('detector_name'),
+            _ALLOWED_QUEUE_DETECTOR_NAMES,
+            default='mdv6-e',
+        )
 
     if 'exposure_quality' in data:
         out['exposure_quality'] = _coerce_enum(
@@ -401,7 +420,8 @@ def _sanitize_settings_payload(data: dict, emit_log: bool = False) -> dict:
     # as user settings so photographers can trade storage for fidelity.
     # Width in pixels along the long edge; JPEG quality is cv2's 0–100 param.
     _set_int('thumbnail_max_width', default=1200, min_value=400, max_value=2400)
-    _set_int('thumbnail_jpeg_quality', default=95, min_value=50, max_value=100)
+    _set_float('thumbnail_jpeg_compression', default=0.75, min_value=0.5, max_value=1.0, digits=4)
+    _set_int('thumbnail_jpeg_quality', default=75, min_value=50, max_value=100)
 
     _set_bool('includeSecondarySpecies', default=False)
     _set_bool('groupByFolder', default=True)

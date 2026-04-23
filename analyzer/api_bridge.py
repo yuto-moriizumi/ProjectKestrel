@@ -1588,6 +1588,16 @@ class Api:
             detection_threshold = max(0.1, min(0.99, detection_threshold))
             scene_time_threshold = float(sett.get('scene_time_threshold', 1.0))
             scene_time_threshold = max(0.0, scene_time_threshold)
+            detector_name = 'mdv6-e'
+            mode_raw = str(sett.get('wildlife_model_mode', '') or '').strip().lower()
+            if mode_raw == 'accurate':
+                detector_name = 'mdv5a'
+            elif mode_raw == 'fast':
+                detector_name = 'mdv6-e'
+            else:
+                legacy_detector = str(sett.get('detector_name', '') or '').strip().lower()
+                if legacy_detector in {'mdv6-e', 'mdv5a'}:
+                    detector_name = legacy_detector
             mask_threshold = float(sett.get('mask_threshold', 0.5))
             mask_threshold = max(0.5, min(0.95, mask_threshold))
             try:
@@ -1606,7 +1616,8 @@ class Api:
                                           scene_time_threshold=scene_time_threshold,
                                           mask_threshold=mask_threshold,
                                           max_bird_crops=max_bird_crops,
-                                          parallel_prefetch=parallel_prefetch)
+                                          parallel_prefetch=parallel_prefetch,
+                                          detector_name=detector_name)
         except Exception as e:
             print(f'[API] start_analysis_queue() -> Error: {e}', flush=True)
             return {'success': False, 'error': str(e)}

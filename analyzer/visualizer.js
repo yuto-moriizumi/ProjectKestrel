@@ -4346,17 +4346,6 @@
       // RAW preview cache
       const rawCacheCb = document.getElementById('rawPreviewCacheEnabled');
       if (rawCacheCb) rawCacheCb.checked = getSetting('raw_preview_cache_enabled', true);
-      // Thumbnail resolution + JPEG quality
-      const thumbWidthSel = document.getElementById('thumbnailMaxWidth');
-      if (thumbWidthSel) {
-        const curW = parseInt(getSetting('thumbnail_max_width', 1200), 10) || 1200;
-        // Snap to the nearest option if the stored value isn't in the list.
-        const opts = Array.from(thumbWidthSel.options).map(o => parseInt(o.value, 10));
-        const nearest = opts.reduce((a, b) => (Math.abs(b - curW) < Math.abs(a - curW) ? b : a), opts[0]);
-        thumbWidthSel.value = String(nearest);
-      }
-      const thumbQualInp = document.getElementById('thumbnailJpegQuality');
-      if (thumbQualInp) thumbQualInp.value = parseInt(getSetting('thumbnail_jpeg_quality', 95), 10) || 95;
       const optedIn = getSetting('analytics_opted_in', null);
       const consentShown = getSetting('analytics_consent_shown', false);
       const cb = document.getElementById('settingsAnalyticsOptIn');
@@ -4396,10 +4385,6 @@
       const rawPreviewCacheEnabled = rawCacheCb2 ? rawCacheCb2.checked : true;
       const autoSaveCb = document.getElementById('settingsAutoSave');
       const autoSaveEnabled = autoSaveCb ? autoSaveCb.checked : true;
-      const thumbWidthEl = document.getElementById('thumbnailMaxWidth');
-      const thumbnailMaxWidth = Math.max(400, Math.min(2400, parseInt(thumbWidthEl?.value, 10) || 1200));
-      const thumbQualEl = document.getElementById('thumbnailJpegQuality');
-      const thumbnailJpegQuality = Math.max(50, Math.min(100, parseInt(thumbQualEl?.value, 10) || 95));
       // Merge into existing settings so keys like machine_id / analytics_consent_shown are preserved
       const existing = loadSettings();
       const prevProfile = existing.rating_profile || 'balanced';
@@ -4417,8 +4402,6 @@
         auto_save_enabled: autoSaveEnabled,
         raw_exposure_correction_disabled: rawExposureCorrectionDisabled,
         exposure_corrected_thumbs: exposureCorrectedThumbs,
-        thumbnail_max_width: thumbnailMaxWidth,
-        thumbnail_jpeg_quality: thumbnailJpegQuality,
       };
       _autoSaveEnabled = autoSaveEnabled;
       if (!_autoSaveEnabled) {
@@ -5776,10 +5759,30 @@
         const savedEq = String(getSetting('exposure_quality', 'balanced') || 'balanced').toLowerCase();
         _adlgEq.value = ['lenient', 'balanced', 'aggressive'].includes(savedEq) ? savedEq : 'balanced';
       }
+      const _adlgModelMode = document.getElementById('adlgWildlifeModelMode');
+      if (_adlgModelMode) {
+        const savedMode = String(getSetting('wildlife_model_mode', 'fast') || 'fast').toLowerCase();
+        _adlgModelMode.value = (savedMode === 'accurate') ? 'accurate' : 'fast';
+      }
       const _adlgSt = document.getElementById('adlgSceneTime');
       if (_adlgSt) _adlgSt.value = getSetting('scene_time_threshold', 1.0);
       const _adlgPp = document.getElementById('adlgParallelPrefetch');
       if (_adlgPp) _adlgPp.value = getSetting('parallel_prefetch', 3);
+      const _adlgThumbW = document.getElementById('adlgThumbnailMaxWidth');
+      if (_adlgThumbW) {
+        const savedW = parseInt(getSetting('thumbnail_max_width', 1200), 10);
+        _adlgThumbW.value = Math.max(400, Math.min(2400, Number.isFinite(savedW) ? savedW : 1200));
+      }
+      const _adlgThumbComp = document.getElementById('adlgThumbnailJpegCompression');
+      if (_adlgThumbComp) {
+        let compression = parseFloat(getSetting('thumbnail_jpeg_compression', Number.NaN));
+        if (!Number.isFinite(compression)) {
+          const legacyQuality = parseInt(getSetting('thumbnail_jpeg_quality', 75), 10);
+          compression = (Number.isFinite(legacyQuality) ? legacyQuality : 75) / 100;
+        }
+        compression = Math.max(0.5, Math.min(1.0, compression));
+        _adlgThumbComp.value = compression.toFixed(2);
+      }
 
       const treeEl = document.getElementById('analyzeDlgTree');
       treeEl.innerHTML = '';
@@ -7694,15 +7697,28 @@
           const mbcVal = Math.max(1, Math.min(20, Number.isFinite(mbcRaw) ? mbcRaw : 10));
           const eqRaw = String(document.getElementById('adlgExposureQuality')?.value || 'balanced').toLowerCase();
           const eqVal = ['lenient', 'balanced', 'aggressive'].includes(eqRaw) ? eqRaw : 'balanced';
+          const modelRaw = String(document.getElementById('adlgWildlifeModelMode')?.value || 'fast').toLowerCase();
+          const modelVal = modelRaw === 'accurate' ? 'accurate' : 'fast';
+          const detectorName = modelVal === 'accurate' ? 'mdv5a' : 'mdv6-e';
           const stVal = Math.max(0, parseFloat(document.getElementById('adlgSceneTime')?.value) || 1.0);
           const ppRaw = parseInt(document.getElementById('adlgParallelPrefetch')?.value, 10);
           const ppVal = Math.max(1, Math.min(5, Number.isFinite(ppRaw) ? ppRaw : 3));
+          const twRaw = parseInt(document.getElementById('adlgThumbnailMaxWidth')?.value, 10);
+          const twVal = Math.max(400, Math.min(2400, Number.isFinite(twRaw) ? twRaw : 1200));
+          const tcRaw = parseFloat(document.getElementById('adlgThumbnailJpegCompression')?.value);
+          const tcVal = Math.max(0.5, Math.min(1.0, Number.isFinite(tcRaw) ? tcRaw : 0.75));
+          const tqVal = Math.max(50, Math.min(100, Math.round(tcVal * 100)));
           const adlgSettings = loadSettings();
           adlgSettings.detection_threshold = dtVal;
           adlgSettings.max_bird_crops = mbcVal;
           adlgSettings.exposure_quality = eqVal;
+          adlgSettings.wildlife_model_mode = modelVal;
+          adlgSettings.detector_name = detectorName;
           adlgSettings.scene_time_threshold = stVal;
           adlgSettings.parallel_prefetch = ppVal;
+          adlgSettings.thumbnail_max_width = twVal;
+          adlgSettings.thumbnail_jpeg_compression = tcVal;
+          adlgSettings.thumbnail_jpeg_quality = tqVal;
           saveSettings(adlgSettings);
           if (hasPywebviewApi && window.pywebview?.api?.save_settings_data) {
             try { await window.pywebview.api.save_settings_data(adlgSettings); } catch (_) { }

@@ -2570,10 +2570,17 @@
     .analyze-dlg-advanced summary:hover { color: #c8cdd8; }
 
     .analyze-dlg-advanced-body {
-      display: flex;
-      flex-direction: column;
+      display: grid;
+      grid-template-columns: repeat(auto-fit, minmax(320px, 1fr));
       gap: 12px;
       padding: 4px 12px 12px;
+      align-items: start;
+    }
+
+    @media (max-width: 780px) {
+      .analyze-dlg-advanced-body {
+        grid-template-columns: 1fr;
+      }
     }
 
     .adlg-group {
