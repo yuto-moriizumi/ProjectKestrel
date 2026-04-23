@@ -470,11 +470,27 @@ def parse_args():
     ap = argparse.ArgumentParser(description='Serve Project Kestrel visualizer with local desktop bridge.')
     ap.add_argument('--port', type=int, default=8765, help='Port to listen on (default 8765)')
     ap.add_argument('--root', default='', help='Default root folder for RAW originals (client can override unless KESTREL_ALLOWED_ROOT set)')
-    return ap.parse_args()
+    ap.add_argument(
+        '--cli',
+        action='store_true',
+        help='Run analyzer CLI mode (headless) instead of launching the desktop UI.',
+    )
+    return ap.parse_known_args()
 
 
 def main():
-    args = parse_args()
+    args, remaining_args = parse_args()
+    if args.cli:
+        from cli import main as cli_main
+
+        original_argv = sys.argv[:]
+        try:
+            sys.argv = [original_argv[0], *remaining_args]
+            cli_main()
+        finally:
+            sys.argv = original_argv
+        return
+
     runtime_log_path = _enable_runtime_log_capture()
     if runtime_log_path:
         log('Runtime log capture enabled:', runtime_log_path)

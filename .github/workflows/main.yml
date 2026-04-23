@@ -123,6 +123,24 @@ jobs:
         shell: cmd
         run: packaging\build_installer_headless.bat
 
+      - name: Smoke test built executable (first 2 test images)
+        shell: powershell
+        run: |
+          $smokeDir = Join-Path $env:RUNNER_TEMP "kestrel-smoke-input"
+          Remove-Item -Recurse -Force $smokeDir -ErrorAction Ignore
+          New-Item -ItemType Directory -Path $smokeDir | Out-Null
+
+          $images = Get-ChildItem -Path "test_imgs" -File | Sort-Object Name | Select-Object -First 2
+          if ($images.Count -lt 2) {
+            throw "Expected at least 2 images in test_imgs/ for smoke test"
+          }
+
+          foreach ($img in $images) {
+            Copy-Item $img.FullName -Destination $smokeDir
+          }
+
+          & "analyzer\dist\ProjectKestrel\ProjectKestrel.exe" --cli $smokeDir --no-gpu --parallel-prefetch 1
+
       - name: Create MSIX package
         shell: powershell
         run: |
