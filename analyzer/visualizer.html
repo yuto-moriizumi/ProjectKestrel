@@ -624,7 +624,7 @@
         <summary>Advanced Analysis Settings</summary>
         <div class="analyze-dlg-advanced-body">
           <div class="adlg-group">
-            <div class="adlg-group-title">Detection</div>
+            <div class="adlg-group-title">Performance</div>
             <label class="adlg-toggle-row" id="analyzeGpuLabel">
               <input id="analyzeUseGpu" type="checkbox" checked />
               <div class="adlg-toggle-text">
@@ -632,21 +632,24 @@
                 <span class="adlg-toggle-hint muted">Accelerates detection and classification via DirectML (Windows) or CoreML (macOS).</span>
               </div>
             </label>
-            <label class="adlg-toggle-row">
-              <input id="analyzeWildlife" type="checkbox" />
-              <div class="adlg-toggle-text">
-                <span class="adlg-toggle-label">Check for other wildlife species in addition to birds <span class="adlg-tag">experimental</span></span>
-                <span class="adlg-toggle-hint muted">Detects 1,200+ non-bird species (squirrels, deer, bears, etc.) using SpeciesNet.</span>
-              </div>
-            </label>
+            <div class="adlg-setting-row">
+              <label for="adlgParallelPrefetch">Parallel Processing</label>
+              <input id="adlgParallelPrefetch" type="number" min="1" max="5" step="1" value="3"
+                style="width:80px" title="Number of images to read ahead in parallel (1–5)" />
+            </div>
+            <div class="adlg-hint muted">Number of images to read ahead to sustain the processing queue (1–5). Lower this if your computer slows down too much during analysis.</div>
+          </div>
+
+          <div class="adlg-group">
+            <div class="adlg-group-title">Wildlife Detection</div>
             <div class="adlg-setting-row">
               <label for="adlgWildlifeModelMode">Wildlife Detection Model</label>
               <select id="adlgWildlifeModelMode" style="width:130px" title="Fast uses MDv6-E. Accurate uses MDv5a.">
-                <option value="fast" selected>Fast</option>
-                <option value="accurate">Accurate</option>
+                <option value="fast">Fast</option>
+                <option value="accurate" selected>Accurate</option>
               </select>
             </div>
-            <div class="adlg-hint muted">Fast uses MDv6-E (current default). Accurate uses MDv5a for stronger recall on difficult subjects.</div>
+            <div class="adlg-hint muted">Fast uses MDv6-E. Accurate uses MDv5a for stronger recall on difficult subjects.</div>
             <div class="adlg-setting-row">
               <label for="adlgDetectionThreshold">Animal Detection Confidence</label>
               <input id="adlgDetectionThreshold" type="number" min="0.1" max="0.99" step="0.05" value="0.25"
@@ -659,10 +662,17 @@
                 style="width:80px" title="Maximum number of bird/wildlife subjects saved per image (1–20)" />
             </div>
             <div class="adlg-hint muted">Maximum bird (aves) and non-bird wildlife subjects saved per image (each list capped separately).</div>
+            <label class="adlg-toggle-row">
+              <input id="analyzeWildlife" type="checkbox" />
+              <div class="adlg-toggle-text">
+                <span class="adlg-toggle-label">Check for other wildlife species in addition to birds <span class="adlg-tag">experimental</span></span>
+                <span class="adlg-toggle-hint muted">Detects 1,200+ non-bird species (squirrels, deer, bears, etc.) using SpeciesNet.</span>
+              </div>
+            </label>
           </div>
 
           <div class="adlg-group">
-            <div class="adlg-group-title">Exposure</div>
+            <div class="adlg-group-title">Exposure/Grouping</div>
             <div class="adlg-setting-row">
               <label for="adlgExposureQuality">Exposure Compensation Quality</label>
               <select id="adlgExposureQuality" style="flex:1;max-width:340px">
@@ -672,26 +682,16 @@
               </select>
             </div>
             <div class="adlg-hint muted">Controls how strongly Kestrel corrects bird exposure. Balanced is recommended for most images.</div>
-          </div>
-
-          <div class="adlg-group">
-            <div class="adlg-group-title">Processing</div>
             <div class="adlg-setting-row">
               <label for="adlgSceneTime">Scene Grouping Time (seconds)</label>
               <input id="adlgSceneTime" type="number" min="0" max="60" step="0.5" value="1.0"
                 style="width:80px" title="Images within this many seconds are grouped as one scene burst" />
             </div>
             <div class="adlg-hint muted">Images captured within this many seconds of each other are treated as the same burst/scene.</div>
-            <div class="adlg-setting-row">
-              <label for="adlgParallelPrefetch">Parallel Processing</label>
-              <input id="adlgParallelPrefetch" type="number" min="1" max="5" step="1" value="3"
-                style="width:80px" title="Number of images to read ahead in parallel (1–5)" />
-            </div>
-            <div class="adlg-hint muted">Number of images to read ahead to sustain the processing queue (1–5). Lower this if your computer slows down too much during analysis.</div>
           </div>
 
           <div class="adlg-group">
-            <div class="adlg-group-title">Thumbnail Export</div>
+            <div class="adlg-group-title">Thumbnails</div>
             <div class="adlg-setting-row">
               <label for="adlgThumbnailMaxWidth">Thumbnail Width (px)</label>
               <input id="adlgThumbnailMaxWidth" type="number" min="400" max="2400" step="100" value="1200"

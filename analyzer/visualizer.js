@@ -5761,8 +5761,8 @@
       }
       const _adlgModelMode = document.getElementById('adlgWildlifeModelMode');
       if (_adlgModelMode) {
-        const savedMode = String(getSetting('wildlife_model_mode', 'fast') || 'fast').toLowerCase();
-        _adlgModelMode.value = (savedMode === 'accurate') ? 'accurate' : 'fast';
+        const savedMode = String(getSetting('wildlife_model_mode', 'accurate') || 'accurate').toLowerCase();
+        _adlgModelMode.value = (savedMode === 'fast') ? 'fast' : 'accurate';
       }
       const _adlgSt = document.getElementById('adlgSceneTime');
       if (_adlgSt) _adlgSt.value = getSetting('scene_time_threshold', 1.0);

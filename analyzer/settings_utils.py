@@ -395,7 +395,7 @@ def _sanitize_settings_payload(data: dict, emit_log: bool = False) -> dict:
         out['wildlife_model_mode'] = _coerce_enum(
             data.get('wildlife_model_mode'),
             _ALLOWED_WILDLIFE_MODEL_MODES,
-            default='fast',
+            default='accurate',
         )
     if 'detector_name' in data:
         out['detector_name'] = _coerce_enum(
