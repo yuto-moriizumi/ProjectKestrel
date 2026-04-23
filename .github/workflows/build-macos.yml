@@ -52,9 +52,9 @@ jobs:
 
           .venv2/bin/python analyzer/cli.py "${SMOKE_DIR}" --no-gpu --parallel-prefetch 1
 
-          META_PATH="${SMOKE_DIR}/.kestrel/metadata.csv"
+          META_PATH="${SMOKE_DIR}/.kestrel/kestrel_database.csv"
           if [ ! -f "${META_PATH}" ]; then
-            echo "Source CLI smoke test did not produce metadata.csv"
+            echo "Source CLI smoke test did not produce kestrel_database.csv"
             exit 1
           fi
           PROCESSED_ROWS=$(( $(wc -l < "${META_PATH}") - 1 ))
@@ -95,9 +95,9 @@ jobs:
 
           analyzer/dist/ProjectKestrel/ProjectKestrel --cli "${SMOKE_DIR}" --no-gpu --parallel-prefetch 1
 
-          META_PATH="${SMOKE_DIR}/.kestrel/metadata.csv"
+          META_PATH="${SMOKE_DIR}/.kestrel/kestrel_database.csv"
           if [ ! -f "${META_PATH}" ]; then
-            echo "Smoke test did not produce metadata.csv"
+            echo "Smoke test did not produce kestrel_database.csv"
             exit 1
           fi
           PROCESSED_ROWS=$(( $(wc -l < "${META_PATH}") - 1 ))
