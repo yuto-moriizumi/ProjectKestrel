@@ -116,9 +116,9 @@ jobs:
 
           & ".\.venv2\Scripts\python.exe" "analyzer\cli.py" $smokeDir --no-gpu --parallel-prefetch 1
 
-          $metadataPath = Join-Path $smokeDir ".kestrel\metadata.csv"
+          $metadataPath = Join-Path $smokeDir ".kestrel\kestrel_database.csv"
           if (!(Test-Path $metadataPath)) {
-            throw "Source CLI smoke test did not produce metadata.csv"
+            throw "Source CLI smoke test did not produce kestrel_database.csv"
           }
           $processedRows = (Get-Content $metadataPath | Measure-Object -Line).Lines - 1
           if ($processedRows -lt 2) {
@@ -149,9 +149,9 @@ jobs:
 
           & "analyzer\dist\ProjectKestrel\ProjectKestrel.exe" --cli $smokeDir --no-gpu --parallel-prefetch 1
 
-          $metadataPath = Join-Path $smokeDir ".kestrel\metadata.csv"
+          $metadataPath = Join-Path $smokeDir ".kestrel\kestrel_database.csv"
           if (!(Test-Path $metadataPath)) {
-            throw "Smoke test did not produce metadata.csv"
+            throw "Smoke test did not produce kestrel_database.csv"
           }
           $processedRows = (Get-Content $metadataPath | Measure-Object -Line).Lines - 1
           if ($processedRows -lt 2) {
