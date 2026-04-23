@@ -42,6 +42,10 @@ jobs:
           mkdir -p "${SMOKE_DIR}"
 
           smoke_imgs=$(find test_imgs -maxdepth 1 -type f | sort | head -n 2)
+          if [ -z "${smoke_imgs}" ]; then
+            echo "Expected at least 2 images in test_imgs/ for smoke test"
+            exit 1
+          fi
           smoke_count=$(printf '%s\n' "${smoke_imgs}" | sed '/^$/d' | wc -l | tr -d ' ')
           if [ "${smoke_count}" -lt 2 ]; then
             echo "Expected at least 2 images in test_imgs/ for smoke test"
