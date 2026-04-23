@@ -5,7 +5,7 @@ from __future__ import annotations
 import math
 from typing import Any
 
-from speciesnet.constants import Classification
+from ._speciesnet_ensemble import Classification
 
 # Full label strings from SpeciesNet taxonomy (see speciesnet.constants.Classification).
 _SPECIESNET_BLANK = "f1856211-cfb7-4a5b-9158-c0f72fd09ee6;;;;;;blank"

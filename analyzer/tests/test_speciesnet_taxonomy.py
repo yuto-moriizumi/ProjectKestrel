@@ -2,7 +2,7 @@
 
 import unittest
 
-from speciesnet.constants import Classification
+from kestrel_analyzer.ml._speciesnet_ensemble import Classification
 
 from kestrel_analyzer.ml.speciesnet_taxonomy import (
     bird_vs_wildlife_classifier_scores,

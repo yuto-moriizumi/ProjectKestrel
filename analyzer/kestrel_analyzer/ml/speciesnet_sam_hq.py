@@ -904,7 +904,7 @@ class SpeciesNetSAMHQWrapper:
         self.model_name: Optional[str] = None
 
     def _ensure_speciesnet(self) -> None:
-        from speciesnet import SpeciesNetEnsemble
+        from ._speciesnet_ensemble import LocalSpeciesNetEnsemble as SpeciesNetEnsemble
 
         if self.detector is None or self.classifier is None:
             self.model_name = _speciesnet_bundle_model_name()
@@ -1004,7 +1004,7 @@ class SpeciesNetSAMHQWrapper:
         self._ensure_speciesnet()
         self._ensure_sam()
 
-        from speciesnet.utils import BBox
+        from ._speciesnet_ensemble import BBox
 
         fp = str(Path(image_path).resolve())
         h, w = image_data.shape[:2]

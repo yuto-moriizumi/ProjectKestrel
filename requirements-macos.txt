@@ -1,7 +1,5 @@
 # Core ML/AI Dependencies
-torch==2.11.0
-torchvision==0.26.0
-tensorflow
+# torch, torchvision, tensorflow removed: all ML inference uses ONNX Runtime.
 # onnxruntime on macOS includes CoreMLExecutionProvider for GPU/Neural Engine
 # acceleration via Apple Core ML. No separate package needed (unlike DirectML on Windows).
 onnxruntime==1.23.2
@@ -33,7 +31,5 @@ pyinstaller==6.18.0
 exifread
 pillow==12.1.1
 
-# Camera-trap detection + segmentation (SpeciesNet + SAM-HQ)
-speciesnet==5.0.3
-segment-anything-hq
-timm
+# speciesnet, segment-anything-hq, timm removed: ensemble logic is inlined in
+# kestrel_analyzer/ml/_speciesnet_ensemble.py; SAM-HQ runs via ONNX Runtime.

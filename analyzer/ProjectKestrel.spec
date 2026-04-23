@@ -9,8 +9,7 @@ hiddenimports = ['pywebview','PIL','exifread','settings_utils','editor_launch','
 binaries += collect_dynamic_libs('onnxruntime')
 tmp_ret = collect_all('msvc-runtime')
 datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
-tmp_ret = collect_all('optree')
-datas += tmp_ret[0]; binaries += tmp_ret[1]; hiddenimports += tmp_ret[2]
+# optree removed: was a transitive dependency of torch via speciesnet (now eliminated)
 
 
 a = Analysis(
