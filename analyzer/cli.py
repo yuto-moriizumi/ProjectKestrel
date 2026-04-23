@@ -4,6 +4,7 @@ import shutil
 import sys
 import tempfile
 from pathlib import Path
+from typing import Sequence
 
 sys.path.insert(0, str(Path(__file__).parent))
 from kestrel_analyzer.pipeline import AnalysisPipeline
@@ -16,7 +17,7 @@ from kestrel_analyzer.config import (
 )
 
 
-def parse_args():
+def parse_args(argv: Sequence[str] | None = None):
     detector_choices = sorted(DETECTOR_ONNX_PATHS.keys())
     parser = argparse.ArgumentParser(description="Kestrel Analyzer CLI")
     parser.add_argument("folder", help="Folder with RAW/JPEG images")
@@ -46,7 +47,7 @@ def parse_args():
         help="Load a single image via Wand and exit (skips model loading)",
     )
     parser.set_defaults(use_gpu=True)
-    return parser.parse_args()
+    return parser.parse_args(argv)
 
 
 def _find_first_image(folder: str) -> str | None:
@@ -69,10 +70,10 @@ def _find_first_image(folder: str) -> str | None:
     return os.path.join(folder, files[0])
 
 
-def main():
+def main(argv: Sequence[str] | None = None):
     log_path = get_log_path(None)
     try:
-        args = parse_args()
+        args = parse_args(argv)
         detection_threshold = max(0.10, min(0.99, float(args.detection_threshold)))
         parallel_pf = max(1, min(5, int(float(args.parallel_prefetch))))
         log_path = get_log_path(args.folder)

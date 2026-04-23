@@ -483,12 +483,7 @@ def main():
     if args.cli:
         from cli import main as cli_main
 
-        original_argv = sys.argv[:]
-        try:
-            sys.argv = [original_argv[0], *remaining_args]
-            cli_main()
-        finally:
-            sys.argv = original_argv
+        cli_main(remaining_args)
         return
 
     runtime_log_path = _enable_runtime_log_capture()
