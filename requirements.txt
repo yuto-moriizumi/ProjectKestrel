@@ -28,5 +28,5 @@ msvc-runtime==14.44.35112
 exifread
 pillow==12.1.1
 
-# Camera-trap detection + classification (ensemble logic only; no PyTorch inference)
-speciesnet==5.0.3
+# speciesnet removed: ensemble logic is inlined in kestrel_analyzer/ml/_speciesnet_ensemble.py
+# (Apache 2.0, adapted from google/cameratrapai). This eliminates the torch/optree dependency.
