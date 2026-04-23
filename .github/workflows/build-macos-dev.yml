@@ -43,7 +43,7 @@ jobs:
 
           # mapfile is unavailable in macOS runner bash (3.2), so use newline-delimited paths.
           smoke_imgs=$(find test_imgs -maxdepth 1 -type f | sort | head -n 2)
-          smoke_count=$(printf '%s\n' "${smoke_imgs}" | awk 'NF { c++ } END { print c+0 }')
+          smoke_count=$(printf '%s\n' "${smoke_imgs}" | awk 'NF { c++ } END { print (c ? c : 0) }')
           if [ "${smoke_count}" -lt 2 ]; then
             echo "Expected at least 2 images in test_imgs/ for smoke test"
             exit 1
