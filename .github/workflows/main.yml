@@ -141,6 +141,15 @@ jobs:
 
           & "analyzer\dist\ProjectKestrel\ProjectKestrel.exe" --cli $smokeDir --no-gpu --parallel-prefetch 1
 
+          $metadataPath = Join-Path $smokeDir ".kestrel\metadata.csv"
+          if (!(Test-Path $metadataPath)) {
+            throw "Smoke test did not produce metadata.csv"
+          }
+          $processedRows = (Get-Content $metadataPath | Measure-Object -Line).Lines - 1
+          if ($processedRows -lt 2) {
+            throw "Smoke test processed fewer than 2 images (rows=$processedRows)"
+          }
+
       - name: Create MSIX package
         shell: powershell
         run: |

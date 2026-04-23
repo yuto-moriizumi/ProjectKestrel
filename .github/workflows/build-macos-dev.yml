@@ -74,6 +74,17 @@ jobs:
 
           analyzer/dist/ProjectKestrel/ProjectKestrel --cli "${SMOKE_DIR}" --no-gpu --parallel-prefetch 1
 
+          META_PATH="${SMOKE_DIR}/.kestrel/metadata.csv"
+          if [ ! -f "${META_PATH}" ]; then
+            echo "Smoke test did not produce metadata.csv"
+            exit 1
+          fi
+          PROCESSED_ROWS=$(( $(wc -l < "${META_PATH}") - 1 ))
+          if [ "${PROCESSED_ROWS}" -lt 2 ]; then
+            echo "Smoke test processed fewer than 2 images (rows=${PROCESSED_ROWS})"
+            exit 1
+          fi
+
       - name: Collect macOS .app
         shell: bash
         run: |
