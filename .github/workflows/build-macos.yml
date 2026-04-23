@@ -43,20 +43,19 @@ jobs:
           rm -rf "${SMOKE_DIR}"
           mkdir -p "${SMOKE_DIR}"
 
-          # mapfile is unavailable in macOS runner bash (3.2), so use newline-delimited paths.
-          smoke_imgs=$(find test_imgs -maxdepth 1 -type f | sort | head -n 2)
-          smoke_count=$(printf '%s\n' "${smoke_imgs}" | awk 'NF { c++ } END { print (c ? c : 0) }')
-          if [ "${smoke_count}" -lt 2 ]; then
+          # mapfile is unavailable in macOS runner bash (3.2), so use while-read.
+          smoke_imgs=()
+          while IFS= read -r img; do
+            smoke_imgs+=("${img}")
+          done < <(find test_imgs -maxdepth 1 -type f | sort | head -n 2)
+          if [ "${#smoke_imgs[@]}" -lt 2 ]; then
             echo "Expected at least 2 images in test_imgs/ for smoke test"
             exit 1
           fi
 
-          while IFS= read -r img; do
-            [ -z "${img}" ] && continue
+          for img in "${smoke_imgs[@]}"; do
             cp "${img}" "${SMOKE_DIR}/"
-          done <<EOF
-          ${smoke_imgs}
-          EOF
+          done
 
           analyzer/dist/ProjectKestrel/ProjectKestrel --cli "${SMOKE_DIR}" --no-gpu --parallel-prefetch 1
 
