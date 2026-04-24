@@ -1,6 +1,6 @@
 from pathlib import Path
 
-VERSION = "2.0.0"
+VERSION = "2.0.1"
 
 ANALYZER_DIR = Path(__file__).resolve().parents[1]
 REPO_ROOT = ANALYZER_DIR.parent
