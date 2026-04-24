@@ -644,12 +644,12 @@
             <div class="adlg-group-title">Wildlife Detection</div>
             <div class="adlg-setting-row">
               <label for="adlgWildlifeModelMode">Wildlife Detection Model</label>
-              <select id="adlgWildlifeModelMode" style="width:130px" title="Fast uses MDv6-C (YOLOv9-C). Accurate uses MDv6-E (YOLOv9-E).">
+              <select id="adlgWildlifeModelMode" style="width:130px" title="Fast uses a smaller model. Accurate uses a larger model with stronger recall.">
                 <option value="fast">Fast</option>
                 <option value="accurate" selected>Accurate</option>
               </select>
             </div>
-            <div class="adlg-hint muted">Fast uses MDv6-C (YOLOv9-C, compact). Accurate uses MDv6-E (YOLOv9-E, larger). Both are Apache 2.0 licensed.</div>
+            <div class="adlg-hint muted">Fast uses a smaller model that may miss some detections. Accurate uses a larger model with stronger recall.</div>
             <div class="adlg-setting-row">
               <label for="adlgDetectionThreshold">Animal Detection Confidence</label>
               <input id="adlgDetectionThreshold" type="number" min="0.1" max="0.99" step="0.05" value="0.25"

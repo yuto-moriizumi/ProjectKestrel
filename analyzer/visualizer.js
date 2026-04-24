@@ -9375,12 +9375,12 @@
     // `last_seen_whats_new_version` will not see the banner again.
     const WHATS_NEW = {
       version: 'gambels-quail',
-      headline: "New in v(Gambel's Quail) \u2014 our biggest update yet",
+      headline: "New in v(Gambel\u2019s Quail) \u2014 the biggest update yet!",
       items: [
-        'New <b>pipeline v2.0</b> is up to <b>500% faster</b> with better bird detection and exposure compensation \u2014 all powered by ONNX Runtime with GPU acceleration.',
-        'Detects <b>1,200+ wildlife species</b> (squirrels, bears, and more) using <b>MegaDetector</b>, <b>SpeciesNet</b>, and <b>SAM-HQ</b>. Enable in Settings \u2192 Analysis.',
-        'New <b>bird thumbnail</b> view shows the crop side-by-side with the full scene, plus new Scene view buttons: <b>Mark as Reviewed</b>, <b>Open in [editor]</b>, and subject-switcher arrows for multi-bird scenes.',
-        'Rebuilt in-app tutorial with <b>Basics</b> and <b>Advanced</b> branches, a rotating tips carousel, and a new <b>Adjust Capture Time</b> dialog for timeline fixes.',
+        'New <b>Analysis Pipeline v2.0</b> is up to <b>500% faster</b> with better bird detection and exposure compensation, made possible by GPU support, more efficient machine learning models, and algorithmic tweaks!',
+        'Kestrel is rolling out <b>beta support for 1,200+ wildlife species</b>. Enable this experimental feature in <b>Advanced Analysis Settings</b>.',
+        'Several UI tweaks, new features, enhancements, and bug fixes improve Kestrel\u2019s usability.',
+        'New <b>in-app tutorials</b> let you choose between just the basics or showing all features.',
       ],
     };
 
