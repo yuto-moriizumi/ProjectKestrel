@@ -45,7 +45,7 @@ _ALLOWED_EDITORS = {
 _ALLOWED_RATING_PROFILES = {'very_strict', 'strict', 'balanced', 'lenient', 'very_lenient'}
 _ALLOWED_EXPOSURE_QUALITY = {'lenient', 'balanced', 'aggressive'}
 _ALLOWED_WILDLIFE_MODEL_MODES = {'fast', 'accurate'}
-_ALLOWED_QUEUE_DETECTOR_NAMES = {'mdv6-e', 'mdv5a'}
+_ALLOWED_QUEUE_DETECTOR_NAMES = {'mdv6-c', 'mdv6-e'}
 _ALLOWED_QUEUE_ITEM_STATUSES = {'pending', 'running', 'done', 'error', 'cancelled'}
 
 # Telemetry — failsafe import (never blocks startup)

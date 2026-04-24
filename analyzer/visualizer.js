@@ -7699,7 +7699,7 @@
           const eqVal = ['lenient', 'balanced', 'aggressive'].includes(eqRaw) ? eqRaw : 'balanced';
           const modelRaw = String(document.getElementById('adlgWildlifeModelMode')?.value || 'fast').toLowerCase();
           const modelVal = modelRaw === 'accurate' ? 'accurate' : 'fast';
-          const detectorName = modelVal === 'accurate' ? 'mdv5a' : 'mdv6-e';
+          const detectorName = modelVal === 'accurate' ? 'mdv6-e' : 'mdv6-c';
           const stVal = Math.max(0, parseFloat(document.getElementById('adlgSceneTime')?.value) || 1.0);
           const ppRaw = parseInt(document.getElementById('adlgParallelPrefetch')?.value, 10);
           const ppVal = Math.max(1, Math.min(5, Number.isFinite(ppRaw) ? ppRaw : 3));

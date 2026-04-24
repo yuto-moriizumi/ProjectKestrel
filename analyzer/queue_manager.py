@@ -32,7 +32,7 @@ except ImportError:
 _pipeline_import_error = ''
 _AnalysisPipeline = None   # populated lazily on first use
 _DEFAULT_DETECTOR_NAME = 'mdv6-e'
-_ALLOWED_DETECTOR_NAMES = {'mdv6-e', 'mdv5a'}
+_ALLOWED_DETECTOR_NAMES = {'mdv6-c', 'mdv6-e'}
 
 
 def _coerce_detector_name(value) -> str:

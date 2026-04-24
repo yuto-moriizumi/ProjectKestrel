@@ -1591,12 +1591,12 @@ class Api:
             detector_name = 'mdv6-e'
             mode_raw = str(sett.get('wildlife_model_mode', '') or '').strip().lower()
             if mode_raw == 'accurate':
-                detector_name = 'mdv5a'
-            elif mode_raw == 'fast':
                 detector_name = 'mdv6-e'
+            elif mode_raw == 'fast':
+                detector_name = 'mdv6-c'
             else:
                 legacy_detector = str(sett.get('detector_name', '') or '').strip().lower()
-                if legacy_detector in {'mdv6-e', 'mdv5a'}:
+                if legacy_detector in {'mdv6-c', 'mdv6-e'}:
                     detector_name = legacy_detector
             mask_threshold = float(sett.get('mask_threshold', 0.5))
             mask_threshold = max(0.5, min(0.95, mask_threshold))
