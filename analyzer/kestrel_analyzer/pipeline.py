@@ -379,6 +379,7 @@ class AnalysisPipeline:
             self.quality_clf = QualityClassifier(
                 str(QUALITYCLASSIFIER_PATH),
                 normalization_data_path=str(QUALITY_NORMALIZATION_DATA_PATH),
+                use_gpu=self.use_gpu,
             )
         if status_cb:
             status_cb("Models loaded. Processing started.")
