@@ -40,6 +40,13 @@ KESTREL_API_URL = "https://api.projectkestrel.org"  # production endpoint
 KESTREL_SHARED_SECRET = "kestrel_secret_dev_shared"  # basic abuse-prevention
 
 _TIMEOUT_SECONDS = 10
+
+
+def is_frozen() -> bool:
+    """Return True when running inside a PyInstaller-frozen build."""
+    return getattr(sys, 'frozen', False)
+
+
 _MAX_LOG_ENTRIES = 50
 _MAX_SCREENSHOT_BYTES = 2 * 1024 * 1024  # 2 MB cap for screenshot payloads
 _MAX_RUNTIME_LOG_LINES = 200
@@ -234,6 +241,8 @@ def send_crash_report(
     machine_id, version : str
         Machine identifier and app version.
     """
+    if not is_frozen():
+        return
     try:
         exc_type = type(exc).__name__ if exc else 'Unknown'
         exc_msg = str(exc) if exc else ''
