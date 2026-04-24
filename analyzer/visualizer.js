@@ -134,28 +134,48 @@
       }
     }
 
-    // Pywebview API might load asynchronously, so wait for it
+    // Pywebview API might load asynchronously, so wait for it.
+    // On macOS (WKWebView) the bridge is injected later than on Windows and
+    // pywebview fires a 'pywebviewready' event when it is truly available.
+    // We listen for that event AND poll as a fallback, with a generous timeout.
     async function waitForPywebview() {
       if (typeof window.pywebview !== 'undefined' && window.pywebview.api) {
         return true;
       }
-      // Poll for up to 2 seconds
-      for (let i = 0; i < 20; i++) {
-        await new Promise(r => setTimeout(r, 100));
-        if (typeof window.pywebview !== 'undefined' && window.pywebview.api) {
-          console.log('[DEBUG] Pywebview API became available after', (i + 1) * 100, 'ms');
-          hasPywebviewApi = true;
-          console.log('[DEBUG] Updated hasPywebviewApi to:', hasPywebviewApi);
-          console.log('[DEBUG] window.pywebview:', window.pywebview);
-          console.log('[DEBUG] window.pywebview.api:', window.pywebview.api);
-          console.log('[DEBUG] Available API methods:', Object.keys(window.pywebview.api));
-          // Hide compatibility warning since we now have pywebview
-          el('#compat').classList.add('hidden');
-          return true;
+      return new Promise((resolve) => {
+        let settled = false;
+        function settle(found) {
+          if (settled) return;
+          settled = true;
+          clearInterval(pollTimer);
+          window.removeEventListener('pywebviewready', onReady);
+          if (found) {
+            hasPywebviewApi = true;
+            el('#compat')?.classList.add('hidden');
+            console.log('[DEBUG] Pywebview API ready (elapsed ~' + elapsed + 'ms)');
+          } else {
+            console.log('[DEBUG] Pywebview API not available after ' + elapsed + 'ms');
+          }
+          resolve(found);
         }
-      }
-      console.log('[DEBUG] Pywebview API not available after 2 seconds');
-      return false;
+        function onReady() {
+          // pywebviewready fires on all platforms when the JS bridge is injected
+          if (typeof window.pywebview !== 'undefined' && window.pywebview.api) {
+            settle(true);
+          }
+        }
+        window.addEventListener('pywebviewready', onReady);
+        // Polling fallback — catches cases where the event already fired
+        let elapsed = 0;
+        const pollTimer = setInterval(() => {
+          elapsed += 100;
+          if (typeof window.pywebview !== 'undefined' && window.pywebview.api) {
+            settle(true);
+          } else if (elapsed >= 10000) {
+            settle(false);
+          }
+        }, 100);
+      });
     }
 
     // Desktop mode requires pywebview API at startup.
@@ -7699,7 +7719,7 @@
           const eqVal = ['lenient', 'balanced', 'aggressive'].includes(eqRaw) ? eqRaw : 'balanced';
           const modelRaw = String(document.getElementById('adlgWildlifeModelMode')?.value || 'fast').toLowerCase();
           const modelVal = modelRaw === 'accurate' ? 'accurate' : 'fast';
-          const detectorName = modelVal === 'accurate' ? 'mdv6-e' : 'mdv6-c';
+          const detectorName = modelVal === 'accurate' ? 'mdv5a' : 'mdv6-e';
           const stVal = Math.max(0, parseFloat(document.getElementById('adlgSceneTime')?.value) || 1.0);
           const ppRaw = parseInt(document.getElementById('adlgParallelPrefetch')?.value, 10);
           const ppVal = Math.max(1, Math.min(5, Number.isFinite(ppRaw) ? ppRaw : 3));

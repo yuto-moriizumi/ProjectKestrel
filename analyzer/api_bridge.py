@@ -1588,15 +1588,15 @@ class Api:
             detection_threshold = max(0.1, min(0.99, detection_threshold))
             scene_time_threshold = float(sett.get('scene_time_threshold', 1.0))
             scene_time_threshold = max(0.0, scene_time_threshold)
-            detector_name = 'mdv6-e'
+            detector_name = 'mdv5a'
             mode_raw = str(sett.get('wildlife_model_mode', '') or '').strip().lower()
             if mode_raw == 'accurate':
-                detector_name = 'mdv6-e'
+                detector_name = 'mdv5a'
             elif mode_raw == 'fast':
-                detector_name = 'mdv6-c'
+                detector_name = 'mdv6-e'
             else:
                 legacy_detector = str(sett.get('detector_name', '') or '').strip().lower()
-                if legacy_detector in {'mdv6-c', 'mdv6-e'}:
+                if legacy_detector in {'mdv5a', 'mdv6-e'}:
                     detector_name = legacy_detector
             mask_threshold = float(sett.get('mask_threshold', 0.5))
             mask_threshold = max(0.5, min(0.95, mask_threshold))

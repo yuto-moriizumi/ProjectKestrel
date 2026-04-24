@@ -45,7 +45,7 @@ _ALLOWED_EDITORS = {
 _ALLOWED_RATING_PROFILES = {'very_strict', 'strict', 'balanced', 'lenient', 'very_lenient'}
 _ALLOWED_EXPOSURE_QUALITY = {'lenient', 'balanced', 'aggressive'}
 _ALLOWED_WILDLIFE_MODEL_MODES = {'fast', 'accurate'}
-_ALLOWED_QUEUE_DETECTOR_NAMES = {'mdv6-c', 'mdv6-e'}
+_ALLOWED_QUEUE_DETECTOR_NAMES = {'mdv5a', 'mdv6-e'}
 _ALLOWED_QUEUE_ITEM_STATUSES = {'pending', 'running', 'done', 'error', 'cancelled'}
 
 # Telemetry — failsafe import (never blocks startup)
@@ -244,9 +244,9 @@ def _sanitize_queue_recovery_state(value: Any) -> dict | None:
         'use_gpu': _coerce_bool(opts.get('use_gpu', True), default=True),
         'wildlife_enabled': _coerce_bool(opts.get('wildlife_enabled', True), default=True),
         'detector_name': _coerce_enum(
-            opts.get('detector_name', 'mdv6-e'),
+            opts.get('detector_name', 'mdv5a'),
             _ALLOWED_QUEUE_DETECTOR_NAMES,
-            default='mdv6-e',
+            default='mdv5a',
         ),
         'detection_threshold': _coerce_float(opts.get('detection_threshold', 0.25), 0.25, min_value=0.1, max_value=0.99),
         'scene_time_threshold': _coerce_float(opts.get('scene_time_threshold', 1.0), 1.0, min_value=0.0, max_value=60.0),
@@ -401,7 +401,7 @@ def _sanitize_settings_payload(data: dict, emit_log: bool = False) -> dict:
         out['detector_name'] = _coerce_enum(
             data.get('detector_name'),
             _ALLOWED_QUEUE_DETECTOR_NAMES,
-            default='mdv6-e',
+            default='mdv5a',
         )
 
     if 'exposure_quality' in data:

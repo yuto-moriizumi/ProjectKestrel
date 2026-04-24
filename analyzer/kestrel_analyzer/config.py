@@ -22,11 +22,11 @@ SAM_HQ_MODEL_KEY = "vit_tiny"  # segment_anything_hq.sam_model_registry
 SPECIESNET_MODEL_DIR = MODELS_DIR / "speciesnet"
 
 # Runtime-selectable MegaDetector ONNX variants (all require .onnx.data sidecar files).
-# mdv6-c (YOLOv9-C, compact/fast) and mdv6-e (YOLOv9-E, accurate) are bundled
-# under models/speciesnet. Both are Apache 2.0 licensed.
-DEFAULT_DETECTOR_NAME = "mdv6-e"
+# mdv5a (accurate) and mdv6-e (YOLOv9-E, fast) are bundled under models/speciesnet.
+# mdv5a provides best accuracy for wildlife detection; mdv6-e is faster but less accurate.
+DEFAULT_DETECTOR_NAME = "mdv5a"
 DETECTOR_ONNX_PATHS = {
-    "mdv6-c": SPECIESNET_MODEL_DIR / "mdv6-mit-yolov9-c.onnx",
+    "mdv5a": SPECIESNET_MODEL_DIR / "mdv5a.onnx",
     "mdv6-e": SPECIESNET_MODEL_DIR / "mdv6-mit-yolov9-e.onnx",
 }
 
