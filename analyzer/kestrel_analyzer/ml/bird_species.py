@@ -24,6 +24,8 @@ class BirdSpeciesClassifier:
         except Exception as e:
             print(f"Warning: Failed to load ONNX model with specified providers: {e}")
             self.session = ort.InferenceSession(model_path, providers=["CPUExecutionProvider"])
+        active = self.session.get_providers()
+        print(f"[BirdSpeciesClassifier] Active provider: {active[0] if active else 'unknown'}  all providers: {active}")
 
         try:
             base_dir = Path(models_dir) if models_dir else MODELS_DIR

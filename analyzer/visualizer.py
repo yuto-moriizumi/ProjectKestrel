@@ -365,10 +365,22 @@ class Handler(SimpleHTTPRequestHandler):
         # The CSP below is defense-in-depth — it still blocks remote
         # script loads, ``eval``-style CSS injection, plugin embeds, and
         # form submission to third parties.
+        #
+        # Note on ``'unsafe-eval'`` for ``script-src``: pywebview 6.1's JS
+        # bridge (``webview/js/api.js::_createApi``) generates each
+        # ``window.pywebview.api.<method>`` stub with ``new Function(params,
+        # body)``, which CSP treats as ``eval``. Without ``'unsafe-eval'``
+        # the stubs are never created and ``window.pywebview.api`` ends up
+        # empty. Windows WebView2's ``ExecuteScriptAsync`` runs in a
+        # privileged context that bypasses page CSP, so the bug only
+        # manifests on macOS (WKWebView's ``evaluateJavaScript:`` enforces
+        # page CSP). Allowing ``'unsafe-eval'`` is required to keep the
+        # desktop bridge working on macOS until pywebview drops the
+        # dynamic-Function pattern. The CSP scope is otherwise the same.
         self.send_header(
             'Content-Security-Policy',
             "default-src 'self'; "
-            "script-src 'self' 'unsafe-inline'; "
+            "script-src 'self' 'unsafe-inline' 'unsafe-eval'; "
             "style-src 'self' 'unsafe-inline'; "
             "img-src 'self' data: blob:; "
             "media-src 'self' blob:; "

@@ -278,7 +278,8 @@ class OnnxClassifier:
         self.providers_used = self._session.get_providers()
         with open(labels_path) as f:
             self._labels = [line.strip() for line in f]
-        print(f"[OnnxClassifier] {len(self._labels)} labels  providers={self.providers_used}")
+        _active = self.providers_used[0] if self.providers_used else "unknown"
+        print(f"[OnnxClassifier] {len(self._labels)} labels  Active provider: {_active}  all providers: {self.providers_used}")
 
     def preprocess(self, img_pil: Image.Image, bboxes: list | None = None) -> np.ndarray:
         """
@@ -526,7 +527,8 @@ class OnnxMDv6Detector:
         self._session = ort.InferenceSession(str(onnx_path), providers=providers)
         _provs = self._session.get_providers()
         self.device = "ONNX/GPU" if is_gpu_active(_provs) else "ONNX/CPU"
-        print(f"[OnnxMDv6Detector] Loaded {onnx_path.name}  providers={_provs}")
+        _active = _provs[0] if _provs else "unknown"
+        print(f"[OnnxMDv6Detector] Loaded {onnx_path.name}  Active provider: {_active}  all providers: {_provs}")
 
     def preprocess(self, img_pil: "Image.Image") -> tuple:
         """CPU: squash PIL to 640×640 float tensor; record original dims.
@@ -621,8 +623,10 @@ class OnnxMDv6MitYoloV9Detector:
 
         _provs = self._session.get_providers()
         self.device = "ONNX/GPU" if is_gpu_active(_provs) else "ONNX/CPU"
+        _active = _provs[0] if _provs else "unknown"
         print(
-            f"[OnnxMDv6MitYoloV9Detector] Loaded {onnx_path.name}  providers={_provs}"
+            f"[OnnxMDv6MitYoloV9Detector] Loaded {onnx_path.name}"
+            f"  Active provider: {_active}  all providers: {_provs}"
             f"  inputs=({self._images_input_name}, {self._rev_input_name})"
             f"  outputs=({self._logits_output_name}, {self._boxes_output_name})"
         )
@@ -805,7 +809,8 @@ class OnnxSamPredictor:
         self._dec_session = ort.InferenceSession(str(dec_path), providers=providers)
         _provs = self._enc_session.get_providers()
         self.device = "ONNX/GPU" if is_gpu_active(_provs) else "ONNX/CPU"
-        print(f"[OnnxSamPredictor] Loaded encoder+decoder  providers={_provs}")
+        _active = _provs[0] if _provs else "unknown"
+        print(f"[OnnxSamPredictor] Loaded encoder+decoder  Active provider: {_active}  all providers: {_provs}")
 
     @staticmethod
     def _resize_longest_side(image: np.ndarray, target: int) -> np.ndarray:
